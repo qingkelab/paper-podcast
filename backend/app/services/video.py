@@ -94,6 +94,20 @@ class Scene:
 
 
 @dataclass
+class ImageAsset:
+    """一张可用作画面的图。"""
+
+    id: str
+    path: Path
+    kind: str      # "cover" | "figure" | "table" | "illustration"
+    caption: str = ""
+
+    @property
+    def exists(self) -> bool:
+        return self.path.exists()
+
+
+@dataclass
 class VideoResult:
     video_path: Path
     duration_sec: float
@@ -114,21 +128,28 @@ class VideoResult:
 # 配图分配
 # --------------------------------------------------------------------------
 
-ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版安排画面。听众能听到主播的对话，\
-你要决定每个画面节点出现在哪一句之后，让画面和正在聊的内容对得上。
+ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排。
+
+听众能听到主播的对话，同时看到画面。你的任务是让**每一段话配上意思相符的图**：
+听众听到某个概念时，屏幕上正好是讲这个概念的图。图不对文比没有图更糟。
 
 你会拿到：
-- 脚本分段列表，每段有编号、主播和内容
-- 可用的图片列表，每张有 id 和图注
+- 脚本分段列表（编号、内容）
+- 可用图片列表（id 与图注）
 
-请为**每张图**指定它应当开始显示的脚本段编号。要求：
-- 编号必须是脚本段列表中真实存在的编号。
-- 必须递增：后面的图不能比前面的图更早出现。
-- 判断依据是图注讲的内容和脚本段讲的内容是否相关，不要随机分配。
-- 封面图（id 为 cover）代表论文首页，只应出现在最开头。
+请为**每一段**指定一张图。判断依据是这一段在讲什么，以及哪张图正好在讲同一件事。
 
-只输出 JSON：{"assignments": [{"image_id": "f1", "segment": 3}, ...]}
-不要输出任何解释。"""
+【重要规则】
+- 图注可能是英文，脚本是中文，你要按**语义**判断，不要按字面。
+- 若某一段的内容和任何一张图都对不上，就填 `illustration`（那是一张概括全文的
+  信息图，属于中性选择）。**不要为了填满而硬塞一张不相关的图。**
+- `cover` 是论文首页，适合开场介绍论文时用；正文讨论具体内容时不要用它。
+- 相邻段落如果确实在讲同一件事，用同一张图是正常的；话题变了就换图。
+- 图片 id 只能从给出的列表里选，不要编造。
+
+只输出 JSON：
+{"assignments": [{"segment": 0, "image_id": "cover"}, {"segment": 1, "image_id": "f1"}, ...]}
+每个脚本段都要有一项，不要遗漏。不要输出任何解释。"""
 
 
 def build_assign_messages(
@@ -137,38 +158,77 @@ def build_assign_messages(
     script_lines = []
     for index, segment in enumerate(segments):
         text = (segment.get("text") or "").strip().replace("\n", " ")
-        script_lines.append(f"[{index}] {text[:70]}")
+        speaker = segment.get("speaker") or "A"
+        script_lines.append(f"[{index}] 主播{speaker}：{text}")
 
     asset_lines = []
     for asset in assets:
         caption = (asset.get("caption") or asset.get("label") or "").strip()
-        asset_lines.append(f"- {asset['id']}: {caption[:120]}")
+        asset_lines.append(f"- {asset['id']}: {caption[:160]}")
 
-    user = f"""【脚本分段】共 {len(segments)-1} 段（编号 0 到 {len(segments)-1}）
+    user = f"""【脚本分段】共 {len(segments)} 段（编号 0 到 {len(segments)-1}）
 {chr(10).join(script_lines)}
 
 【可用图片】共 {len(assets)} 张
 {chr(10).join(asset_lines)}
 
-请输出每张图对应的起始脚本段编号（JSON）。"""
+请为每一段脚本指定一张意思相符的图，输出 JSON。"""
     return [
         {"role": "system", "content": ASSIGN_SYSTEM},
         {"role": "user", "content": user},
     ]
 
 
+def _normalize_per_segment(
+    raw: Any, *, count: int, valid_ids: set[str], default_id: str
+) -> list[str] | None:
+    """把模型给的逐段分配整理成「每段一个图片 id」。
+
+    与旧版「只给起始段号」不同：那种做法下，一张图会一直挂到下一张图开始，
+    中间几段可能已经换了话题。这里要求逐段明确，才能保证图文一致。
+    """
+    if not isinstance(raw, list):
+        return None
+
+    picks: dict[int, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        image_id = str(item.get("image_id") or "").strip()
+        try:
+            segment = int(item.get("segment"))
+        except (TypeError, ValueError):
+            continue
+        if image_id in valid_ids and 0 <= segment < count:
+            picks[segment] = image_id
+
+    if not picks:
+        return None
+
+    # 模型漏掉的段落（尤其是开头）沿用最近一次有效选择，避免出现空图
+    result: list[str] = []
+    last = picks.get(0, default_id)
+    for index in range(count):
+        if index in picks:
+            last = picks[index]
+        result.append(last)
+    return result
+
+
 def heuristic_assignment(count: int, figure_count: int) -> list[int]:
-    """均匀分布：把图铺到正文段上。模型不可用时的兜底。"""
+    """均匀分布：把图铺到正文段上。模型不可用时的兜底（给的是起始段号）。
+
+    这是**退化**方案：它只保证每张图都有露面，不保证图文相符。
+    正常的语义匹配由模型逐段完成；模型不可用时至少画面不会空着。
+    """
     if figure_count <= 0:
         return []
-    # 跳过开头和结尾各一小段，让封面和信息图有机会出现
     head = max(int(count * 0.06), 0)
     tail = max(int(count * 0.12), 1)
     span = max(count - head - tail, 1)
     step = max(span / figure_count, 1)
     result = [min(head + int(i * step), count - 1) for i in range(figure_count)]
 
-    # 同样要保证严格递增，否则图会被顶掉（段数太少时很容易撞在一起）
     for index in range(1, len(result)):
         if result[index] <= result[index - 1]:
             result[index] = min(result[index - 1] + 1, count - 1)
@@ -178,55 +238,20 @@ def heuristic_assignment(count: int, figure_count: int) -> list[int]:
     return result
 
 
-def _normalize_assignment(
-    raw: Any, *, count: int, ordered_ids: list[str]
-) -> list[int] | None:
-    """把模型给的分配结果整理成与 ordered_ids 等长的、非递减的段号列表。"""
-    if not isinstance(raw, list):
-        return None
-
-    mapping: dict[str, int] = {}
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        image_id = str(item.get("image_id") or "").strip()
-        try:
-            segment = int(item.get("segment"))
-        except (TypeError, ValueError):
-            continue
-        if not image_id:
-            continue
-        # 越界的段号钳到边界而不是整条丢掉：模型说「放最后」时，
-        # 钳制能保留它的意图，丢弃则会让这张图完全失去位置信息
-        mapping[image_id] = min(max(segment, 0), count - 1)
-
-    if not mapping:
-        return None
-
-    result: list[int] = []
-    last = 0
-    for image_id in ordered_ids:
-        segment = mapping.get(image_id)
-        if segment is None:
-            # 模型漏了某张图 → 插在上一张之后
-            segment = last if result else 0
-        segment = max(segment, last)
-        segment = min(segment, count - 1)
-        result.append(segment)
-        last = segment
-
-    # ⚠️ 只保证「非递减」是不够的：取图逻辑是「取最后一个 start <= 当前段」，
-    # 所以两张图起点相同时，靠前那张永远不会被显示。
-    # 实测模型给出过 [3, 6, 6, 10, 12]，f2 就这样被 f3 顶掉了。
-    # 这里把重复值往后推，保证每张图都有独占的起点。
-    for index in range(1, len(result)):
-        if result[index] <= result[index - 1]:
-            result[index] = min(result[index - 1] + 1, count - 1)
-    # 触顶后可能又产生重复，再从后往前压一遍
-    for index in range(len(result) - 2, -1, -1):
-        if result[index] >= result[index + 1]:
-            result[index] = max(result[index + 1] - 1, 0)
-
+def heuristic_per_segment(
+    count: int, figure_ids: list[str], default_id: str
+) -> list[str]:
+    """把「均匀分布的起始段号」展开成逐段图片 id。"""
+    if not figure_ids:
+        return [default_id] * count
+    starts = heuristic_assignment(count, len(figure_ids))
+    result: list[str] = []
+    current = default_id
+    for index in range(count):
+        starts_here = [j for j, start in enumerate(starts) if start <= index]
+        if starts_here:
+            current = figure_ids[starts_here[-1]]
+        result.append(current)
     return result
 
 
@@ -240,96 +265,90 @@ def build_scenes(
     segments: list[dict[str, Any]],
     timings: list[Any],
     audio_duration: float,
-    cover: Path | None,
-    figures: list[dict[str, Any]],
-    illustration: Path | None,
-    assignment: list[int] | None = None,
+    assets: dict[str, ImageAsset],
+    image_for_segment: list[str],
+    fallback_id: str,
 ) -> list[Scene]:
-    """把脚本、时间戳和配图拼成画面时间轴。
+    """把脚本、时间戳和逐段配图拼成画面时间轴。
 
-    `timings` 是 RoundTiming 列表（顺序与脚本段一一对应）。
-    注意时间戳里已经包含了片头音乐的偏移，所以直接拿来当绝对时间用。
+    `timings` 是 RoundTiming 列表（顺序与脚本段一一对应），
+    里面已经包含了片头音乐的偏移，可以直接当绝对时间用。
+
+    `image_for_segment[i]` 是第 i 段脚本要显示的图片 id —— 逐段指定而不是
+    「从某段开始一直用到下一张图」，这样才能保证画面跟着话题走。
     """
     if not segments or not timings:
         raise VideoError("缺少脚本或时间戳，无法建立视频时间轴")
+    if not assets:
+        raise VideoError("没有任何可用配图，无法生成视频")
+
+    def asset_for(index: int) -> ImageAsset:
+        if index < len(image_for_segment):
+            asset = assets.get(image_for_segment[index])
+            if asset and asset.exists:
+                return asset
+        asset = assets.get(fallback_id)
+        if asset and asset.exists:
+            return asset
+        return next(a for a in assets.values() if a.exists)
 
     ordered = sorted(timings, key=lambda t: t.start)
     scenes: list[Scene] = []
 
     # ---- 片头：封面 ----
     head_end = ordered[0].start
-    if cover and head_end > 0.3:
+    cover = assets.get("cover")
+    head_asset = cover if (cover and cover.exists) else asset_for(0)
+    if head_end > 0.3:
         scenes.append(
-            Scene(start=0.0, end=head_end, image=cover, kind="cover", caption="论文首页")
+            Scene(
+                start=0.0,
+                end=head_end,
+                image=head_asset.path,
+                kind=head_asset.kind,
+                caption=head_asset.caption,
+            )
         )
 
-    # ---- 正文：每段脚本一个画面 ----
-    # 图片池按顺序铺到脚本段上
-    pool: list[tuple[Path, str, str]] = []
-    for figure in figures:
-        path = Path(figure.get("path") or "")
-        if path.exists():
-            pool.append((path, "figure", figure.get("caption") or figure.get("label") or ""))
-
-    if assignment is None or len(assignment) != len(pool):
-        assignment = heuristic_assignment(len(segments), len(pool))
-
-    # 为每一段决定用哪张图：在其所属图片的起始段之前沿用上一张
-    current: tuple[Path, str, str] | None = None
-    if pool and assignment:
-        # assignment[i] 是第 i 张图的起始段号
-        for index in range(len(segments)):
-            starts = [j for j, seg_index in enumerate(assignment) if seg_index <= index]
-            if starts:
-                current = pool[starts[-1]]
-            if current is None:
-                current = pool[0]
-    else:
-        current = None
-
-    # 没有正文配图时用封面/信息图兜底，保证画面不为空
-    fallback = None
-    for candidate in (cover, illustration):
-        if candidate and candidate.exists():
-            fallback = (candidate, "cover", "")
-            break
-
-    # 重新逐段计算（上面的循环只为确定分段边界，这里正式生成）
-    image_for_segment: list[tuple[Path, str, str]] = []
-    if pool and assignment:
-        for index in range(len(segments)):
-            starts = [j for j, seg_index in enumerate(assignment) if seg_index <= index]
-            image_for_segment.append(pool[starts[-1]] if starts else pool[0])
-    elif fallback:
-        image_for_segment = [fallback] * len(segments)
-    else:
-        raise VideoError("没有任何可用配图，无法生成视频")
-
+    # ---- 正文：逐段按语义配图 ----
     for index, timing in enumerate(ordered):
         segment = segments[index] if index < len(segments) else {}
-        image, kind, caption = image_for_segment[min(index, len(image_for_segment) - 1)]
+        asset = asset_for(index)
         scenes.append(
             Scene(
                 start=float(timing.start),
                 end=float(timing.end),
-                image=image,
-                kind=kind,
-                speaker=str(segment.get("speaker") or timing.speaker or "A"),
+                image=asset.path,
+                kind=asset.kind,
+                speaker=str(segment.get("speaker") or getattr(timing, "speaker", "") or "A"),
                 text=str(segment.get("text") or ""),
-                caption=caption,
+                caption=asset.caption,
             )
         )
 
     # ---- 片尾：信息图 + 结束卡 ----
     tail_start = ordered[-1].end
     if audio_duration > tail_start + 0.3:
-        tail_image = illustration if illustration and illustration.exists() else scenes[-1].image
+        illustration = assets.get("illustration")
+        if illustration and illustration.exists:
+            tail_image, tail_kind, tail_caption = (
+                illustration.path,
+                illustration.kind,
+                illustration.caption,
+            )
+        else:
+            # 没有信息图就沿用最后一段的画面，别让片尾变成黑屏
+            tail_image = scenes[-1].image
+            tail_kind = scenes[-1].kind
+            tail_caption = scenes[-1].caption
+
         scenes.append(
             Scene(
                 start=tail_start,
                 end=audio_duration,
                 image=tail_image,
-                kind="illustration" if tail_image is illustration else scenes[-1].kind,
+                kind=tail_kind,
+                caption=tail_caption,
                 text="以上就是这篇论文的解读，感谢收听。",
             )
         )
@@ -697,6 +716,55 @@ def probe_media_duration(path: Path) -> float | None:
 # --------------------------------------------------------------------------
 
 
+def build_asset_pool(
+    *,
+    cover_path: str | None,
+    figures: list[dict[str, Any]],
+    illustration_png: str | None,
+) -> dict[str, ImageAsset]:
+    """收集所有可用作画面的图。
+
+    封面(id=cover) 和 信息图(id=illustration) 也要进池子：它们是**中性选项**——
+    当某段脚本和任何一张论文原图都对不上时，用信息图比硬塞一张不相关的图好。
+    """
+    pool: dict[str, ImageAsset] = {}
+
+    if cover_path and Path(cover_path).exists():
+        pool["cover"] = ImageAsset(
+            id="cover", path=Path(cover_path), kind="cover", caption="论文首页"
+        )
+
+    for index, figure in enumerate(figures):
+        path = figure.get("path")
+        if not path or not Path(path).exists():
+            continue
+        figure_id = str(figure.get("id") or f"f{index + 1}")
+        pool[figure_id] = ImageAsset(
+            id=figure_id,
+            path=Path(path),
+            kind=str(figure.get("kind") or "figure"),
+            caption=str(figure.get("caption") or figure.get("label") or ""),
+        )
+
+    if illustration_png and Path(illustration_png).exists():
+        pool["illustration"] = ImageAsset(
+            id="illustration",
+            path=Path(illustration_png),
+            kind="illustration",
+            caption="论文核心机制信息图",
+        )
+
+    return pool
+
+
+def default_asset_id(pool: dict[str, ImageAsset]) -> str:
+    """没有明确匹配时用哪张图。信息图最中性（它概括全文，不会文不对题）。"""
+    for candidate in ("illustration", "cover"):
+        if candidate in pool:
+            return candidate
+    return next(iter(pool))
+
+
 def compose_video(
     *,
     segments: list[dict[str, Any]],
@@ -713,57 +781,59 @@ def compose_video(
     analysis: dict[str, Any] | None = None,
 ) -> VideoResult:
     """合成视频解读播客。任何一步失败都抛 VideoError，由调用方降级。"""
-    cover = Path(cover_path) if cover_path and Path(cover_path).exists() else None
-    illustration = (
-        Path(illustration_png)
-        if illustration_png and Path(illustration_png).exists()
-        else None
+    pool = build_asset_pool(
+        cover_path=cover_path, figures=figures, illustration_png=illustration_png
     )
+    if not pool:
+        raise VideoError("没有任何可用配图，无法生成视频")
 
-    usable_figures = [
-        f for f in figures if f.get("path") and Path(f["path"]).exists()
-    ]
+    default_id = default_asset_id(pool)
+    figure_ids = [i for i in pool if i not in ("cover", "illustration")]
 
-    # 配图分配：优先让模型判断图文相关性
-    assignment: list[int] | None = None
+    # 逐段语义匹配：优先让模型判断「这一段在讲什么、哪张图正好在讲同一件事」
+    image_for_segment: list[str] | None = None
     strategy = "heuristic"
 
-    if llm is not None and not getattr(llm, "mock", True) and usable_figures:
+    if llm is not None and not getattr(llm, "mock", True):
         assets = [
-            {
-                "id": f.get("id") or f"f{index}",
-                "caption": f.get("caption") or f.get("label") or "",
-            }
-            for index, f in enumerate(usable_figures)
+            {"id": asset.id, "caption": asset.caption}
+            for asset in pool.values()
         ]
         try:
             data = llm._chat_json(
-                build_assign_messages(segments, assets), max_tokens=1200, temperature=0.2
+                build_assign_messages(segments, assets),
+                max_tokens=max(1500, len(segments) * 60),
+                temperature=0.2,
             )
-            candidate = _normalize_assignment(
+            candidate = _normalize_per_segment(
                 data.get("assignments"),
                 count=len(segments),
-                ordered_ids=[a["id"] for a in assets],
+                valid_ids=set(pool),
+                default_id=default_id,
             )
             if candidate:
-                assignment = candidate
+                image_for_segment = candidate
                 strategy = "model"
-                logger.info("配图分配由模型完成：%s", assignment)
+                distinct = len(set(candidate))
+                logger.info(
+                    "逐段配图由模型完成：%d 段用了 %d 张不同的图", len(candidate), distinct
+                )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("模型配图分配失败，退回均匀分布：%s", exc)
+            logger.warning("模型逐段配图失败，退回均匀分布：%s", exc)
 
-    if assignment is None:
-        assignment = heuristic_assignment(len(segments), len(usable_figures))
-        logger.info("配图分配使用均匀分布：%s", assignment)
+    if image_for_segment is None:
+        image_for_segment = heuristic_per_segment(
+            len(segments), figure_ids, default_id
+        )
+        logger.info("逐段配图使用均匀分布（退化方案，不保证图文相符）")
 
     scenes = build_scenes(
         segments=segments,
         timings=timings,
         audio_duration=audio_duration,
-        cover=cover,
-        figures=usable_figures,
-        illustration=illustration,
-        assignment=assignment,
+        assets=pool,
+        image_for_segment=image_for_segment,
+        fallback_id=default_id,
     )
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -779,7 +849,6 @@ def compose_video(
     )
     result.assignment = strategy
 
-    # 渲染中间产物占磁盘，成功后清掉
     for slide_path in slide_paths:
         try:
             slide_path.unlink(missing_ok=True)
