@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -64,7 +65,7 @@ class Pipeline:
             error=message,
         )
 
-    def _compose_video_safely(
+    async def _compose_video_safely(
         self,
         episode_id: str,
         *,
@@ -79,6 +80,10 @@ class Pipeline:
 
         视频是增强项：任何失败都只记日志并返回空字段，绝不影响已经可用的音频。
         所以要放在音频落库之后。
+
+        用 to_thread 跑：compose_video 是同步的，而且现在会为缺少原图的段落
+        现场生成配图（每张约 10 秒）。直接调用会**阻塞事件循环**几十秒，
+        期间前端轮询拿不到任何响应，看起来像服务挂了。
         """
         if not self.settings.enable_video:
             logger.info("视频合成已关闭（ENABLE_VIDEO=false）")
@@ -94,7 +99,8 @@ class Pipeline:
         illustration = record.get("illustration") or {}
 
         try:
-            result = compose_video(
+            result = await asyncio.to_thread(
+                compose_video,
                 segments=segments,
                 timings=timings,
                 audio_path=audio_path,
@@ -107,6 +113,7 @@ class Pipeline:
                 title=title,
                 llm=self.llm,
                 analysis=analysis,
+                max_topic_images=self.settings.max_topic_images,
             )
         except VideoError as exc:
             logger.warning("视频合成失败（音频不受影响）：%s", exc)
@@ -293,7 +300,7 @@ class Pipeline:
             )
 
             # ---- 5. 视频 ----
-            video_fields = self._compose_video_safely(
+            video_fields = await self._compose_video_safely(
                 episode_id,
                 segments=script["segments"],
                 timings=result.timings,

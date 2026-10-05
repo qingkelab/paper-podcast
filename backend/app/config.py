@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     # 是否在音频合成后继续合成视频解读播客（需要系统安装 ffmpeg）
     enable_video: bool = True
 
+    # 视频里「没有对应论文原图」的段落，最多现场生成几张专门配图。
+    # 每张一次模型调用（实测约 10 秒 / 3000+ token），调大要留意成本与耗时。
+    max_topic_images: int = 4
+
     # ---------- 派生属性 ----------
 
     @property

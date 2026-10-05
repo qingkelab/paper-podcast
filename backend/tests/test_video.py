@@ -26,8 +26,11 @@ from app.services.video import (
     default_asset_id,
     encode_video,
     ffmpeg_available,
+    generate_topic_images,
+    group_generate_runs,
     heuristic_assignment,
     heuristic_per_segment,
+    merge_runs_to_cap,
     render_slide,
 )
 
@@ -473,3 +476,170 @@ class TestRenderAndEncode:
         scenes = [Scene(start=0, end=1, image=image, kind="figure")]
         with pytest.raises(VideoError):
             encode_video(scenes, [], tmp_path / "a.mp3", tmp_path / "o.mp4")
+
+
+# --------------------------------------------------------------------------
+# 「没有对应原图」时现场生成专门配图
+# --------------------------------------------------------------------------
+
+
+class TestGenerateRuns:
+    """论文原图只能覆盖一部分话题。剩下的段落以前统一挂同一张概括全图的信息图，
+    实测 21 段里有 10 段都是它 —— 画面单调，而且并不真的对应内容。
+    现在改成按话题现场生成，但要先把连续段落合并，否则段数一多就失控。
+    """
+
+    def test_groups_consecutive_segments(self):
+        picks = ["cover", "generate", "generate", "f1", "generate", "f2"]
+        assert group_generate_runs(picks) == [(1, 3), (4, 5)]
+
+    def test_handles_trailing_run(self):
+        assert group_generate_runs(["f1", "generate", "generate"]) == [(1, 3)]
+
+    def test_no_runs(self):
+        assert group_generate_runs(["cover", "f1", "f2"]) == []
+
+    def test_all_generate(self):
+        assert group_generate_runs(["generate"] * 5) == [(0, 5)]
+
+    def test_empty(self):
+        assert group_generate_runs([]) == []
+
+    def test_merge_preserves_coverage(self):
+        """超过上限时合并，而不是丢弃 —— 丢弃会让那些段落退回中性图，又变回图文不符。"""
+        runs = [(1, 3), (4, 5), (6, 9), (10, 12), (13, 15)]
+        merged = merge_runs_to_cap(runs, 2)
+        assert len(merged) == 2
+        assert merged[0][0] == runs[0][0]
+        assert merged[-1][1] == runs[-1][1]
+
+        # 每一段原本要生成的段落都必须仍被某个合并区间覆盖。
+        # 注意区间之间**允许有缝** —— 缝里是分配了真实论文原图的段落，
+        # 不该被生成图覆盖，所以这里不能断言首尾相接。
+        def covered(index: int) -> bool:
+            return any(start <= index < end for start, end in merged)
+
+        for start, end in runs:
+            for index in range(start, end):
+                assert covered(index), f"第 {index} 段丢失了生成覆盖"
+
+    def test_merge_keeps_figure_gaps(self):
+        """被真实原图隔开的两个区间，合并后仍不能把中间的段落吞进去。"""
+        runs = [(1, 3), (6, 8)]
+        merged = merge_runs_to_cap(runs, 1)
+        assert merged == [(1, 8)]
+        # 单区间情况下中间确实被覆盖了 —— 这是合并的必然代价，
+        # 所以优先级是「先保证都画出来」，实在超上限才牺牲精确度
+
+    def test_merge_is_noop_when_under_cap(self):
+        runs = [(1, 3), (4, 5)]
+        assert merge_runs_to_cap(runs, 4) == runs
+
+    def test_merge_with_zero_cap_is_noop(self):
+        """cap<=0 表示不限制，不能变成空列表（那会丢掉全部生成）。"""
+        runs = [(1, 3)]
+        assert merge_runs_to_cap(runs, 0) == runs
+
+    def test_merge_single_slot(self):
+        merged = merge_runs_to_cap([(1, 3), (5, 7), (9, 11)], 1)
+        assert merged == [(1, 11)]
+
+
+class TestGenerateIdAcceptance:
+    VALID = {"cover", "f1", "illustration"}
+
+    def test_generate_is_accepted(self):
+        """generate 是伪 id，不在图片池里也必须被接受，否则会被当成非法值丢掉。"""
+        result = _normalize_per_segment(
+            [
+                {"segment": 0, "image_id": "cover"},
+                {"segment": 1, "image_id": "generate"},
+            ],
+            count=2,
+            valid_ids=self.VALID,
+            default_id="illustration",
+        )
+        assert result == ["cover", "generate"]
+
+    def test_unknown_id_still_rejected(self):
+        result = _normalize_per_segment(
+            [{"segment": 0, "image_id": "f99"}],
+            count=1,
+            valid_ids=self.VALID,
+            default_id="illustration",
+        )
+        assert result is None
+
+    def test_prompt_tells_model_to_prefer_original_figures(self):
+        """有原图就对原图，原图对不上才让生成 —— 原图最准确。"""
+        system = build_assign_messages(
+            [{"speaker": "A", "text": "x"}], [{"id": "f1", "caption": "y"}]
+        )[0]["content"]
+        assert "generate" in system
+        assert "优先用原图" in system
+
+    def test_prompt_warns_against_marking_every_segment(self):
+        """必须提醒模型合并：每段都标会让生成量失控。"""
+        system = build_assign_messages(
+            [{"speaker": "A", "text": "x"}], [{"id": "f1", "caption": "y"}]
+        )[0]["content"]
+        assert "合并" in system
+
+
+class TestTopicGeneration:
+    def test_mock_mode_skips_generation(self, tmp_path):
+        """Mock 模式没有真实模型，不该发起生成。"""
+        from app.services.video import generate_topic_images
+
+        class FakeLLM:
+            mock = True
+
+        result = generate_topic_images(
+            FakeLLM(),
+            segments=[{"speaker": "A", "text": "x"}],
+            runs=[(0, 1)],
+            paper_title="t",
+            analysis=None,
+            output_dir=tmp_path,
+            stem="s",
+        )
+        assert result == {}
+
+    def test_empty_runs_returns_empty(self, tmp_path):
+        from app.services.video import generate_topic_images
+
+        result = generate_topic_images(
+            object(),
+            segments=[],
+            runs=[],
+            paper_title="t",
+            analysis=None,
+            output_dir=tmp_path,
+            stem="s",
+        )
+        assert result == {}
+
+    def test_generation_failure_does_not_raise(self, tmp_path, monkeypatch):
+        """单组生成失败必须降级（退回中性图），不能让整个视频合成挂掉。"""
+        from app.services import video as video_module
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("模型调用炸了")
+
+        monkeypatch.setattr(
+            "app.services.illustration.generate_topic_illustration", boom, raising=False
+        )
+
+        class FakeLLM:
+            mock = False
+
+        result = video_module.generate_topic_images(
+            FakeLLM(),
+            segments=[{"speaker": "A", "text": "x"}],
+            runs=[(0, 1)],
+            paper_title="t",
+            analysis=None,
+            output_dir=tmp_path,
+            stem="s",
+        )
+        assert result == {}

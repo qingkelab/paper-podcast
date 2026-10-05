@@ -506,3 +506,119 @@ def generate_illustration(
         height=height,
         source=source,
     )
+
+
+# --------------------------------------------------------------------------
+# 按主题生成（视频里「没有对应原图」的段落用）
+# --------------------------------------------------------------------------
+#
+# 背景：论文原图只能覆盖一部分话题。实测一篇论文 21 段脚本里，只有约一半段落
+# 能对上原图，其余（背景铺垫、结果讨论、不足与展望）都给同一张概括全图的信息图，
+# 画面单调且并不真的对应内容。
+#
+# 所以这里支持**按话题现场生成**：几段连续的内容讲同一件事，就为它们画一张。
+# 连续段落必须合并成一组再生成，否则 21 段会生成十几张，成本和耗时都不可控。
+
+TOPIC_SYSTEM = """你在为学术播客的视频画一张示意图，画的是主持人**这一段正在讲的内容**。
+
+【输出要求】
+- 只输出一个完整的 `<svg>` 元素，不要 markdown 围栏，不要任何解释文字。
+- 必须带 `xmlns="http://www.w3.org/2000/svg"` 和 `viewBox="0 0 1280 720"`。
+- 深色底（例如 #101a2b），四角圆润，风格克制、学术。
+- 样式写成**元素属性**（fill / stroke / font-size / font-family），不要 <style>、不要 class。
+- 字体统一 `font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"`。
+- 文字用简体中文，字号：标题 38-46，正文 20-26，注释 16-18。
+- 文字必须落在画布内，至少留 48px 边距。中文一个字约占一个字号宽，据此估算位置，
+  宁可留白也不要让文字超出画布或互相重叠。
+- 可以用 SMIL 动画（`repeatCount="indefinite"`，周期 2-4 秒）帮助表达「信息怎么流动」，
+  但要有节制，不要闪烁。不要用 `<animateTransform>`。
+
+【画什么】
+- 只画这一段对话讲的那**一个**要点，不要试图概括整篇论文。
+- 用方框、箭头、示意图形表达机制或流程，让听众一眼看懂。
+- 如果对话里提到了具体数字（指标、倍数、参数量），直接标在图上。
+
+【绝对禁止】
+- 不要 `<script>`、`<foreignObject>`、`<image>`、任何外部链接或 `url(...)` 引用。
+- 不要输出 `<svg>` 之外的任何字符。"""
+
+
+def build_topic_messages(
+    *,
+    script_lines: list[str],
+    paper_title: str = "",
+    analysis: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """为一段连续对话构建生成提示词。"""
+    analysis = analysis or {}
+    context_bits = []
+    if paper_title:
+        context_bits.append(f"所属论文：{paper_title}")
+    if analysis.get("background"):
+        context_bits.append(f"论文背景（仅供理解，不要画进去）：{analysis['background'][:160]}")
+
+    user = "\n".join(
+        [
+            *context_bits,
+            "",
+            "【这一段对话正在讲】",
+            *script_lines,
+            "",
+            "请为**上面这段对话**画一张示意图，只表达它讲的那个要点。",
+        ]
+    )
+    return [
+        {"role": "system", "content": TOPIC_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
+
+def generate_topic_illustration(
+    llm: Any,
+    *,
+    script_lines: list[str],
+    paper_title: str,
+    analysis: dict[str, Any] | None,
+    output_dir: Path,
+    stem: str,
+) -> Illustration | None:
+    """为一段对话生成配图。失败返回 None（调用方会退回中性图）。
+
+    与 generate_illustration 的区别：那个是「概括整篇论文」，这个是「画这一段」。
+    这里**不**退回本地兜底图 —— 因为兜底图是整篇的概括，放进某个具体段落里
+    反而又是图文不符，不如让调用方继续用中性图。
+    """
+    if getattr(llm, "mock", True):
+        return None
+
+    try:
+        raw = llm.complete(
+            build_topic_messages(
+                script_lines=script_lines, paper_title=paper_title, analysis=analysis
+            ),
+            max_tokens=6000,
+            temperature=0.75,
+        )
+        svg_text = sanitize_svg(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("段落配图生成失败（%s）：%s", stem, exc)
+        return None
+
+    svg_path = output_dir / f"{stem}.svg"
+    png_path = output_dir / f"{stem}.png"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        svg_path.write_text(svg_text, encoding="utf-8")
+        _, width, height = rasterize_svg(svg_text, png_path)
+    except IllustrationError as exc:
+        logger.warning("段落配图渲染失败（%s）：%s", stem, exc)
+        return None
+
+    logger.info("段落配图已生成：%s（%dx%d）", stem, width, height)
+    return Illustration(
+        svg_path=str(svg_path),
+        png_path=str(png_path),
+        width=width,
+        height=height,
+        source="model",
+    )

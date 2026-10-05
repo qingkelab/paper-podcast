@@ -71,6 +71,9 @@ SPEAKER_NAMES = {"A": "主播A", "B": "主播B"}
 
 BG_COLOR = "#0c1524"
 
+# 伪 id：模型用它表示「这一段没有对应原图，需要现场生成一张」
+GENERATE_ID = "generate"
+
 
 class VideoError(Exception):
     """视频合成失败。属于可降级错误——没有视频也要能听播客。"""
@@ -141,9 +144,13 @@ ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排�
 
 【重要规则】
 - 图注可能是英文，脚本是中文，你要按**语义**判断，不要按字面。
-- 若某一段的内容和任何一张图都对不上，就填 `illustration`（那是一张概括全文的
-  信息图，属于中性选择）。**不要为了填满而硬塞一张不相关的图。**
+- 若某一段的内容和任何一张图都对不上，就填 `generate` —— 系统会为这一段
+  **现场画一张专门的示意图**。连续几段讲同一件事时都填 `generate`，
+  系统会把它们合并成一张图，不要每段都标。
+- `illustration` 是一张概括全文的信息图，只在「需要一个中性过渡画面」时用
+  （例如开场收尾）。**不要为了填满而硬塞一张不相关的原图。**
 - `cover` 是论文首页，适合开场介绍论文时用；正文讨论具体内容时不要用它。
+- 能对上论文原图的段落**优先用原图**（原图最准确）；原图对不上才填 `generate`。
 - 相邻段落如果确实在讲同一件事，用同一张图是正常的；话题变了就换图。
 - 图片 id 只能从给出的列表里选，不要编造。
 
@@ -199,8 +206,10 @@ def _normalize_per_segment(
             segment = int(item.get("segment"))
         except (TypeError, ValueError):
             continue
-        if image_id in valid_ids and 0 <= segment < count:
-            picks[segment] = image_id
+        # "generate" 是伪 id：表示「这一段需要现场生成一张专门的图」
+        if image_id == GENERATE_ID or image_id in valid_ids:
+            if 0 <= segment < count:
+                picks[segment] = image_id
 
     if not picks:
         return None
@@ -779,6 +788,7 @@ def compose_video(
     title: str = "",
     llm: Any | None = None,
     analysis: dict[str, Any] | None = None,
+    max_topic_images: int = 4,
 ) -> VideoResult:
     """合成视频解读播客。任何一步失败都抛 VideoError，由调用方降级。"""
     pool = build_asset_pool(
@@ -827,6 +837,51 @@ def compose_video(
         )
         logger.info("逐段配图使用均匀分布（退化方案，不保证图文相符）")
 
+    # ---- 没有对应原图的段落：现场生成专门的配图 ----
+    #
+    # 以前这些段落统一挂同一张概括全图的信息图，实测 21 段里有 10 段都是它，
+    # 画面单调且并不真的对应内容。改成按话题生成后，每张图都只讲那一段的事。
+    runs = group_generate_runs(image_for_segment)
+    generated = 0
+    if runs:
+        capped = merge_runs_to_cap(runs, max_topic_images)
+        if len(capped) < len(runs):
+            logger.info(
+                "需要生成配图的段落组有 %d 个，超过上限 %d，已合并为 %d 组",
+                len(runs), max_topic_images, len(capped),
+            )
+        topic_assets = generate_topic_images(
+            llm,
+            segments=segments,
+            runs=capped,
+            paper_title=title,
+            analysis=analysis,
+            output_dir=work_dir / "topics",
+            stem=output_path.stem,
+        )
+        for start, asset in topic_assets.items():
+            pool[asset.id] = asset
+            generated += 1
+
+        # 把 generate 的段落指向它所属那一组生成出来的图
+        for start_segment, end_segment in capped:
+            asset = topic_assets.get(start_segment)
+            if asset is None:
+                continue  # 这一组生成失败 → 保持 generate，下面会退回中性图
+            for index in range(start_segment, min(end_segment, len(image_for_segment))):
+                image_for_segment[index] = asset.id
+
+    # 生成失败或未生成的部分退回中性图，保证不会出现空画面
+    image_for_segment = [
+        pick if pick != GENERATE_ID else default_id for pick in image_for_segment
+    ]
+    logger.info(
+        "配图构成：原图/封面 %d 张，现场生成 %d 张，中性兜底 %d 段",
+        len(figure_ids),
+        generated,
+        sum(1 for pick in image_for_segment if pick == default_id),
+    )
+
     scenes = build_scenes(
         segments=segments,
         timings=timings,
@@ -856,3 +911,114 @@ def compose_video(
             pass
 
     return result
+
+
+# --------------------------------------------------------------------------
+# 「没有对应原图」的段落：现场生成专门的配图
+# --------------------------------------------------------------------------
+
+
+def group_generate_runs(picks: list[str]) -> list[tuple[int, int]]:
+    """把连续的 generate 段落合并成 [起, 止) 区间。
+
+    必须合并：一段一张图的话，21 段脚本会生成十几张，每张一次模型调用
+    （实测单张约 10 秒、3000+ token），成本和耗时都不可控。
+    连续几段通常本来就在讲同一件事，共用一张图反而更贴切。
+    """
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, pick in enumerate(picks):
+        if pick == GENERATE_ID:
+            if start is None:
+                start = index
+        elif start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(picks)))
+    return runs
+
+
+def merge_runs_to_cap(
+    runs: list[tuple[int, int]], cap: int
+) -> list[tuple[int, int]]:
+    """区间数超过上限时，把相邻区间合并到只剩 cap 个。
+
+    按顺序均分成 cap 组，每组覆盖原来若干个区间 —— 这样覆盖范围不变，
+    只是每张图负责更多段落。比「丢掉超出的区间」更合理：
+    丢掉的段落会退回中性图，又变回图文不符。
+    """
+    if len(runs) <= cap or cap <= 0:
+        return runs
+
+    merged: list[tuple[int, int]] = []
+    total = len(runs)
+    for slot in range(cap):
+        first = slot * total // cap
+        last = (slot + 1) * total // cap - 1
+        merged.append((runs[first][0], runs[last][1]))
+    return merged
+
+
+def generate_topic_images(
+    llm: Any,
+    *,
+    segments: list[dict[str, Any]],
+    runs: list[tuple[int, int]],
+    paper_title: str,
+    analysis: dict[str, Any] | None,
+    output_dir: Path,
+    stem: str,
+    progress: Any | None = None,
+) -> dict[int, ImageAsset]:
+    """为每个区间生成一张配图，返回 {起始段号: ImageAsset}。
+
+    用线程池并行：串行的话 4 张图要 40 秒，会把流水线明显拖长。
+    LLMClient 每次调用都是独立的 httpx 请求，没有共享状态，并行是安全的。
+    """
+    if not runs or getattr(llm, "mock", True):
+        return {}
+
+    from .illustration import generate_topic_illustration
+
+    def one(index: int, run: tuple[int, int]) -> tuple[int, ImageAsset | None]:
+        start, end = run
+        lines = [
+            f"主播{(segments[i].get('speaker') or 'A')}：{(segments[i].get('text') or '').strip()}"
+            for i in range(start, min(end, len(segments)))
+        ]
+        try:
+            result = generate_topic_illustration(
+                llm,
+                script_lines=lines,
+                paper_title=paper_title,
+                analysis=analysis,
+                output_dir=output_dir,
+                stem=f"{stem}-topic{index + 1}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("段落配图异常（第 %d 组）：%s", index + 1, exc)
+            return start, None
+
+        if result is None:
+            return start, None
+        return start, ImageAsset(
+            id=f"topic{index + 1}",
+            path=Path(result.png_path),
+            kind="illustration",
+            caption="本段内容的示意图",
+        )
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    assets: dict[int, ImageAsset] = {}
+    workers = min(len(runs), 4)
+    with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
+        for start, asset in pool.map(lambda pair: one(*pair), enumerate(runs)):
+            if asset is not None:
+                assets[start] = asset
+                if progress:
+                    progress(start)
+
+    logger.info("段落配图：%d 组中成功 %d 张", len(runs), len(assets))
+    return assets

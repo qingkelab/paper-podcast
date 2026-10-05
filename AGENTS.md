@@ -93,8 +93,17 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **配图要逐段指定，不能只给「起始段号」**。早期做法是「从第 N 段开始显示某图、
   一直用到下一张图开始」，中间几段话题变了图却没变，直接导致图文不符。
   现在由模型**为每一段**选图（`_normalize_per_segment`），
-  选不出对应图时用中性的信息图，**不硬凑不相关的图**。
-  另外图注是英文、脚本是中文，跨语言匹配只能靠语义，关键词匹配无效。
+  选不出对应图时填伪 id `generate`，由系统**现场生成一张专门的图**
+  （`generate_topic_images`）。另外图注是英文、脚本是中文，
+  跨语言匹配只能靠语义，关键词匹配无效。
+- **现场生成配图必须先合并连续段落**（`group_generate_runs`）。
+  一段一张的话 21 段会生成十几张，每张一次模型调用（约 10 秒 / 3000+ token），
+  成本和耗时都会失控。连续几段通常本来就在讲同一件事，共用一张更贴切。
+  超过上限（`MAX_TOPIC_IMAGES`）时**合并而不是丢弃** —— 丢弃会让那些段落
+  退回中性图，又变回图文不符。
+- **`compose_video` 必须用 `asyncio.to_thread` 跑**。它是同步函数，
+  加上现场生成配图后会阻塞几十秒，直接 await 会让事件循环卡死，
+  前端轮询拿不到响应，看起来像服务挂了。
 - **精简脚本时要检查实际缩减量**：只判「比原来短」不够，
   实测出现过 1175 → 1171 这种「改了等于没改」，白花一次调用。要求至少减 3%。
 
@@ -105,7 +114,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            222 项，改完必须全绿
+backend/tests/            239 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 
