@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     data_dir: Path = PROJECT_ROOT / "data"
     database_path: Path | None = None  # 默认为 data_dir / "app.db"
 
+    # ---- 文本解读 / 脚本生成的大模型提供方 ----
+    # "auto" = 谁配了密钥就用谁（deepseek 优先）；也可显式指定 "deepseek"/"doubao"
+    llm_provider: str = "auto"
+
+    # DeepSeek（OpenAI 兼容接口）
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"
+    deepseek_timeout_sec: float = 180.0
+
     # ---- 豆包方舟大模型（文本解读 / 脚本生成）----
     ark_api_key: str = ""
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
@@ -89,10 +99,41 @@ class Settings(BaseSettings):
 
     @property
     def llm_mode(self) -> str:
-        """文本解读走真实接口还是 Mock。"""
-        if self.force_mock or not self.ark_api_key or not self.ark_model:
+        """文本解读走哪个提供方：'deepseek' | 'doubao' | 'mock'。"""
+        if self.force_mock:
             return "mock"
-        return "doubao"
+
+        provider = (self.llm_provider or "auto").strip().lower()
+        if provider == "deepseek":
+            return "deepseek" if self.deepseek_api_key else "mock"
+        if provider == "doubao":
+            return "doubao" if (self.ark_api_key and self.ark_model) else "mock"
+
+        # auto：DeepSeek 优先，其次方舟
+        if self.deepseek_api_key:
+            return "deepseek"
+        if self.ark_api_key and self.ark_model:
+            return "doubao"
+        return "mock"
+
+    @property
+    def llm_credentials(self) -> tuple[str, str, str, float]:
+        """返回当前提供方的 (base_url, api_key, model, timeout)。"""
+        if self.llm_mode == "deepseek":
+            return (
+                self.deepseek_base_url,
+                self.deepseek_api_key,
+                self.deepseek_model,
+                self.deepseek_timeout_sec,
+            )
+        if self.llm_mode == "doubao":
+            return (
+                self.ark_base_url,
+                self.ark_api_key,
+                self.ark_model,
+                self.ark_timeout_sec,
+            )
+        return ("", "", "", self.deepseek_timeout_sec)
 
     @property
     def tts_mode(self) -> str:

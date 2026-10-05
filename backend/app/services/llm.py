@@ -95,13 +95,29 @@ def _extract_balanced_object(text: str) -> str | None:
 
 
 class LLMClient:
+    """论文解读 + 播客脚本生成。
+
+    支持两个提供方，它们都是 OpenAI 兼容的 /chat/completions：
+    - DeepSeek（默认）：https://api.deepseek.com
+    - 豆包方舟（Ark）：https://ark.cn-beijing.volces.com/api/v3
+    切换只改配置，调用代码完全一致。都没配密钥时降级为 Mock。
+    """
+
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.mock = settings.llm_mode == "mock"
+        self.mode = settings.llm_mode
+        self.mock = self.mode == "mock"
+        self.base_url, self.api_key, self.model, self.timeout = settings.llm_credentials
+        self.provider_label = {"deepseek": "DeepSeek", "doubao": "豆包方舟"}.get(
+            self.mode, "Mock"
+        )
         if self.mock:
             logger.warning(
-                "大模型未配置（缺少 ARK_API_KEY 或 ARK_MODEL），解读与脚本将使用 Mock 数据"
+                "大模型未配置（缺少 DEEPSEEK_API_KEY 或 ARK_API_KEY），"
+                "解读与脚本将使用 Mock 数据"
             )
+        else:
+            logger.info("文本解读使用 %s（model=%s）", self.provider_label, self.model)
 
     # ---------- 对外 ----------
 
@@ -165,50 +181,67 @@ class LLMClient:
         max_tokens: int,
         temperature: float,
     ) -> str:
-        settings = self.settings
         payload: dict[str, Any] = {
-            "model": settings.ark_model,
+            "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            # 两个提供方都支持 JSON 输出模式。开启后模型不会在外面裹客套话，
+            # 解析成功率显著提升（parse_json_response 仍保留兜底）。
+            "response_format": {"type": "json_object"},
         }
         headers = {
-            "Authorization": f"Bearer {settings.ark_api_key}",
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        url = f"{settings.ark_base_url.rstrip('/')}/chat/completions"
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
 
         try:
-            with httpx.Client(timeout=settings.ark_timeout_sec) as client:
+            with httpx.Client(timeout=self.timeout) as client:
                 response = client.post(url, json=payload, headers=headers)
         except httpx.TimeoutException as exc:
-            raise LLMError("大模型请求超时，请稍后重试") from exc
+            raise LLMError(f"{self.provider_label} 请求超时，请稍后重试") from exc
         except httpx.HTTPError as exc:
-            raise LLMError(f"大模型请求失败：{exc}") from exc
+            raise LLMError(f"{self.provider_label} 请求失败：{exc}") from exc
 
         if response.status_code == 401:
-            raise LLMError("大模型鉴权失败（401），请检查 ARK_API_KEY 是否正确")
+            raise LLMError(
+                f"{self.provider_label} 鉴权失败（401），请检查 API Key 是否正确/是否欠费"
+            )
+        if response.status_code == 402:
+            raise LLMError(f"{self.provider_label} 账户余额不足（402）")
         if response.status_code == 404:
             raise LLMError(
-                f"大模型接入点不存在（404）：model={settings.ark_model!r}。"
-                "请确认 ARK_MODEL 填的是控制台里的接入点 ID（ep-…）或有效的模型 ID"
+                f"{self.provider_label} 接口或模型不存在（404）：model={self.model!r}，"
+                f"base_url={self.base_url}"
             )
+        if response.status_code == 429:
+            raise LLMError(f"{self.provider_label} 触发限流（429），请稍后重试")
         if response.status_code >= 400:
             raise LLMError(
-                f"大模型返回错误 {response.status_code}：{response.text[:300]}"
+                f"{self.provider_label} 返回错误 {response.status_code}：{response.text[:300]}"
             )
 
         try:
             body = response.json()
         except ValueError as exc:
-            raise LLMError("大模型返回了非 JSON 响应") from exc
+            raise LLMError(f"{self.provider_label} 返回了非 JSON 响应") from exc
 
         choices = body.get("choices") or []
         if not choices:
-            raise LLMError(f"大模型返回中没有 choices：{str(body)[:200]}")
+            raise LLMError(f"{self.provider_label} 返回中没有 choices：{str(body)[:200]}")
         content = (choices[0].get("message") or {}).get("content") or ""
         if not isinstance(content, str) or not content.strip():
-            raise LLMError("大模型返回了空 message")
+            raise LLMError(f"{self.provider_label} 返回了空 message")
+
+        usage = body.get("usage") or {}
+        if usage:
+            logger.info(
+                "%s 用量：prompt=%s completion=%s",
+                self.provider_label,
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+            )
         return content
 
 

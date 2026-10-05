@@ -39,7 +39,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("=" * 62)
     logger.info("  %s v%s", settings.app_name, settings.version)
-    logger.info("  文本解读：%s", "豆包方舟 API" if settings.llm_mode == "doubao" else "Mock（未配置 ARK_API_KEY/ARK_MODEL）")
+    llm_label = {
+        "deepseek": "DeepSeek API",
+        "doubao": "豆包方舟 API",
+    }.get(settings.llm_mode, "Mock（未配置 DEEPSEEK_API_KEY / ARK_API_KEY）")
+    logger.info("  文本解读：%s", llm_label)
     logger.info("  音频合成：%s", "豆包语音播客" if settings.tts_mode == "doubao" else "Mock（未配置豆包语音密钥）")
     logger.info("  数据库：%s", settings.db_path)
     logger.info("=" * 62)

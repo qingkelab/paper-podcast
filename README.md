@@ -42,17 +42,26 @@ cp .env.example .env      # 然后填入密钥
 
 | 用途 | 变量 | 去哪拿 |
 |---|---|---|
-| 论文解读 + 脚本生成 | `ARK_API_KEY`、`ARK_MODEL` | 火山引擎控制台 → 方舟 → API Key / 接入点 |
+| 论文解读 + 脚本生成 | `DEEPSEEK_API_KEY` | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) |
 | 播客音频合成 | `DOUBAO_API_KEY`（新版）<br>或 `DOUBAO_APP_ID`+`DOUBAO_ACCESS_KEY`（旧版） | 火山引擎控制台 → 豆包语音 → 应用管理 |
+
+文本解读默认走 **DeepSeek**（`deepseek-chat`）。也支持豆包方舟，两者都是
+OpenAI 兼容接口，切换只改 `LLM_PROVIDER`，代码路径完全一致：
+
+```bash
+LLM_PROVIDER=deepseek   # 默认（auto 时 DeepSeek 优先）
+LLM_PROVIDER=doubao     # 改用方舟，需另配 ARK_API_KEY + ARK_MODEL
+LLM_PROVIDER=auto       # 谁配了密钥用谁
+```
 
 配置完成后重启后端，启动日志会打印当前模式：
 
 ```
-  文本解读：豆包方舟 API
+  文本解读：DeepSeek API
   音频合成：豆包语音播客
 ```
 
-`GET /api/health` 也会返回 `{"modes": {"llm": "doubao", "tts": "doubao"}}`。
+`GET /api/health` 也会返回 `{"modes": {"llm": "deepseek", "tts": "doubao"}}`。
 
 ### ⚠️ 关于播客接口的重要更正
 
@@ -97,7 +106,7 @@ wss://openspeech.bytedance.com/api/v3/sami/podcasttts    (WebSocket 长连接)
 | 前端 | Vue 3 + Vite + TypeScript + Pinia |
 | 后端 | Python 3.13 + FastAPI |
 | 存储 | SQLite（标准库 sqlite3，WAL 模式） |
-| 大模型 | 豆包方舟（Ark）Chat Completions |
+| 大模型 | DeepSeek（默认）/ 豆包方舟，均为 OpenAI 兼容 Chat Completions |
 | 语音合成 | 豆包语音播客 PodcastTTS（WebSocket） |
 
 **为什么用标准库 sqlite3 而不是 ORM**：整个应用只有一张表，ORM 带来的迁移和版本

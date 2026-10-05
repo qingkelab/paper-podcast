@@ -73,6 +73,7 @@ EV_SESSION_FAILED = 153
 EV_ROUND_STARTED = 360
 EV_ROUND_AUDIO = 361
 EV_ROUND_FINISHED = 362
+EV_USAGE = 154  # 每轮合成后的 token 用量，仅用于日志
 
 # 这些事件不带 session_id 字段
 _NO_SESSION_ID_EVENTS = {
@@ -412,13 +413,26 @@ class PodcastTTSClient:
                     payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 )
             )
-            await self._recv_event(ws, expect=EV_SESSION_STARTED, timeout=30)
+            started = await self._recv_event(ws, expect=EV_SESSION_STARTED, timeout=30)
+            # task_id 用于断点续传（retry_info），服务端通常不在 150 里给，退回用 session_id
+            task_id = _safe_json(started.payload).get("task_id") or session_id
+
+            # ⚠️ 关键：收到 150 之后必须**立刻**发送 FinishSession(102)，声明「输入已发完」。
+            # 服务端收到它才会在合成完毕后发出 152（会话结束）。
+            # 之前把这一步放在 finally 里（循环都结束了才发），结果是永远等不到 152，
+            # 每次都误判为超时，并把已经收到的完整音频整个丢掉。
+            await ws.send(
+                build_event_frame(EV_FINISH_SESSION, session_id=session_id, payload=b"{}")
+            )
 
             # 用 running_loop 而不是 get_event_loop()：后者在 Python 3.12+ 的协程里
             # 已被标记为不推荐，行为也将在未来版本改变。
             loop = asyncio.get_running_loop()
             deadline = loop.time() + settings.podcast_timeout_sec
             current_round = -1
+            current_round_type = ""
+            script_rounds_done = 0
+            expected_script_rounds = len(segments)
 
             while True:
                 if loop.time() > deadline:
@@ -427,7 +441,7 @@ class PodcastTTSClient:
                     )
 
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=60)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=120)
                 except asyncio.TimeoutError as exc:
                     raise PodcastTTSError("等待播客音频数据超时") from exc
 
@@ -446,24 +460,47 @@ class PodcastTTSClient:
 
                 if frame.event == EV_ROUND_STARTED:
                     meta = _safe_json(frame.payload)
-                    current_round = int(meta.get("round_id", current_round + 1))
-                    task_id = meta.get("task_id") or task_id
-                    if on_round:
-                        on_round(current_round, str(meta.get("speaker") or ""))
+                    current_round_type = str(meta.get("round_type") or "")
+                    raw_round_id = meta.get("round_id")
+                    try:
+                        current_round = int(raw_round_id)
+                    except (TypeError, ValueError):
+                        current_round = current_round + 1
+                    # 只有脚本轮次才回调进度：片头音乐(-1)/片尾音乐(9999)/水印(10000)
+                    # 不是用户能感知的「第几段」，混进去会让进度条乱跳。
+                    if on_round and not current_round_type:
+                        on_round(script_rounds_done, str(meta.get("speaker") or ""))
 
                 elif frame.event == EV_ROUND_AUDIO:
                     if frame.payload:
                         audio_buffer += frame.payload
 
                 elif frame.event == EV_ROUND_FINISHED:
+                    # 注意：362 的 payload 里**没有** round_id，只有 audio_duration /
+                    # start_time / end_time，所以轮次编号只能从 360 里跟踪。
                     meta = _safe_json(frame.payload)
-                    finished_round = int(meta.get("round_id", current_round))
-                    task_id = meta.get("task_id") or task_id
                     if meta.get("is_error"):
                         raise PodcastTTSError(
-                            f"第 {finished_round} 段音频合成失败："
+                            f"第 {script_rounds_done + 1} 段音频合成失败："
                             f"{meta.get('message') or '服务端未给出原因'}"
                         )
+                    if not current_round_type:
+                        finished_round = current_round
+                        script_rounds_done += 1
+                    logger.debug(
+                        "轮次完成：round=%s type=%r 时长=%ss（累计脚本轮次 %d/%d）",
+                        current_round,
+                        current_round_type or "script",
+                        meta.get("audio_duration"),
+                        script_rounds_done,
+                        expected_script_rounds,
+                    )
+
+                elif frame.event == EV_USAGE:
+                    usage = _safe_json(frame.payload).get("usage") or {}
+                    logger.info(
+                        "播客合成用量：输出音频 tokens=%s", usage.get("output_audio_tokens")
+                    )
 
                 elif frame.event == EV_SESSION_FAILED:
                     meta = _safe_json(frame.payload)
@@ -486,6 +523,12 @@ class PodcastTTSClient:
 
         if not audio_buffer:
             raise PodcastTTSError("豆包语音未返回任何音频数据")
+        if script_rounds_done < expected_script_rounds:
+            logger.warning(
+                "脚本共 %d 段，但只收到 %d 段音频，产物可能不完整",
+                expected_script_rounds,
+                script_rounds_done,
+            )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(bytes(audio_buffer))
@@ -632,14 +675,92 @@ def probe_duration(path: Path) -> float | None:
     return None
 
 
-_MP3_BITRATES_V1_L3 = [
-    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
-]
-_MP3_SAMPLE_RATES_V1 = [44100, 48000, 32000, 0]
+# MP3 比特率表（kbps），按 [版本][层] 索引；索引 0 与 15 是保留值。
+# ⚠️ 必须区分 MPEG1 与 MPEG2/2.5：豆包播客接口给的是 24000Hz，属于 **MPEG2**，
+# 其 Layer III 比特率表和 MPEG1 完全不同。早先只按 MPEG1 表估算，
+# 实测把一段真实的 58.52 秒音频算成了 35.11 秒（偏差 40%），并且直接显示给用户。
+_MP3_BITRATE_TABLES: dict[tuple[int, int], list[int]] = {
+    (1, 1): [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
+    (1, 2): [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
+    (1, 3): [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
+    (2, 1): [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
+    (2, 2): [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+}
+_MP3_BITRATE_TABLES[(2, 3)] = _MP3_BITRATE_TABLES[(2, 2)]  # MPEG2/2.5 的 Layer II/III 共用一张表
+
+_MP3_SAMPLE_RATES: dict[int, list[int]] = {
+    1: [44100, 48000, 32000, 0],  # MPEG1
+    2: [22050, 24000, 16000, 0],  # MPEG2
+    0: [11025, 12000, 8000, 0],   # MPEG2.5
+}
+
+# 帧头里 2 bit 的 version 字段 → 上表的键。
+# 注意 MPEG1 在帧头里是 3，不是 1。
+_MP3_VERSION_BITS_TO_KEY = {3: 1, 2: 2, 0: 0}
+
+# 每帧采样数：[版本][层]
+_MP3_SAMPLES_PER_FRAME: dict[tuple[int, int], int] = {
+    (1, 1): 384, (1, 2): 1152, (1, 3): 1152,
+    (2, 1): 384, (2, 2): 1152, (2, 3): 576,
+}
+
+
+def _parse_mp3_frame_header(data: bytes, offset: int) -> dict[str, int] | None:
+    """解析 offset 处的 MP3 帧头，不是合法帧头则返回 None。"""
+    if offset + 4 > len(data):
+        return None
+    b0, b1, b2 = data[offset], data[offset + 1], data[offset + 2]
+
+    if b0 != 0xFF or (b1 & 0xE0) != 0xE0:
+        return None
+
+    version_bits = (b1 >> 3) & 0x03  # 3=MPEG1, 2=MPEG2, 0=MPEG2.5, 1=保留
+    layer_bits = (b1 >> 1) & 0x03    # 1=Layer III, 2=Layer II, 3=Layer I
+    if version_bits == 1 or layer_bits == 0:
+        return None
+
+    layer = 4 - layer_bits
+    bitrate_index = (b2 >> 4) & 0x0F
+    sample_rate_index = (b2 >> 2) & 0x03
+    padding = (b2 >> 1) & 0x01
+
+    # 帧头里的 version 字段是 3/2/0，而各张表用 1/2/0 作键（1=MPEG1）。
+    # 必须显式转换：直接拿 version_bits 查表会在 MPEG1（3）上 KeyError。
+    version_key = _MP3_VERSION_BITS_TO_KEY.get(version_bits)
+    if version_key is None:
+        return None
+    table = _MP3_BITRATE_TABLES.get((version_key, layer))
+    if table is None:
+        return None
+    bitrate_kbps = table[bitrate_index]
+    sample_rate = _MP3_SAMPLE_RATES[version_key][sample_rate_index]
+    if bitrate_kbps <= 0 or sample_rate <= 0:
+        return None
+
+    samples_per_frame = _MP3_SAMPLES_PER_FRAME[(version_key, layer)]
+    if layer == 1:
+        frame_length = int((12 * bitrate_kbps * 1000 / sample_rate) + padding) * 4
+    else:
+        coefficient = 144 if version_key == 1 else 72
+        frame_length = int(coefficient * bitrate_kbps * 1000 / sample_rate) + padding
+
+    if frame_length <= 4:
+        return None
+
+    return {
+        "bitrate": bitrate_kbps * 1000,
+        "sample_rate": sample_rate,
+        "samples_per_frame": samples_per_frame,
+        "frame_length": frame_length,
+    }
 
 
 def _estimate_mp3_duration(path: Path) -> float | None:
-    """按第一帧的比特率估算时长。CBR 准确，VBR 只是近似。"""
+    """逐帧累计采样数得到时长。
+
+    逐帧走而不是「首帧比特率 × 文件大小」的原因：后者对 VBR 文件是错的，
+    而且必须先正确区分 MPEG 版本。逐帧累计对 CBR/VBR 都精确。
+    """
     try:
         data = path.read_bytes()
     except OSError:
@@ -647,7 +768,7 @@ def _estimate_mp3_duration(path: Path) -> float | None:
 
     offset = 0
     if data[:3] == b"ID3" and len(data) > 10:
-        # 跳过 ID3v2，标签长度是 synchsafe 整数
+        # ID3v2 标签长度是 synchsafe 整数（每字节只用低 7 位）
         size = (
             (data[6] & 0x7F) << 21
             | (data[7] & 0x7F) << 14
@@ -656,16 +777,20 @@ def _estimate_mp3_duration(path: Path) -> float | None:
         )
         offset = 10 + size
 
-    limit = min(len(data) - 4, offset + 200_000)
-    while offset < limit:
-        if data[offset] == 0xFF and (data[offset + 1] & 0xE0) == 0xE0:
-            header = data[offset : offset + 4]
-            bitrate_index = (header[2] >> 4) & 0x0F
-            sample_rate_index = (header[2] >> 2) & 0x03
-            bitrate = _MP3_BITRATES_V1_L3[bitrate_index] * 1000
-            sample_rate = _MP3_SAMPLE_RATES_V1[sample_rate_index]
-            if bitrate > 0 and sample_rate > 0:
-                audio_bytes = len(data) - offset
-                return round(audio_bytes * 8 / bitrate, 2)
-        offset += 1
-    return None
+    total_samples = 0
+    sample_rate = 0
+    frames = 0
+
+    while offset < len(data) - 4:
+        header = _parse_mp3_frame_header(data, offset)
+        if header is None:
+            offset += 1  # 没对齐，逐字节找下一个同步字
+            continue
+        sample_rate = header["sample_rate"]
+        total_samples += header["samples_per_frame"]
+        offset += header["frame_length"]
+        frames += 1
+
+    if frames == 0 or sample_rate <= 0:
+        return None
+    return round(total_samples / sample_rate, 2)

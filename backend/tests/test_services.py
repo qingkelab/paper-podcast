@@ -218,15 +218,58 @@ class TestProbeDuration:
             handle.writeframes(b"\x00\x00" * rate * 2)  # 2 秒
         assert probe_duration(path) == pytest.approx(2.0, abs=0.05)
 
-    def test_estimates_mp3_duration_from_header(self, tmp_path):
-        """构造一个 128kbps / 44.1kHz 的 MP3 帧头，估算时长应接近真实值。"""
-        path = tmp_path / "t.mp3"
-        header = bytes([0xFF, 0xFB, 0x90, 0x00])  # MPEG1 Layer3, 128kbps, 44100Hz
-        body = header + b"\x00" * (16000 * 10)  # 16000 字节 ≈ 1 秒 @128kbps
-        path.write_bytes(body)
+    def test_estimates_mpeg2_mp3_duration(self, tmp_path):
+        """豆包播客接口返回的是 24000Hz 的 **MPEG2** MP3。
+
+        这里用真实抓到的帧头 `FF F3 A4 C4`（MPEG2 / Layer III / 96kbps / 24000Hz）。
+        早先的估算器只按 MPEG1 的比特率表算，把一段真实的 58.52 秒音频算成了
+        35.11 秒（偏差 40%），而且这个值会直接显示给用户。
+        """
+        path = tmp_path / "mpeg2.mp3"
+        frames = 120
+        frame_length = 288  # int(72 * 96000 / 24000)
+        header = bytes([0xFF, 0xF3, 0xA4, 0xC4])
+        path.write_bytes((header + b"\x00" * (frame_length - 4)) * frames)
+
         duration = probe_duration(path)
         assert duration is not None
-        assert duration == pytest.approx(10.0, abs=0.5)
+        # MPEG2 Layer III 每帧 576 采样
+        assert duration == pytest.approx(frames * 576 / 24000, abs=0.05)
+
+    def test_estimates_mpeg1_mp3_duration(self, tmp_path):
+        path = tmp_path / "mpeg1.mp3"
+        frames = 200
+        frame_length = int(144 * 128000 / 44100)  # 128kbps / 44100Hz
+        header = bytes([0xFF, 0xFB, 0x90, 0x00])
+        path.write_bytes((header + b"\x00" * (frame_length - 4)) * frames)
+
+        duration = probe_duration(path)
+        assert duration is not None
+        # MPEG1 Layer III 每帧 1152 采样
+        assert duration == pytest.approx(frames * 1152 / 44100, abs=0.05)
+
+    def test_skips_id3v2_tag(self, tmp_path):
+        """ID3v2 标签内的字节不能被当成音频帧。"""
+        path = tmp_path / "with_id3.mp3"
+        tag_size = 200
+        id3 = b"ID3\x04\x00\x00" + bytes([
+            (tag_size >> 21) & 0x7F, (tag_size >> 14) & 0x7F,
+            (tag_size >> 7) & 0x7F, tag_size & 0x7F,
+        ]) + b"\x00" * tag_size
+        frames = 60
+        frame_length = 288
+        header = bytes([0xFF, 0xF3, 0xA4, 0xC4])
+        path.write_bytes(id3 + (header + b"\x00" * (frame_length - 4)) * frames)
+
+        duration = probe_duration(path)
+        assert duration is not None
+        assert duration == pytest.approx(frames * 576 / 24000, abs=0.05)
+
+    def test_rejects_garbage_after_sync_word(self, tmp_path):
+        """只有同步字但帧头非法时不能瞎猜时长。"""
+        path = tmp_path / "bad.mp3"
+        path.write_bytes(bytes([0xFF, 0xFF, 0xFF, 0xFF]) * 100)
+        assert probe_duration(path) is None
 
     def test_returns_none_for_unknown_format(self, tmp_path):
         path = tmp_path / "t.bin"

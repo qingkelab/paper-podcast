@@ -74,10 +74,12 @@
 
 ```json
 { "status": "ok", "version": "0.1.0",
-  "modes": { "llm": "mock", "tts": "mock" } }
+  "modes": { "llm": "deepseek", "tts": "doubao" } }
 ```
 
-`modes.*` 取值 `"mock"` 或 `"doubao"`，前端在顶栏显示「Mock 模式」角标。
+`modes.llm` 取值 `"deepseek"` | `"doubao"` | `"mock"`。
+`modes.tts` 取值 `"doubao"` | `"mock"`。
+前端在顶栏显示对应角标（Mock 时提示「Mock 模式」）。
 
 ### `GET /api/options`
 
