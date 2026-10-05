@@ -16,8 +16,18 @@ from __future__ import annotations
 
 from typing import Any
 
-# 中文播客舒适语速（字/分钟）。真人和 TTS 都在这个区间。
-CHARS_PER_MINUTE = 250
+# 豆包播客音色的真实语速（字/分钟）。
+#
+# ⚠️ 这个值是**实测反推**出来的，不是拍的。用两次真实合成结果算：
+#   - 238 字 → 总时长 58.49s，扣掉 17s 片头片尾音乐 → 41.5s → 344 字/分钟
+#   - 1787 字 → 总时长 319.01s，扣掉 17s → 302.0s       → 355 字/分钟
+# 早先按「中文播客常识」填了 250，导致时长控制偏差 20~26%：
+# 用户选 10 分钟只会拿到约 7.4 分钟的音频。
+CHARS_PER_MINUTE = 350
+
+# 服务端默认会加片头/片尾音乐，实测各约 7.0s / 9.95s。
+# 估算总时长时必须算进去，否则短节目的预估会明显偏短。
+MUSIC_PADDING_SEC = 17.0
 
 # 各难度档的表达约束
 LEVEL_GUIDE: dict[str, str] = {
@@ -38,9 +48,27 @@ LEVEL_GUIDE: dict[str, str] = {
 }
 
 
-def target_chars(duration_min: int) -> int:
-    """把目标时长换算成脚本字数。"""
-    return CHARS_PER_MINUTE * duration_min
+def effective_rate(speech_rate: int = 0) -> float:
+    """把语速档位换算成实际语速（字/分钟）。
+
+    服务端的 speech_rate 是百分比：-50 = 0.5x，100 = 2.0x。
+    字数预算必须跟着它联动，否则调慢语速后实际时长会超出目标。
+    """
+    return CHARS_PER_MINUTE * (1.0 + speech_rate / 100.0)
+
+
+def target_chars(duration_min: int, speech_rate: int = 0) -> int:
+    """把目标时长换算成脚本字数。
+
+    要扣掉片头/片尾音乐占用的时间，否则估出来的字数偏多、实际时长超目标。
+    """
+    speech_seconds = max(duration_min * 60 - MUSIC_PADDING_SEC, 30.0)
+    return int(speech_seconds / 60 * effective_rate(speech_rate))
+
+
+def estimate_duration_sec(chars: int, speech_rate: int = 0) -> int:
+    """脚本字数 → 预期音频时长（含片头片尾音乐）。"""
+    return round(chars / effective_rate(speech_rate) * 60 + MUSIC_PADDING_SEC)
 
 
 # --------------------------------------------------------------------------
@@ -170,15 +198,17 @@ def build_script_messages(
     *,
     duration_min: int,
     level: str,
+    speech_rate: int = 0,
 ) -> list[dict[str, str]]:
-    chars = target_chars(duration_min)
+    chars = target_chars(duration_min, speech_rate)
+    rate = effective_rate(speech_rate)
     level_text = LEVEL_GUIDE.get(level, LEVEL_GUIDE["intro"])
     meta = paper_meta or {}
 
     brief = [
-        f"【目标时长】{duration_min} 分钟（中文播客语速约 {CHARS_PER_MINUTE} 字/分钟，"
-        f"所以全文总字数控制在 {int(chars * 0.85)}-{int(chars * 1.1)} 字之间，"
-        f"这是硬约束，超了会被裁掉）",
+        f"【目标时长】{duration_min} 分钟（这套音色的实测语速约 {rate:.0f} 字/分钟，"
+        f"另有约 {int(MUSIC_PADDING_SEC)} 秒片头片尾音乐，所以全文总字数控制在 "
+        f"{int(chars * 0.92)}-{int(chars * 1.05)} 字之间，这是硬约束，超了会被裁掉）",
         f"【讲解难度】{level_text}",
         f"【论文标题】{meta.get('title') or '未知'}",
     ]
@@ -238,4 +268,60 @@ def build_title_messages(paper_text: str) -> list[dict[str, str]]:
             "content": "你从论文正文中提取标题。只输出标题本身，不要引号、不要解释、不要句号。",
         },
         {"role": "user", "content": paper_text[:2000]},
+    ]
+
+
+# --------------------------------------------------------------------------
+# 第三步（按需）：脚本长度修复
+# --------------------------------------------------------------------------
+#
+# 为什么需要这一步：模型并不总是遵守 prompt 里的字数预算。实测同一套 prompt
+# 下，3 分钟档超出 7%、5 分钟档欠了 35%（1065 字 vs 目标 1650 字，产出只有
+# 3.27 分钟）。靠措辞约束是不可靠的，所以在生成后做一次确定性检查，
+# 不达标才补一次针对性的扩写。
+#
+# 扩写与「注水」的区别在于：要求模型把抽象讲具体、补例子和类比、把追问写细，
+# 而不是加过渡句和总结。prompt 里对此有明确约束。
+
+EXPAND_SYSTEM = """你是播客撰稿人，正在把一版偏短的稿子改写成目标长度。\
+听众反馈「内容太赶、很多地方没听懂」，所以你要把话讲透，而不是把话说多。
+
+【怎么做】
+- 抽象的地方讲具体：凡是出现「效果好」「有提升」这类说法，都要落到具体数字、具体场景。
+- 给每个技术点补一个例子或类比，尤其是机制性内容。
+- 把主播B的追问写得更具体、更像真听众会问的问题，A的回答随之展开。
+- 可以补充方法的技术细节、实验设置、适用边界，但必须来自给定的解读稿，不许编造。
+- 保持原有的观点、结论和事实不变。
+
+【不要做】
+- 不要加过渡句、铺垫句、小总结来凑字数。
+- 不要重复已经说过的内容换种说法。
+- 不要新增原文里没有的数据、结论或评价。
+- 保持原有的开场方式和收尾方式，不要改成另一套。
+
+输出 JSON：{"segments": [{"speaker": "A", "text": "..."}]}，speaker 只能是 A 或 B，\
+每段 30-120 字，禁止 Markdown。"""
+
+
+def build_expand_messages(
+    segments: list[dict],
+    *,
+    current_chars: int,
+    target: int,
+) -> list[dict[str, str]]:
+    script_text = "\n".join(
+        f"主播{'A' if seg.get('speaker') == 'A' else 'B'}：{seg.get('text', '')}"
+        for seg in segments
+    )
+    need = max(target - current_chars, 0)
+    user = f"""下面这版播客脚本共 {current_chars} 字，目标长度是 {target} 字左右，\
+还差约 {need} 字。请在保持结构、观点、事实完全不变的前提下把它扩写到目标长度。
+
+【当前脚本】
+{script_text}
+
+请输出扩写后的完整脚本 JSON（是完整替换，不是只输出新增部分）。"""
+    return [
+        {"role": "system", "content": EXPAND_SYSTEM},
+        {"role": "user", "content": user},
     ]

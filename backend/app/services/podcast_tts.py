@@ -338,6 +338,7 @@ class PodcastTTSClient:
         voice_b: str,
         output_path: Path,
         on_round: Callable[[int, str], None] | None = None,
+        speech_rate: int = 0,
     ) -> SynthesisResult:
         if self.mock:
             return await self._synthesize_mock(
@@ -349,6 +350,7 @@ class PodcastTTSClient:
             voice_b=voice_b,
             output_path=output_path,
             on_round=on_round,
+            speech_rate=speech_rate,
         )
 
     # ---------- 真实调用 ----------
@@ -361,6 +363,7 @@ class PodcastTTSClient:
         voice_b: str,
         output_path: Path,
         on_round: Callable[[int, str], None] | None,
+        speech_rate: int = 0,
     ) -> SynthesisResult:
         try:
             import websockets
@@ -377,6 +380,7 @@ class PodcastTTSClient:
             script_segments=segments,
             voice_a=voice_a,
             voice_b=voice_b,
+            speech_rate=speech_rate,
         )
 
         headers = auth_headers(settings, connect_id)

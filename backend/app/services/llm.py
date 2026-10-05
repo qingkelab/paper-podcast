@@ -18,6 +18,10 @@ from . import prompts
 
 logger = logging.getLogger(__name__)
 
+# 脚本字数低于目标的这个比例时，触发一次扩写补救。
+# 0.9 的意思是「允许比目标短 10%」，超出这个范围才多花一次模型调用。
+LENGTH_REPAIR_THRESHOLD = 0.9
+
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
 
@@ -145,14 +149,25 @@ class LLMClient:
         *,
         duration_min: int,
         level: str,
+        speech_rate: int = 0,
     ) -> dict[str, Any]:
         """返回 script dict：{segments, word_count, est_duration_sec}。"""
         if self.mock:
-            return mock_script(analysis, paper_meta, duration_min=duration_min, level=level)
+            return mock_script(
+                analysis,
+                paper_meta,
+                duration_min=duration_min,
+                level=level,
+                speech_rate=speech_rate,
+            )
 
         data = self._chat_json(
             prompts.build_script_messages(
-                analysis, paper_meta, duration_min=duration_min, level=level
+                analysis,
+                paper_meta,
+                duration_min=duration_min,
+                level=level,
+                speech_rate=speech_rate,
             ),
             max_tokens=8000,
             temperature=0.9,  # 脚本需要文采，适度放开
@@ -160,7 +175,78 @@ class LLMClient:
         segments = _normalize_segments(data.get("segments"))
         if len(segments) < 4:
             raise LLMError("模型生成的播客脚本过短，无法合成")
-        return build_script_payload(segments)
+
+        script = build_script_payload(segments, speech_rate=speech_rate)
+        return self._repair_length_if_needed(
+            script,
+            analysis=analysis,
+            duration_min=duration_min,
+            level=level,
+            speech_rate=speech_rate,
+        )
+
+    def _repair_length_if_needed(
+        self,
+        script: dict[str, Any],
+        *,
+        analysis: dict[str, Any],
+        duration_min: int,
+        level: str,
+        speech_rate: int,
+    ) -> dict[str, Any]:
+        """生成后做一次确定性长度检查，偏短就补一次扩写。
+
+        为什么不只靠 prompt：实测同一套 prompt 下，3 分钟档超出 7%、
+        5 分钟档却欠了 35%（1065 字 vs 目标 1650 字）。模型对字数的遵守
+        程度不稳定，所以用「检查实际字数 → 不达标才补救」兜底，
+        而不是反复调措辞。只补一次，避免无限循环和成本失控。
+        """
+        target = prompts.target_chars(duration_min, speech_rate)
+        actual = script.get("word_count", 0)
+
+        if actual >= target * LENGTH_REPAIR_THRESHOLD:
+            return script
+
+        logger.info(
+            "脚本偏短（%d 字 / 目标 %d 字，达 %.0f%%），追加一次扩写",
+            actual,
+            target,
+            actual / max(target, 1) * 100,
+        )
+
+        try:
+            data = self._chat_json(
+                prompts.build_expand_messages(
+                    script["segments"], current_chars=actual, target=target
+                ),
+                max_tokens=12000,
+                temperature=0.85,
+            )
+        except LLMError as exc:
+            # 扩写失败不该让整个任务失败：原脚本本身可用，只是短一些。
+            logger.warning("扩写失败，沿用原脚本：%s", exc)
+            return script
+
+        expanded = _normalize_segments(data.get("segments"))
+        if len(expanded) < 4:
+            logger.warning("扩写结果无效（%d 段），沿用原脚本", len(expanded))
+            return script
+
+        repaired = build_script_payload(expanded, speech_rate=speech_rate)
+
+        # 扩写反而更短说明模型没按要求做，保留原稿更稳妥
+        if repaired["word_count"] <= actual:
+            logger.warning(
+                "扩写后并未变长（%d → %d 字），沿用原脚本",
+                actual,
+                repaired["word_count"],
+            )
+            return script
+
+        logger.info(
+            "扩写完成：%d → %d 字（目标 %d 字）", actual, repaired["word_count"], target
+        )
+        return repaired
 
     # ---------- 内部 ----------
 
@@ -324,7 +410,9 @@ def _normalize_segments(value: Any) -> list[dict[str, Any]]:
     return segments
 
 
-def build_script_payload(segments: list[dict[str, Any]]) -> dict[str, Any]:
+def build_script_payload(
+    segments: list[dict[str, Any]], *, speech_rate: int = 0
+) -> dict[str, Any]:
     """补上 round 编号与字数/时长统计。"""
     total_chars = 0
     payload_segments = []
@@ -337,7 +425,7 @@ def build_script_payload(segments: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "segments": payload_segments,
         "word_count": total_chars,
-        "est_duration_sec": round(total_chars / prompts.CHARS_PER_MINUTE * 60),
+        "est_duration_sec": prompts.estimate_duration_sec(total_chars, speech_rate),
     }
 
 
@@ -448,6 +536,7 @@ def mock_script(
     *,
     duration_min: int,
     level: str,
+    speech_rate: int = 0,
 ) -> dict[str, Any]:
     title = (paper_meta or {}).get("title") or "这篇论文"
     innovations = analysis.get("innovations") or []
@@ -473,7 +562,7 @@ def mock_script(
     ]
 
     # 按目标时长裁剪：保留首尾，删掉中间对谈
-    target = prompts.target_chars(duration_min)
+    target = prompts.target_chars(duration_min, speech_rate)
     total = sum(len(t) for _, t in lines)
     while total > target * 1.15 and len(lines) > 6:
         remove_at = len(lines) - 3
@@ -481,4 +570,4 @@ def mock_script(
         lines.pop(remove_at)
 
     segments = [{"speaker": speaker, "text": text} for speaker, text in lines]
-    return build_script_payload(segments)
+    return build_script_payload(segments, speech_rate=speech_rate)

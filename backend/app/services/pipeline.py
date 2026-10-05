@@ -104,6 +104,7 @@ class Pipeline:
         level = str(options.get("level") or "intro")
         voice_a = options.get("voice_a") or self.settings.default_voice_a
         voice_b = options.get("voice_b") or self.settings.default_voice_b
+        speech_rate = int(self.settings.podcast_speech_rate or 0)
 
         try:
             # ---- 1. 解析 ----
@@ -135,7 +136,11 @@ class Pipeline:
             # ---- 3. 脚本 ----
             self._set_stage(episode_id, "scripting")
             script = self.llm.generate_script(
-                analysis, paper_meta, duration_min=duration_min, level=level
+                analysis,
+                paper_meta,
+                duration_min=duration_min,
+                level=level,
+                speech_rate=speech_rate,
             )
             self.db.update_episode(episode_id, script=script)
 
@@ -159,6 +164,7 @@ class Pipeline:
                 voice_b=voice_b,
                 output_path=audio_path,
                 on_round=on_round,
+                speech_rate=speech_rate,
             )
 
             # ---- 5. 完成 ----

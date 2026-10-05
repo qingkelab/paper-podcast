@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     default_voice_a: str = "zh_male_dayixiansheng_v2_saturn_bigtts"
     default_voice_b: str = "zh_female_mizaitongxue_v2_saturn_bigtts"
 
+    # 播客合成语速。范围 -50(0.5x) ~ 100(2.0x)，0 为音色标准语速。
+    # 这几个音色在 0 档实测约 350 字/分钟，对中文听众偏快（人声叙述通常 240~280），
+    # 觉得赶的话调到 -20 ~ -30 会舒服很多。字数预算会随语速自动联动。
+    podcast_speech_rate: int = 0
+
     # ---- 行为开关 ----
     # 强制走 Mock（即使有密钥）。留空表示按密钥是否齐全自动判断。
     force_mock: bool = False

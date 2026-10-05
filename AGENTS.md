@@ -2,7 +2,8 @@
 
 ## 这是什么
 
-把论文变成双人对谈播客的全栈应用。前端 Vue3 + 后端 FastAPI + 豆包（方舟大模型 / 语音播客 TTS）。
+把论文变成双人对谈播客的全栈应用。前端 Vue3 + 后端 FastAPI + DeepSeek（文本解读/脚本）+ 豆包语音播客（音频合成）。
+豆包方舟（Ark）作为大模型备选，用 `LLM_PROVIDER` 切换。
 **无密钥也能跑**：缺哪个密钥，哪一步就自动降级为 Mock。
 
 ## 常用命令
@@ -30,7 +31,8 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 
 - **`docs/API.md` 是前后端的唯一契约**。改接口先改它，字段名不许各自发明。
   列表接口要省略 `analysis`/`script` 大字段（否则列表响应会到 MB 级）。
-- **密钥只在后端**。前端任何地方不得出现 `ARK_API_KEY` / `DOUBAO_*`。
+- **密钥只在后端**（`.env`，已被 gitignore）。前端任何地方不得出现
+  `DEEPSEEK_API_KEY` / `ARK_API_KEY` / `DOUBAO_*`。
 - **Prompt 改动要跑测试**。`backend/app/services/prompts.py` 是本产品的核心资产，
   `tests/test_services.py::TestPromptConstraints` 锁定了「反 AI 腔负面清单」和字数预算，
   别把它当装饰删掉。
@@ -49,13 +51,26 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   抛 `UnboundLocalError`。用 `extend()` 或改成纯函数返回列表（`_markdown_section` 就是这么改的）。
 - **正文清洗判定用字符位置而不是行号**。PDF 抽出来的正文常是少数超长行，
   按行号算「是否进入后半段」会漏掉参考文献。
+- **播客合成必须收到 150 后立刻发 FinishSession(102)**。服务端只有收到它才会在
+  合成完毕后发 152。放进 finally（循环结束后才发）会导致永远等不到 152、
+  每次都误判超时，并把已经完整收到的音频整个丢掉。实测过，这是唯一正确的时序。
+- **362（轮次结束）没有 round_id**，只能从 360 跟踪；且 round_id 会出现
+  -1/9999/10000（片头音乐/片尾音乐/水印），不能计入进度回调。
+- **豆包返回的是 24000Hz 的 MPEG2 MP3**。做时长估算必须区分 MPEG1/2/2.5 与
+  Layer I/II/III 的比特率表——按 MPEG1 表算会把 58.52 秒算成 35.11 秒。
+  现在用逐帧累计采样数，对 CBR/VBR 都精确。
+- **时长靠字数控制，而模型不守字数预算**。语速常量（350 字/分钟）和音乐时长
+  （17 秒）是从真实结果反推的，别凭「中文播客常识」改。光靠 prompt 约束字数
+  不可靠（实测欠过 35%），所以有 `_repair_length_if_needed` 做生成后兜底。
+- **macOS 系统代理开着 SOCKS 时**，websockets 会自动读取系统代理，缺 python-socks
+  会直接连接失败。
 
 ## 结构
 
 ```
-backend/app/services/     ingest(预处理) prompts(Prompt) llm(方舟) podcast_tts(语音) pipeline(编排)
+backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟) podcast_tts(语音) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            81 项，改完必须全绿
+backend/tests/            126 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 

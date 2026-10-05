@@ -140,8 +140,45 @@ class TestBuildScriptPayload:
 
 
 class TestPromptConstraints:
-    def test_target_chars_scales_with_duration(self):
-        assert prompts.target_chars(10) == prompts.target_chars(5) * 2
+    def test_target_chars_roundtrips_to_requested_duration(self):
+        """最重要的一致性：按目标字数写出来的脚本，预测时长应当回到用户选的分钟数。"""
+        for minutes in (3, 5, 10):
+            chars = prompts.target_chars(minutes)
+            predicted = prompts.estimate_duration_sec(chars)
+            assert abs(predicted - minutes * 60) <= 20, (
+                f"选 {minutes} 分钟，按 {chars} 字预测 {predicted} 秒，偏差过大"
+            )
+
+    def test_target_chars_amortizes_music_padding(self):
+        """片头片尾音乐是固定开销，时长越长摊得越薄。
+
+        所以每分钟字数随时长**递增**：target_chars(10)/10 > target_chars(5)/5。
+        """
+        assert prompts.target_chars(10) > prompts.target_chars(5)
+        per_minute_5 = prompts.target_chars(5) / 5
+        per_minute_10 = prompts.target_chars(10) / 10
+        assert per_minute_10 > per_minute_5
+
+    def test_duration_model_matches_real_measurements(self):
+        """用两次真实合成结果校准过的模型，不能随意改动常量而不复核。
+
+        实测：
+        - 238 字  → 58.49 秒
+        - 1787 字 → 319.01 秒
+        """
+        assert prompts.estimate_duration_sec(238) == pytest.approx(58.5, abs=3)
+        assert prompts.estimate_duration_sec(1787) == pytest.approx(319.0, abs=8)
+
+    def test_slower_speech_rate_needs_fewer_chars(self):
+        """调慢语速后，同样时长所需的字数必须变少，否则实际时长会超标。"""
+        assert prompts.target_chars(5, -20) < prompts.target_chars(5, 0)
+        assert prompts.target_chars(5, 20) > prompts.target_chars(5, 0)
+
+    def test_speech_rate_roundtrips(self):
+        for rate in (-30, -20, 0, 50):
+            chars = prompts.target_chars(5, rate)
+            predicted = prompts.estimate_duration_sec(chars, rate)
+            assert abs(predicted - 300) <= 20, f"speech_rate={rate} 往返偏差过大"
 
     def test_script_prompt_states_word_budget(self):
         messages = prompts.build_script_messages(
@@ -150,8 +187,8 @@ class TestPromptConstraints:
         user = messages[-1]["content"]
         target = prompts.target_chars(5)
         # prompt 里给的是区间而不是单点，两端都要出现，模型才有明确的目标
-        assert str(int(target * 0.85)) in user
-        assert str(int(target * 1.1)) in user
+        assert str(int(target * 0.92)) in user
+        assert str(int(target * 1.05)) in user
         assert "硬约束" in user
         assert "5 分钟" in user
 
