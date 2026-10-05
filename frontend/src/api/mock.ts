@@ -553,9 +553,10 @@ function ensureLoaded(): void {
 
 function buildScriptText(episode: Episode): string {
   const segments = episode.script?.segments ?? []
-  return segments
-    .map((segment) => `【主播${segment.speaker}】${segment.text}`)
-    .join('\n')
+  // 与真实后端 /script.txt 的输出格式保持一致：标题 + 分隔线 + 空行分隔的逐段脚本
+  const header = [`《${episode.paper_meta?.title ?? episode.title}》`, '双人播客脚本', '='.repeat(40), '']
+  const body = segments.map((segment) => `【主播${segment.speaker}】${segment.text}`)
+  return [...header, ...body.flatMap((line) => [line, ''])].join('\n').trimEnd()
 }
 
 function buildAnalysisMarkdown(episode: Episode): string {
@@ -564,16 +565,13 @@ function buildAnalysisMarkdown(episode: Episode): string {
   const lines: string[] = []
 
   lines.push(`# ${meta?.title ?? episode.title}`, '')
-  const metaBits: string[] = []
-  if (meta?.authors?.length) metaBits.push(`**作者**：${meta.authors.join('、')}`)
-  if (meta?.year) metaBits.push(`**年份**：${meta.year}`)
-  if (meta?.venue) metaBits.push(`**会议/期刊**：${meta.venue}`)
-  if (meta?.arxiv_id) metaBits.push(`**arXiv**：[${meta.arxiv_id}](https://arxiv.org/abs/${meta.arxiv_id})`)
-  if (meta?.keywords?.length) metaBits.push(`**关键词**：${meta.keywords.join('、')}`)
-  if (metaBits.length) {
-    lines.push(...metaBits.map((bit) => `- ${bit}`), '')
+  if (meta?.authors?.length) lines.push(`**作者**：${meta.authors.join(', ')}`)
+  if (meta?.year) lines.push(`**发表**：${meta.venue ?? meta.year}`)
+  if (meta?.arxiv_id) {
+    lines.push(`**arXiv**：[${meta.arxiv_id}](https://arxiv.org/abs/${meta.arxiv_id})`)
   }
-  if (meta?.abstract) lines.push(`> ${meta.abstract}`, '')
+  if (meta?.keywords?.length) lines.push(`**关键词**：${meta.keywords.join(', ')}`)
+  lines.push('')
 
   if (!analysis) {
     lines.push('_解读尚未生成。_')
@@ -589,17 +587,17 @@ function buildAnalysisMarkdown(episode: Episode): string {
     lines.push(`## ${title}`, '', ...items.map((item) => `- ${item}`), '')
   }
 
+  section('摘要', meta?.abstract)
   section('研究背景', analysis.background)
-  listSection('创新点', analysis.innovations)
+  listSection('核心创新点', analysis.innovations)
   section('研究方法', analysis.method)
   section('实验结果', analysis.experiments)
   section('核心结论', analysis.conclusion)
   listSection('存在不足', analysis.limitations)
-  section('行业价值', analysis.value)
-  listSection('未来方向', analysis.future)
+  section('行业应用价值', analysis.value)
+  listSection('未来研究方向', analysis.future)
 
-  lines.push('---', '', `由「论文解读 AI 播客」生成 · 单集 ${episode.id}`)
-  return lines.join('\n')
+  return lines.join('\n').trimEnd()
 }
 
 function textBlobUrl(content: string, type: string): string {
