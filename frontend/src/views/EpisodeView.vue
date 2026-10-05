@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
   IS_MOCK,
@@ -12,10 +12,12 @@ import {
   retryEpisode,
   scriptTxtUrl,
 } from '../api'
-import type { Episode, Figure, VideoInfo } from '../api'
+import type { Analysis, Episode, Figure, VideoInfo } from '../api'
 import AudioPlayer from '../components/AudioPlayer.vue'
 import AnalysisView from '../components/AnalysisView.vue'
+import FigureGallery from '../components/FigureGallery.vue'
 import FigureLightbox from '../components/FigureLightbox.vue'
+import PaperMetaSection from '../components/PaperMetaSection.vue'
 import ScriptView from '../components/ScriptView.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
@@ -36,11 +38,7 @@ let audioRetryTimer: number | undefined
 
 const isCompleted = computed(() => episode.value?.status === 'completed')
 const isFailed = computed(() => episode.value?.status === 'failed')
-const paper = computed(() => episode.value?.paper_meta ?? null)
 const audioSrc = computed(() => (episode.value ? audioUrl(episode.value) : null))
-const arxivUrl = computed(() =>
-  paper.value?.arxiv_id ? `https://arxiv.org/abs/${paper.value.arxiv_id}` : null,
-)
 /** 失败原因既可能来自 episode.error，也可能来自网络异常 */
 const failureText = computed(() => episode.value?.error ?? error.value)
 
@@ -107,6 +105,18 @@ const videoSizeLabel = computed(() => {
   return size ? `${size.width}×${size.height}` : VIDEO_NOMINAL_SIZE
 })
 
+/**
+ * 音频播放器何时出场。
+ *
+ * 页面有两种展示形态（见模板）：
+ *   - 有视频（episode.video 非 null）：视频为主。视频自带音轨，独立音频播放器会让人
+ *     不知道该点哪个，所以整个不渲染 —— 互斥逻辑此时自然不会触发。
+ *   - 没有视频：完全保持改造前的样子，音频播放器照旧。
+ * 另外视频地址真的打不开时（videoFailed）把音频播放器顶上来，兑现降级提示里
+ * 「音频、脚本与解读都不受影响」这句话；此时双向互斥依旧生效。
+ */
+const audioVisible = computed(() => !video.value || videoFailed.value)
+
 function downloadVideo(): void {
   const url = video.value?.url
   if (!url) return
@@ -171,16 +181,6 @@ function onAudioPlay(element: HTMLAudioElement): void {
 
 const figures = computed<Figure[]>(() => episode.value?.figures ?? [])
 const lightboxIndex = ref<number | null>(null)
-/** 加载失败的图：退化成占位卡，不留破图 */
-const brokenFigures = ref<string[]>([])
-
-function isBroken(figure: Figure): boolean {
-  return brokenFigures.value.includes(figure.id)
-}
-
-function markBroken(figureId: string): void {
-  if (!brokenFigures.value.includes(figureId)) brokenFigures.value = [...brokenFigures.value, figureId]
-}
 
 function openFigure(index: number): void {
   lightboxIndex.value = index
@@ -193,27 +193,67 @@ function navigateFigure(delta: number): void {
   lightboxIndex.value = (current + delta + count) % count
 }
 
+// ---------------------------------------------------------------------------
+// 折叠区（只有「有视频」形态才用得上）
+// ---------------------------------------------------------------------------
+
+/** 收起的 <details> 里元素高度是 0，靠 scrollIntoView 会滚到错的位置，所以先展开再滚 */
+const scriptFold = ref<HTMLDetailsElement | null>(null)
+const analysisFold = ref<HTMLDetailsElement | null>(null)
+
+/**
+ * 「结构化解读」的板块数。
+ * 判据和 AnalysisView 里的 CARDS 过滤保持一致（只数有内容的板块）；
+ * 那个列表是组件内部的，这里如果要跟着改，两处记得一起动。
+ */
+const ANALYSIS_FIELDS: Array<keyof Analysis> = [
+  'background',
+  'innovations',
+  'method',
+  'experiments',
+  'conclusion',
+  'limitations',
+  'value',
+  'future',
+]
+
+const scriptSegments = computed(() => episode.value?.script?.segments.length ?? 0)
+const scriptWords = computed(() => episode.value?.script?.word_count ?? 0)
+const analysisCards = computed(() => {
+  const analysis = episode.value?.analysis
+  if (!analysis) return 0
+  return ANALYSIS_FIELDS.filter((key) => {
+    const value = analysis[key]
+    if (Array.isArray(value)) return value.some((item) => Boolean(item && item.trim()))
+    return typeof value === 'string' && Boolean(value.trim())
+  }).length
+})
+
+function toggleFold(fold: HTMLDetailsElement | null, open: boolean): void {
+  if (fold) fold.open = open
+}
+
+/**
+ * 回车键开合折叠区。
+ *
+ * <summary> 原生只认空格（实测 Chrome 里 Enter 不触发开合，Firefox/Safari 认），
+ * 所以这里补一个 Enter 处理让两边一致。用 .prevent 先把默认行为掐掉：
+ * 在原生认 Enter 的浏览器里，默认行为会再合成一次 click，不掐掉就会「开→关」白折腾一下。
+ */
+function onSummaryEnter(event: KeyboardEvent): void {
+  const fold = (event.currentTarget as HTMLElement | null)?.closest('details')
+  if (fold) fold.open = !fold.open
+}
+
 // /episode/:id → /episode/:other 命中同一个路由记录，组件会被复用、onMounted 不会重跑。
 // 不监听 id 的话，页面会继续显示上一集的封面与配图（URL 已经变了），所以这里必须重新拉数据。
 watch(id, () => {
   coverFailed.value = false
   coverLoaded.value = false
   lightboxIndex.value = null
-  brokenFigures.value = []
   resetVideoState()
   episode.value = null
   void load()
-})
-
-const metaItems = computed(() => {
-  const value = paper.value
-  if (!value) return []
-  const items: Array<{ label: string; value: string }> = []
-  if (value.authors?.length) items.push({ label: '作者', value: value.authors.join('、') })
-  if (value.year) items.push({ label: '年份', value: String(value.year) })
-  if (value.venue) items.push({ label: '会议 / 期刊', value: value.venue })
-  if (value.arxiv_id) items.push({ label: 'arXiv', value: value.arxiv_id })
-  return items
 })
 
 function scheduleAudioRefetch(): void {
@@ -275,6 +315,23 @@ function downloadAnalysis(): void {
   downloadUrl(url, `${safeName()}-解读.md`)
 }
 
+/**
+ * 下载播客音频（mp3）。
+ *
+ * 只有「有视频」形态才需要它：那种形态下独立音频播放器被去掉了，页面里再没有第二个
+ * 能拿到音频文件的入口（视频那个播放器不便另存为 mp3）。无视频形态保持原样——
+ * 音频播放器就在页面上，且下载行不动才符合「不改动无视频页面」的要求。
+ */
+function downloadAudio(): void {
+  downloadError.value = null
+  const url = audioSrc.value
+  if (!url) {
+    downloadError.value = '音频还没有生成，暂时无法下载'
+    return
+  }
+  downloadUrl(url, `${safeName()}-播客音频.mp3`)
+}
+
 async function retry(): Promise<void> {
   retrying.value = true
   error.value = null
@@ -288,8 +345,19 @@ async function retry(): Promise<void> {
   }
 }
 
-function scrollToSection(section: 'script' | 'analysis'): void {
-  document.getElementById(`section-${section}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+/**
+ * 「跳到脚本 / 跳到解读」：目标在收起的折叠区里时高度是 0，直接 scrollIntoView 会滚错，
+ * 所以先展开、等布局落定（nextTick）再滚。无视频形态下目标就是普通区块，行为同上。
+ */
+function scrollToSection(section: 'script' | 'analysis' | 'figures'): void {
+  if (section === 'script') toggleFold(scriptFold.value, true)
+  else if (section === 'analysis') toggleFold(analysisFold.value, true)
+  void nextTick(() => {
+    document.getElementById(`section-${section}`)?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    })
+  })
 }
 
 onMounted(() => {
@@ -332,8 +400,13 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-else-if="episode">
-      <!-- 封面 hero：放在标题上方。cover_url 为 null 或加载失败时整块不渲染（不留空白、不留破图） -->
-      <figure v-if="coverSrc" class="hero">
+      <!--
+        封面 hero：只有「没有视频」时才渲染。
+        有视频解读时视频片头几秒就是论文首页整页，再放一张同样的图纯属重复，
+        还会把真正的主角（视频）挤到首屏之外。
+        cover_url 为 null 或加载失败时整块不渲染（不留空白、不留破图）。
+      -->
+      <figure v-if="!video && coverSrc" class="hero">
         <div class="hero__art" :style="{ aspectRatio: coverRatio }">
           <img class="hero__glow" :src="coverSrc" alt="" aria-hidden="true" decoding="async" />
           <img
@@ -403,10 +476,56 @@ onBeforeUnmount(() => {
       </div>
 
       <!--
-        视频解读播客：video 为 null 时整块不渲染（不留空标题、不留空白块）。
-        位置放在音频播放器之前：视频是「完整版」产物，先看视频再听音频更符合使用顺序。
+        ================= 有视频的形态：视频为主 =================
+        可见区块与顺序：标题 → 下载按钮行 → 视频播放区 → 论文元信息 → 三个折叠区。
+        视频排在元信息之前：元信息卡片有 400+ px，挡在中间会让视频掉到首屏之外，
+        那样就不叫「视频为主」了（元信息挪到视频之后，见下面的 PaperMetaSection）。
       -->
-      <section v-if="video" id="section-video" class="section">
+
+      <!--
+        下载按钮行：视频 / 脚本 / 解读一起给，跳转按钮会先展开对应折叠区再滚过去。
+        视频没能加载（videoFailed）时整行让位给下面的音频形态，避免同页出现两排一样的按钮。
+        体积/时长这类元信息单独占一行（见下面的 .video-meta）：按钮数量以后还会变，
+        靠 flex 挤出来的换行不稳。
+      -->
+      <template v-if="video && isCompleted && !videoFailed">
+        <div class="row video-actions">
+          <button type="button" class="btn btn--sm btn--primary" @click="downloadVideo">
+            ↓ 下载视频（mp4）
+          </button>
+          <button type="button" class="btn btn--sm" @click="downloadAudio">↓ 下载音频（mp3）</button>
+          <button type="button" class="btn btn--sm" @click="downloadScript">↓ 下载脚本（txt）</button>
+          <button type="button" class="btn btn--sm" @click="downloadAnalysis">↓ 下载解读（md）</button>
+          <button type="button" class="btn btn--sm btn--ghost" @click="scrollToSection('figures')">
+            跳到原图
+          </button>
+          <button type="button" class="btn btn--sm btn--ghost" @click="scrollToSection('script')">
+            跳到脚本
+          </button>
+          <button type="button" class="btn btn--sm btn--ghost" @click="scrollToSection('analysis')">
+            跳到解读
+          </button>
+        </div>
+
+        <p class="video-meta">
+          <span v-if="IS_MOCK" class="badge badge--neutral">演示模式：视频为占位</span>
+          <span class="file-pill__size">
+            视频 {{ formatDuration(videoDuration) }} · {{ videoSizeLabel }}<template v-if="video.bytes">
+              · {{ formatBytes(video.bytes) }}</template
+            >
+          </span>
+        </p>
+
+        <p v-if="downloadError" class="section__hint" style="color: var(--danger); margin-top: 10px">
+          {{ downloadError }}
+        </p>
+      </template>
+
+      <!--
+        视频解读播客：video 为 null 时整块不渲染（不留空标题、不留空白块）。
+        位置紧跟标题与下载行：视频是主产物，不该被脚本、解读这些长内容挤到下面。
+      -->
+      <section v-if="video" id="section-video" class="section section--lead">
         <div class="section__head">
           <h2 class="section__title">视频解读播客</h2>
           <span class="section__hint">
@@ -441,7 +560,7 @@ onBeforeUnmount(() => {
                 <span class="vplayer__broken-glyph" aria-hidden="true">▶</span>
                 <p class="vplayer__broken-title">视频暂时加载不出来</p>
                 <p class="section__hint" style="margin-bottom: 14px">
-                  视频地址不可用，可能还在合成中或已被清理。音频、脚本与解读都不受影响。
+                  视频地址不可用，可能还在合成中或已被清理。脚本、解读与原图都不受影响。
                 </p>
                 <button type="button" class="btn btn--sm" @click="retryVideo">重新加载视频</button>
               </div>
@@ -472,21 +591,28 @@ onBeforeUnmount(() => {
                 每段画面底部有字幕条，主播 A / 主播 B 用不同颜色区分。
               </p>
               <p class="section__hint">
-                本页音频与视频互斥播放：播放其中一个会自动暂停另一个，不会同时出声。
+                视频自带音轨（H.264 + AAC），不需要另外播放音频<template v-if="videoFailed"
+                  >；视频没能加载，已把音频播放器放到下方，两者互斥，不会同时出声</template
+                >。论文原图、脚本与解读都在下面的折叠区里，点标题展开。
               </p>
-
-              <div class="vplayer__actions">
-                <button type="button" class="btn btn--sm btn--primary" @click="downloadVideo">
-                  ↓ 下载视频（mp4）
-                </button>
-                <span v-if="IS_MOCK" class="badge badge--neutral">演示模式：视频为占位</span>
-              </div>
             </div>
           </div>
         </div>
       </section>
 
-      <template v-if="isCompleted">
+      <!--
+        论文元信息（有视频形态）：排在视频之后。
+        这样首屏就是标题 + 下载行 + 视频播放器；元信息卡片 400+ px，放在视频前面会把
+        视频顶到首屏之外。无视频形态下走下面那份 `v-if="!video"` 的原位，行为不变。
+      -->
+      <PaperMetaSection v-if="video" :episode="episode" />
+
+      <!--
+        ================= 没有视频的形态：与改造前完全一致 =================
+        音频播放器 → 下载行 → 信息图 → 原图 → 元信息 → 脚本 → 解读。
+        顺序刻意保持原样；视频加载失败（videoFailed）时也走这里把音频顶上来。
+      -->
+      <template v-if="isCompleted && audioVisible">
         <AudioPlayer
           ref="audioRef"
           :src="audioSrc"
@@ -516,7 +642,7 @@ onBeforeUnmount(() => {
         </p>
       </template>
 
-      <section v-else class="card card--pad" style="margin-bottom: 22px">
+      <section v-if="!isCompleted" class="card card--pad" style="margin-bottom: 22px">
         <div class="row row--between">
           <div>
             <p class="analysis-card__title">{{ episode.stage_label }}（{{ episode.progress }}%）</p>
@@ -530,8 +656,11 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <!-- 模型生成的信息图：用 <object> 引用，SVG 里的 SMIL 动画才会播放；内嵌 <img> 作降级 -->
-      <section v-if="illustration" class="section">
+      <!--
+        模型生成的信息图：用 <object> 引用，SVG 里的 SMIL 动画才会播放；内嵌 <img> 作降级。
+        有视频时不渲染：这张图已经在视频片尾用过了，再来一遍就是重复内容。
+      -->
+      <section v-if="illustration && !video" class="section">
         <div class="section__head">
           <h2 class="section__title">生成信息图</h2>
           <span class="section__hint">
@@ -585,87 +714,76 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <!-- 论文原图画廊：figures 为空数组时整块不渲染 -->
-      <section v-if="figures.length" class="section">
+      <!--
+        论文原图画廊：figures 为空数组时整块不渲染。
+        有视频时收进折叠区（这些图视频里已经用过一遍），标题上带张数，收起也看得出内容。
+        注意：灯箱的触发按钮就在折叠区里，展开后按钮是真实尺寸，点击照常打开灯箱。
+      -->
+      <details v-if="video && figures.length" id="section-figures" class="section fold">
+        <!--
+          aria-label 不是多余的：实测 Chrome 里 <summary> 的可访问名字只认「直接子文本节点」，
+          标题一旦包在 <h2>/<span> 里就变成空名字（屏幕阅读器只会念「按钮」）。
+          所以这里显式给名字，并且和可见标题保持一致（含数量）。
+        -->
+        <summary
+          class="fold__summary"
+          :aria-label="`论文原图（${figures.length} 张）：从 PDF 图注提取，展开后点击任意一张放大`"
+          @keydown.enter.prevent="onSummaryEnter"
+        >
+          <h2 class="section__title">论文原图（{{ figures.length }} 张）</h2>
+          <span class="section__hint">从 PDF 按「Figure N:」图注提取 · 展开后点击任意一张放大</span>
+          <span class="fold__state" aria-hidden="true">
+            <span class="fold__state-closed">展开</span>
+            <span class="fold__state-open">收起</span>
+          </span>
+        </summary>
+        <div class="fold__body">
+          <FigureGallery :figures="figures" @open="openFigure" />
+        </div>
+      </details>
+
+      <section v-else-if="figures.length" class="section">
         <div class="section__head">
           <h2 class="section__title">论文原图</h2>
           <span class="section__hint">
             从 PDF 按「Figure N:」图注提取 · 共 {{ figures.length }} 张 · 点击放大
           </span>
         </div>
-        <div class="figure-grid">
-          <button
-            v-for="(figure, index) in figures"
-            :key="figure.id"
-            type="button"
-            class="figure-card"
-            @click="openFigure(index)"
-          >
-            <span class="figure-card__frame">
-              <img
-                v-if="!isBroken(figure)"
-                :src="figure.url"
-                :alt="figure.caption"
-                loading="lazy"
-                decoding="async"
-                @error="markBroken(figure.id)"
-              />
-              <span v-else class="figure-card__broken">
-                <span class="figure-card__broken-glyph" aria-hidden="true">◫</span>
-                图片暂时加载不出来
-              </span>
-            </span>
-            <span class="figure-card__body">
-              <span class="figure-card__label">{{ figure.label }}</span>
-              <span class="figure-card__caption" :title="figure.caption">{{ figure.caption }}</span>
-            </span>
-          </button>
-        </div>
+        <FigureGallery :figures="figures" @open="openFigure" />
       </section>
 
-      <section v-if="paper" class="section">
-        <div class="section__head">
-          <h2 class="section__title">论文元信息</h2>
-          <span class="section__hint">{{ episode.source_ref ?? '—' }}</span>
-        </div>
-        <div class="card card--pad">
-          <div class="meta-grid">
-            <div class="meta-item">
-              <div class="meta-item__label">论文标题</div>
-              <div class="meta-item__value">{{ paper.title ?? episode.title }}</div>
-            </div>
-            <div v-for="item in metaItems" :key="item.label" class="meta-item">
-              <div class="meta-item__label">{{ item.label }}</div>
-              <div class="meta-item__value">
-                <a
-                  v-if="item.label === 'arXiv' && arxivUrl"
-                  :href="arxivUrl"
-                  target="_blank"
-                  rel="noopener"
-                >
-                  {{ item.value }} ↗
-                </a>
-                <template v-else>{{ item.value }}</template>
-              </div>
-            </div>
+      <!-- 论文元信息：没有视频时的原位（有视频时上面已经渲染过一次） -->
+      <PaperMetaSection v-if="!video" :episode="episode" />
+
+      <!--
+        播客脚本：有视频时默认收起（脚本 2000+ px，是页面变长的头号元凶）。
+        用原生 <details>：键盘 Enter/Space 可开，天然带展开态语义，摘要行给出段数与字数。
+      -->
+      <details v-if="video && episode.script" id="section-script" ref="scriptFold" class="section fold">
+        <summary
+          class="fold__summary"
+          :aria-label="`播客脚本（${scriptSegments} 段 · ${scriptWords} 字）：双人对谈，逐段展示，按说话人配色`"
+          @keydown.enter.prevent="onSummaryEnter"
+        >
+          <h2 class="section__title">播客脚本（{{ scriptSegments }} 段 · {{ scriptWords }} 字）</h2>
+          <span class="section__hint">双人对谈 · 逐段展示，按说话人配色</span>
+          <span class="fold__state" aria-hidden="true">
+            <span class="fold__state-closed">展开</span>
+            <span class="fold__state-open">收起</span>
+          </span>
+        </summary>
+        <div class="fold__body">
+          <div class="card card--pad">
+            <ScriptView
+              :script="episode.script"
+              :voice-a="episode.options.voice_a"
+              :voice-b="episode.options.voice_b"
+            />
           </div>
-
-          <template v-if="paper.keywords?.length">
-            <hr class="divider" />
-            <div class="tag-list">
-              <span v-for="keyword in paper.keywords" :key="keyword" class="tag">{{ keyword }}</span>
-            </div>
-          </template>
-
-          <template v-if="paper.abstract">
-            <hr class="divider" />
-            <div class="meta-item__label">摘要</div>
-            <p class="analysis-card__body" style="margin: 6px 0 0">{{ paper.abstract }}</p>
-          </template>
         </div>
-      </section>
+      </details>
 
-      <section id="section-script" class="section">
+      <section v-else-if="!video" id="section-script" class="section">
         <div class="section__head">
           <h2 class="section__title">播客脚本</h2>
           <span class="section__hint">双人对谈 · 逐段展示，按说话人配色</span>
@@ -679,7 +797,35 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <section id="section-analysis" class="section">
+      <!--
+        结构化解读：有视频时同样默认收起，摘要行给出板块数。
+      -->
+      <details
+        v-if="video && episode.analysis"
+        id="section-analysis"
+        ref="analysisFold"
+        class="section fold"
+      >
+        <summary
+          class="fold__summary"
+          :aria-label="`结构化解读（${analysisCards} 个板块）：背景、创新点、方法、实验、结论、不足、价值、未来`"
+          @keydown.enter.prevent="onSummaryEnter"
+        >
+          <h2 class="section__title">结构化解读（{{ analysisCards }} 个板块）</h2>
+          <span class="section__hint">
+            背景 → 创新点 → 方法 → 实验 → 结论 → 不足 → 价值 → 未来
+          </span>
+          <span class="fold__state" aria-hidden="true">
+            <span class="fold__state-closed">展开</span>
+            <span class="fold__state-open">收起</span>
+          </span>
+        </summary>
+        <div class="fold__body">
+          <AnalysisView :analysis="episode.analysis" />
+        </div>
+      </details>
+
+      <section v-else-if="!video" id="section-analysis" class="section">
         <div class="section__head">
           <h2 class="section__title">结构化解读</h2>
           <span class="section__hint">
