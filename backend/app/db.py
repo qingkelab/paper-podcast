@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS episodes (
     cover_height       INTEGER,
     figures_json       TEXT,
     illustration_json  TEXT,
+    timings_json       TEXT,
+    video_path         TEXT,
+    video_json         TEXT,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
 );
@@ -84,6 +87,9 @@ class Database:
         }
         additions = {
             "cover_path": "TEXT",
+            "timings_json": "TEXT",
+            "video_path": "TEXT",
+            "video_json": "TEXT",
             "cover_width": "INTEGER",
             "cover_height": "INTEGER",
             "figures_json": "TEXT",
@@ -150,6 +156,9 @@ class Database:
             "cover_height": row["cover_height"],
             "figures": load(row["figures_json"]) or [],
             "illustration": load(row["illustration_json"]),
+            "timings": load(row["timings_json"]) or [],
+            "video_path": row["video_path"],
+            "video": load(row["video_json"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -229,6 +238,8 @@ class Database:
             "script",
             "figures",
             "illustration",
+            "timings",
+            "video",
         }
         sets: list[str] = []
         params: list[Any] = []
@@ -240,6 +251,8 @@ class Database:
                 "script": "script_json",
                 "figures": "figures_json",
                 "illustration": "illustration_json",
+                "timings": "timings_json",
+                "video": "video_json",
             }.get(key, key)
             if key in json_fields:
                 value = json.dumps(value, ensure_ascii=False) if value is not None else None

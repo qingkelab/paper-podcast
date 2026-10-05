@@ -73,6 +73,15 @@ class Figure(BaseModel):
     height: int
 
 
+class VideoInfo(BaseModel):
+    """合成好的视频解读播客。"""
+
+    url: str
+    duration_sec: float | None = None
+    scene_count: int | None = None
+    bytes: int | None = None
+
+
 class Illustration(BaseModel):
     """模型生成的信息图。svg_url 保留动画能力，png_url 用于列表缩略图。"""
 
@@ -101,6 +110,7 @@ class Episode(BaseModel):
     cover_height: int | None = None
     figures: list[Figure] = Field(default_factory=list)
     illustration: Illustration | None = None
+    video: VideoInfo | None = None
     audio_url: str | None = None
     audio_duration_sec: float | None = None
     audio_bytes: int | None = None
@@ -119,6 +129,7 @@ class EpisodeListItem(Episode):
     script: None = None
     figures: list[Figure] = Field(default_factory=list)
     illustration: None = None
+    video: None = None
 
 
 class EpisodeList(BaseModel):

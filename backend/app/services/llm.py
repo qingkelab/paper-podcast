@@ -312,10 +312,16 @@ class LLMClient:
 
         trimmed = build_script_payload(trimmed_segments, speech_rate=speech_rate)
 
-        # 精简后反而更长/没变，说明模型没按要求做
-        if trimmed["word_count"] >= actual:
+        # 精简后反而更长/基本没变，说明模型没按要求做。
+        # 只判「比原来短」是不够的：实测出现过 1175 → 1171 这种「改了等于没改」，
+        # 白花一次调用还拖慢流水线，所以要求至少真的减掉 3%。
+        reduction = (actual - trimmed["word_count"]) / max(actual, 1)
+        if reduction < 0.03:
             logger.warning(
-                "精简后并未变短（%d → %d 字），沿用原脚本", actual, trimmed["word_count"]
+                "精简几乎无效（%d → %d 字，仅减 %.1f%%），沿用原脚本",
+                actual,
+                trimmed["word_count"],
+                reduction * 100,
             )
             return script
 

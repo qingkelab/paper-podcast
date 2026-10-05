@@ -308,12 +308,39 @@ def auth_headers(settings: Settings, connect_id: str) -> dict[str, str]:
 
 
 @dataclass
+class RoundTiming:
+    """一段脚本在最终音频里的确切时间区间。
+
+    服务端在 362（轮次结束）事件里给了 audio_duration / start_time / end_time，
+    这是把画面和字幕对齐到音频的唯一可靠依据——不需要自己猜语速。
+    """
+
+    index: int      # 脚本段序号（0-based，只数脚本轮次，不含片头片尾音乐）
+    speaker: str
+    start: float
+    end: float
+
+    @property
+    def duration(self) -> float:
+        return max(self.end - self.start, 0.0)
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "speaker": self.speaker,
+            "start": round(self.start, 3),
+            "end": round(self.end, 3),
+        }
+
+
+@dataclass
 class SynthesisResult:
     audio_path: Path
     duration_sec: float | None
     bytes_written: int
     task_id: str | None = None
     finished_round: int = -1
+    timings: list[RoundTiming] = field(default_factory=list)
 
 
 @dataclass
@@ -435,8 +462,10 @@ class PodcastTTSClient:
             deadline = loop.time() + settings.podcast_timeout_sec
             current_round = -1
             current_round_type = ""
+            current_speaker = ""
             script_rounds_done = 0
             expected_script_rounds = len(segments)
+            timings: list[RoundTiming] = []
 
             while True:
                 if loop.time() > deadline:
@@ -472,8 +501,9 @@ class PodcastTTSClient:
                         current_round = current_round + 1
                     # 只有脚本轮次才回调进度：片头音乐(-1)/片尾音乐(9999)/水印(10000)
                     # 不是用户能感知的「第几段」，混进去会让进度条乱跳。
+                    current_speaker = str(meta.get("speaker") or "")
                     if on_round and not current_round_type:
-                        on_round(script_rounds_done, str(meta.get("speaker") or ""))
+                        on_round(script_rounds_done, current_speaker)
 
                 elif frame.event == EV_ROUND_AUDIO:
                     if frame.payload:
@@ -491,6 +521,21 @@ class PodcastTTSClient:
                     if not current_round_type:
                         finished_round = current_round
                         script_rounds_done += 1
+                        # 记录这一段在音频里的确切区间，供视频合成对齐使用
+                        try:
+                            start = float(meta.get("start_time") or 0.0)
+                            end = float(meta.get("end_time") or 0.0)
+                        except (TypeError, ValueError):
+                            start = end = 0.0
+                        if end > start:
+                            timings.append(
+                                RoundTiming(
+                                    index=script_rounds_done - 1,
+                                    speaker=current_speaker,
+                                    start=start,
+                                    end=end,
+                                )
+                            )
                     logger.debug(
                         "轮次完成：round=%s type=%r 时长=%ss（累计脚本轮次 %d/%d）",
                         current_round,
@@ -543,6 +588,7 @@ class PodcastTTSClient:
             bytes_written=len(audio_buffer),
             task_id=task_id,
             finished_round=finished_round,
+            timings=timings,
         )
 
     @staticmethod
@@ -593,18 +639,34 @@ class PodcastTTSClient:
         sample_rate = 24000
         frames = bytearray()
         seg_duration = duration / max(len(segments), 1)
+        timings: list[RoundTiming] = []
+        # 与服务端一致：片头先垫一段音乐，让脚本段从 MUSIC_HEAD 秒开始
+        music_head = 3.0
+        frames += b"\x00\x00" * int(music_head * sample_rate)
+        cursor = music_head
 
         for index, segment in enumerate(segments):
             if on_round:
                 on_round(index, segment.get("speaker", "A"))
             base_freq = 220.0 if segment["speaker"] == "A" else 294.0
+            tone_seconds = max(seg_duration - 0.25, 0.15)
             frames += _tone(
                 freq=base_freq,
-                seconds=max(seg_duration - 0.25, 0.15),
+                seconds=tone_seconds,
                 sample_rate=sample_rate,
                 amplitude=0.22,
             )
+            timings.append(
+                RoundTiming(
+                    index=index,
+                    speaker=segment.get("speaker", "A"),
+                    start=cursor,
+                    end=cursor + tone_seconds,
+                )
+            )
+            cursor += tone_seconds
             frames += b"\x00\x00" * int(0.25 * sample_rate)  # 段间停顿
+            cursor += 0.25
             await asyncio.sleep(0.05)  # 让前端能看到轮次推进
 
         output_path = output_path.with_suffix(".wav")
@@ -621,6 +683,7 @@ class PodcastTTSClient:
             bytes_written=output_path.stat().st_size,
             task_id=f"mock-{uuid.uuid4().hex[:12]}",
             finished_round=len(segments) - 1,
+            timings=timings,
         )
 
 

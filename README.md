@@ -8,6 +8,10 @@
 ②正文里**按图注提取的论文原图**（最多 6 张）；③一张**模型生成的信息图**
 （SVG，带 SMIL 动画，详情页里会动）。
 
+**视频解读播客**：最后把配图和音频合成一个完整 MP4。画幅就是论文首页尺寸
+（936×1210 竖版），画面按脚本逐段切换、底部带分色字幕条，**用服务端返回的
+轮次时间戳精确对齐音频**（不是猜语速）。需要系统安装 ffmpeg。
+
 > 区别于普通的「论文总结」：这里产出的是**双主播对谈**形态——主播A讲解、主播B追问质疑，
 > 有附和、有停顿、有语气起伏，适配通勤、自习、复盘等碎片化收听场景。
 
@@ -19,6 +23,9 @@
 （解读和脚本用内置示例数据，音频是 Web Audio 合成的占位音），可以直接看界面、走流程。
 
 ```bash
+# 0. 系统依赖：视频合成需要 ffmpeg
+brew install ffmpeg          # macOS；Linux 用 apt install ffmpeg
+
 # 1. 后端
 cd backend
 uv venv --python 3.13 ../.venv          # 或 python3 -m venv ../.venv
@@ -139,6 +146,7 @@ paper-podcast/
 │   │       ├── podcast_tts.py     播客 WebSocket 协议 + Mock
 │   │       ├── figures.py         封面渲染 + 论文原图提取
 │   │       ├── illustration.py    生成信息图（SVG）+ 清洗 + 栅格化
+│   │       ├── video.py           视频合成（时间轴 / 配图分配 / 字幕 / 编码）
 │   │       └── pipeline.py        流水线编排 + 产物导出
 │   └── tests/                     81 项测试
 └── frontend/

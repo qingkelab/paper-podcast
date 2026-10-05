@@ -9,6 +9,9 @@
 ## 常用命令
 
 ```bash
+# 系统依赖：视频合成需要 ffmpeg（不是 Python 包）
+brew install ffmpeg        # macOS；Linux 用 apt install ffmpeg
+
 # 后端（首次）
 cd backend
 uv venv --python 3.13 ../.venv
@@ -80,14 +83,27 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   （resvg 宽容能渲染，浏览器直接报错）。
 - **本环境无法做 HTML→图片**：Chrome headless 会挂死，Playwright 装浏览器超时。
   需要「生成配图」时走 SVG + resvg-py（自包含，且 SVG 原生支持 SMIL 动画）。
+- **视频合成必须分两步**（先出纯视频轨，再用 `-c:v copy` 封音频）。
+  一条命令把 concat 幻灯片和音频一起编码**无法对齐长度**：
+  `-r 30 -shortest` 会多 2.4 秒，不加 `-r` 会少 12 秒，输入端 `-r 30` 直接崩到 0.8 秒。
+  另外**绝对不要用 `-t` 钳总长**——实测 `-t 4.000` 会把 4 秒的片子砍成 2.03 秒。
+- **视频画幅必须是偶数**：H.264 的 yuv420p 要求宽高能被 2 整除。
+  论文首页是 935×1210，取 **936**×1210，直接用 935 会被 libx264 拒绝
+  （`width not divisible by 2`）。
+- **配图分配必须严格递增**：取图逻辑是「取最后一个 start ≤ 当前段」，
+  起点相同的图会被后一张顶掉、永远不显示。实测模型给过 `[3,6,6,10,12]`，
+  要把重复值推开（→ `[3,6,7,10,12]`）。
+- **精简脚本时要检查实际缩减量**：只判「比原来短」不够，
+  实测出现过 1175 → 1171 这种「改了等于没改」，白花一次调用。要求至少减 3%。
 
 ## 结构
 
 ```
 backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟) podcast_tts(语音)
-                          figures(PDF封面+论文原图) illustration(生成信息图) pipeline(编排)
+                          figures(PDF封面+论文原图) illustration(生成信息图)
+                          video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            173 项，改完必须全绿
+backend/tests/            203 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 

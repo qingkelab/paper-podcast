@@ -60,6 +60,12 @@
     "width": 1280, "height": 720,
     "source": "model"                           // "model" | "fallback"
   },
+  "video": {                                    // 视频解读播客，无则 null
+    "url": "/api/episodes/3f2a9c1e/video",
+    "duration_sec": 206.86,
+    "scene_count": 23,
+    "bytes": 4801376
+  },
   "audio_url": "/api/episodes/3f2a9c1e/audio",  // 无音频时 null
   "audio_duration_sec": 302.5,
   "audio_bytes": 2411724,
@@ -68,7 +74,7 @@
 }
 ```
 
-列表接口返回的 Episode **省略** `analysis`、`script`、`figures`、`illustration`
+列表接口返回的 Episode **省略** `analysis`、`script`、`figures`、`illustration`、`video`
 （分别置为 `null` / `[]`），详情接口才返回。但 **`cover_url` 在列表里保留**，
 因为列表卡片要显示封面缩略图。
 
@@ -192,6 +198,20 @@
   这样动画会播放；用 `<img>` 引用时部分浏览器不会跑动画。
   不要内联进页面 HTML（内容是模型生成的，虽然已在入库前白名单清洗）。
 
+### `GET /api/episodes/{id}/video`
+
+视频解读播客，`video/mp4`（H.264 + AAC）。
+
+**画幅 936×1210**，即论文 PDF 首页的尺寸（原始首图是 935×1210，宽度取 936 是因为
+H.264 的 yuv420p 要求宽高都能被 2 整除，935 会被编码器直接拒绝）。
+
+画面构成：每条脚本对应一个画面，**用服务端返回的轮次时间戳精确对齐音频**——
+片头音乐期间显示论文首页，正文按内容相关性切换论文原图，片尾显示生成的信息图。
+字幕条按主播分色（主播A 冷蓝 / 主播B 暖橙）。
+
+同样支持 Range 请求（视频拖动进度比音频更依赖它，播放器还会先发一个小的
+range 请求探测 moov box）。无视频时 `404`。
+
 ### `GET /api/episodes/{id}/audio`
 
 返回音频文件流，`Content-Type` 依格式（`audio/mpeg`）。
@@ -220,7 +240,7 @@
 | 首页/导入 | `/` | `POST /api/episodes`、`GET /api/options`、`GET /api/health` |
 | 任务进度 | `/task/:id` | `GET /api/episodes/{id}`（轮询）、`POST .../retry` |
 | 播客库 | `/library` | `GET /api/episodes`、`DELETE /api/episodes/{id}` |
-| 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md` |
+| 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../video`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md` |
 | 设置 | `/settings` | `GET /api/options`、`GET /api/health`（本地存储偏好） |
 
 ---

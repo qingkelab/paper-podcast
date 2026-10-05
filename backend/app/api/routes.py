@@ -88,6 +88,18 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
             }
         )
 
+    # 列表接口不带 video（列表里不播视频，省流量）
+    video = None
+    video_path = record.get("video_path") if include_large else None
+    if video_path and Path(video_path).exists():
+        stored_video = record.get("video") or {}
+        video = {
+            "url": f"/api/episodes/{episode_id}/video",
+            "duration_sec": stored_video.get("duration_sec"),
+            "scene_count": stored_video.get("scene_count"),
+            "bytes": stored_video.get("bytes"),
+        }
+
     illustration = None
     stored = record.get("illustration") if include_large else None
     if stored and stored.get("png_path") and Path(stored["png_path"]).exists():
@@ -123,6 +135,7 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
         "cover_height": record.get("cover_height"),
         "figures": figures,
         "illustration": illustration,
+        "video": video,
         "audio_url": audio_url,
         "audio_duration_sec": record.get("audio_duration_sec"),
         "audio_bytes": record.get("audio_bytes"),
@@ -369,7 +382,7 @@ async def get_episode(request: Request, episode_id: str):
 async def delete_episode(request: Request, episode_id: str) -> Response:
     record = _require_episode(request, episode_id)
 
-    for key in ("audio_path", "cover_path"):
+    for key in ("audio_path", "cover_path", "video_path"):
         path_value = record.get(key)
         if path_value:
             try:
@@ -428,19 +441,15 @@ async def retry_episode(request: Request, episode_id: str):
 # --------------------------------------------------------------------------
 
 
-@router.get("/episodes/{episode_id}/audio")
-async def get_audio(request: Request, episode_id: str):
-    record = _require_episode(request, episode_id)
-    audio_path = record.get("audio_path")
-    if not audio_path or not Path(audio_path).exists():
-        raise HTTPException(status_code=404, detail="这一集还没有音频")
+def _ranged_response(request: Request, path: Path, media_type: str) -> Response:
+    """带 Range 支持的媒体响应。
 
-    path = Path(audio_path)
-    media_type = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
+    音视频拖动进度条都依赖 `206 + Content-Range`，Starlette 不会自动处理，
+    所以这里手动实现。缺了它 Safari 直接不能播。
+    """
     file_size = path.stat().st_size
-
-    # 播放器拖动进度条依赖 Range 请求，Starlette 不会自动处理，所以手动实现。
     range_header = request.headers.get("range")
+
     if not range_header:
         return FileResponse(
             path,
@@ -465,8 +474,7 @@ async def get_audio(request: Request, episode_id: str):
 
     if start >= file_size or start > end:
         return Response(
-            status_code=416,
-            headers={"Content-Range": f"bytes */{file_size}"},
+            status_code=416, headers={"Content-Range": f"bytes */{file_size}"}
         )
     end = min(end, file_size - 1)
     length = end - start + 1
@@ -493,6 +501,33 @@ async def get_audio(request: Request, episode_id: str):
             "Cache-Control": "public, max-age=3600",
         },
     )
+
+
+@router.get("/episodes/{episode_id}/audio")
+async def get_audio(request: Request, episode_id: str):
+    record = _require_episode(request, episode_id)
+    audio_path = record.get("audio_path")
+    if not audio_path or not Path(audio_path).exists():
+        raise HTTPException(status_code=404, detail="这一集还没有音频")
+
+    path = Path(audio_path)
+    media_type = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
+    return _ranged_response(request, path, media_type)
+
+
+@router.get("/episodes/{episode_id}/video")
+async def get_video(request: Request, episode_id: str):
+    """视频解读播客（MP4）。
+
+    同样支持 Range：视频拖动进度条比音频更依赖它，而且播放器通常先发一个
+    小 range 探测 moov box。
+    """
+    record = _require_episode(request, episode_id)
+    video_path = record.get("video_path")
+    if not video_path or not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail="这一集还没有视频")
+
+    return _ranged_response(request, Path(video_path), "video/mp4")
 
 
 @router.get("/episodes/{episode_id}/script.txt")

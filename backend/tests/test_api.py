@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -29,8 +30,33 @@ SAMPLE_TEXT = (
 
 @pytest.fixture
 def client(tmp_path):
+    """常规用例：**关掉视频合成**。
+
+    视频编码是 CPU 密集的，每个用例都编一遍会让整个测试套件慢两倍以上，
+    而绝大多数用例并不关心视频。视频链路由 TestVideoPipeline 专门覆盖。
+    """
     settings = Settings(
         force_mock=True,
+        enable_video=False,
+        data_dir=tmp_path / "data",
+        database_path=tmp_path / "data" / "test.db",
+    )
+    app = create_app(settings)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def video_client(tmp_path):
+    """开启视频合成的客户端，只给视频集成测试用。"""
+    from app.services.video import ffmpeg_available
+
+    if not ffmpeg_available():
+        pytest.skip("需要系统安装 ffmpeg")
+
+    settings = Settings(
+        force_mock=True,
+        enable_video=True,
         data_dir=tmp_path / "data",
         database_path=tmp_path / "data" / "test.db",
     )
@@ -610,3 +636,93 @@ class TestEpisodeAssets:
 
         assert client.delete(f"/api/episodes/{created['id']}").status_code == 204
         assert client.get(f"/api/episodes/{created['id']}/cover").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 视频解读播客（集成）
+# --------------------------------------------------------------------------
+
+
+class TestVideoPipeline:
+    """视频链路的端到端覆盖。
+
+    常规用例都把 enable_video 关掉了（太慢），所以这里单独验一次：
+    音频合成完成后要真的产出一个能播的 MP4，而且长度和音频对得上。
+    """
+
+    def test_episode_gets_a_video(self, video_client):
+        created = create_text_episode(video_client)
+        episode = wait_for_completion(video_client, created["id"], timeout=180)
+
+        assert episode["status"] == "completed", episode.get("error")
+        video = episode.get("video")
+        assert video is not None, "应当产出视频"
+        assert video["url"] == f"/api/episodes/{created['id']}/video"
+        assert video["scene_count"] > 0
+        assert video["bytes"] > 1000
+
+    def test_video_is_served_with_range_support(self, video_client):
+        created = create_text_episode(video_client)
+        wait_for_completion(video_client, created["id"], timeout=180)
+
+        full = video_client.get(f"/api/episodes/{created['id']}/video")
+        assert full.status_code == 200
+        assert full.headers["content-type"] == "video/mp4"
+        assert full.headers["accept-ranges"] == "bytes"
+        assert full.content[4:8] == b"ftyp", "应当是标准 MP4 容器"
+
+        partial = video_client.get(
+            f"/api/episodes/{created['id']}/video", headers={"Range": "bytes=0-1023"}
+        )
+        assert partial.status_code == 206
+        assert partial.headers["content-range"].startswith("bytes 0-1023/")
+
+    def test_video_length_matches_audio(self, video_client):
+        """视频长度必须和音频基本一致，否则结尾会出现「只有画面没有声音」。"""
+        import subprocess
+
+        created = create_text_episode(video_client)
+        episode = wait_for_completion(video_client, created["id"], timeout=180)
+
+        path = Path(video_client.app.state.settings.video_dir) / f"{created['id']}.mp4"
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=duration",
+                "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        video_duration = float(probe)
+        audio_duration = episode["audio_duration_sec"]
+
+        assert abs(video_duration - audio_duration) < 0.5, (
+            f"视频 {video_duration}s 与音频 {audio_duration}s 差得太多"
+        )
+
+    def test_list_omits_video(self, video_client):
+        """列表接口不带 video（列表里不播视频）。"""
+        created = create_text_episode(video_client)
+        wait_for_completion(video_client, created["id"], timeout=180)
+
+        body = video_client.get("/api/episodes").json()
+        item = next(i for i in body["items"] if i["id"] == created["id"])
+        assert item["video"] is None
+
+    def test_delete_removes_video_file(self, video_client):
+        created = create_text_episode(video_client)
+        wait_for_completion(video_client, created["id"], timeout=180)
+        path = Path(video_client.app.state.settings.video_dir) / f"{created['id']}.mp4"
+        assert path.exists()
+
+        assert video_client.delete(f"/api/episodes/{created['id']}").status_code == 204
+        assert not path.exists()
+
+    def test_video_disabled_produces_no_video(self, client):
+        """默认（关闭视频）时不应该有视频，也不该报错。"""
+        created = create_text_episode(client)
+        episode = wait_for_completion(client, created["id"])
+        assert episode["status"] == "completed"
+        assert episode["video"] is None
+        assert client.get(f"/api/episodes/{created['id']}/video").status_code == 404

@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     # 失败自动重试次数
     max_retries: int = 2
 
+    # 是否在音频合成后继续合成视频解读播客（需要系统安装 ffmpeg）
+    enable_video: bool = True
+
     # ---------- 派生属性 ----------
 
     @property
@@ -108,6 +111,14 @@ class Settings(BaseSettings):
     @property
     def illustration_dir(self) -> Path:
         return self.data_dir / "illustrations"
+
+    @property
+    def video_dir(self) -> Path:
+        return self.data_dir / "videos"
+
+    @property
+    def video_work_dir(self) -> Path:
+        return self.data_dir / "video-frames"
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -170,6 +181,8 @@ class Settings(BaseSettings):
             self.cover_dir,
             self.figure_dir,
             self.illustration_dir,
+            self.video_dir,
+            self.video_work_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
