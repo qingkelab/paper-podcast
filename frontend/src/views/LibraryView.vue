@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { deleteEpisode, errorMessage, listEpisodes, retryEpisode } from '../api'
-import type { Episode, EpisodeStatus } from '../api'
+import type { EpisodeStatus, EpisodeSummary } from '../api'
 import EpisodeCard from '../components/EpisodeCard.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { FILTERABLE_STATUSES, STATUS_LABELS } from '../utils/stages'
@@ -10,7 +10,8 @@ import { FILTERABLE_STATUSES, STATUS_LABELS } from '../utils/stages'
 const PAGE_SIZE = 12
 const AUTO_REFRESH_MS = 5000
 
-const items = ref<Episode[]>([])
+// 列表接口返回的是 EpisodeSummary（不含 analysis / script / figures / illustration）
+const items = ref<EpisodeSummary[]>([])
 const total = ref(0)
 const loading = ref(true)
 const loadingMore = ref(false)
@@ -18,7 +19,7 @@ const error = ref<string | null>(null)
 const notice = ref<string | null>(null)
 const keyword = ref('')
 const status = ref<EpisodeStatus | 'all'>('all')
-const confirmTarget = ref<Episode | null>(null)
+const confirmTarget = ref<EpisodeSummary | null>(null)
 const deleting = ref(false)
 const refreshing = ref(false)
 
@@ -97,7 +98,7 @@ function syncAutoRefresh(): void {
   }
 }
 
-function onConfirmDelete(event: Episode): void {
+function onConfirmDelete(event: EpisodeSummary): void {
   confirmTarget.value = event
 }
 
@@ -118,7 +119,7 @@ async function confirmDelete(): Promise<void> {
   }
 }
 
-async function onRetry(episode: Episode): Promise<void> {
+async function onRetry(episode: EpisodeSummary): Promise<void> {
   notice.value = null
   try {
     await retryEpisode(episode.id)
@@ -214,8 +215,13 @@ onBeforeUnmount(() => {
 
     <div v-if="loading" class="episode-grid">
       <div v-for="index in 3" :key="index" class="episode-card">
-        <div class="skeleton" style="width: 68%; height: 20px" />
-        <div class="skeleton" style="width: 42%" />
+        <div class="row" style="align-items: flex-start; flex-wrap: nowrap; gap: 14px">
+          <div class="skeleton skeleton--thumb" />
+          <div style="min-width: 0; flex: 1">
+            <div class="skeleton" style="width: 74%; height: 20px; margin-bottom: 10px" />
+            <div class="skeleton" style="width: 52%" />
+          </div>
+        </div>
         <div class="skeleton" style="width: 88%" />
       </div>
     </div>
@@ -236,9 +242,10 @@ onBeforeUnmount(() => {
     <template v-else>
       <div class="episode-grid">
         <EpisodeCard
-          v-for="episode in items"
+          v-for="(episode, index) in items"
           :key="episode.id"
           :episode="episode"
+          :priority="index < 3"
           @delete="onConfirmDelete"
           @retry="onRetry"
         />

@@ -59,6 +59,31 @@ export interface Script {
   est_duration_sec: number
 }
 
+/** 论文原图 / 原表（契约 §1：从 PDF 按「Figure N:」图注定位后渲染出的区域） */
+export interface Figure {
+  /** 形如 f1（图）/ t1（表） */
+  id: string
+  kind: 'figure' | 'table'
+  /** 图注里的标签，如 "Figure 1" */
+  label: string
+  caption: string
+  page: number | null
+  /** 资源地址：GET /api/episodes/{id}/figures/{figure_id} */
+  url: string
+  width: number | null
+  height: number | null
+}
+
+/** 模型生成的论文信息图（契约 §2：svg_url 保留 SMIL 动画，需用 <object> 引用） */
+export interface Illustration {
+  png_url: string
+  svg_url: string
+  width: number | null
+  height: number | null
+  /** "model" = 大模型生成；"fallback" = 后端兜底模板 */
+  source: 'model' | 'fallback' | string
+}
+
 export interface Episode {
   id: string
   title: string
@@ -72,6 +97,14 @@ export interface Episode {
   paper_meta: PaperMeta | null
   analysis: Analysis | null
   script: Script | null
+  /** 封面：PDF 第一页整页渲染图；无封面时 null */
+  cover_url: string | null
+  cover_width: number | null
+  cover_height: number | null
+  /** 论文原图，可能为空数组（一篇都没提取到） */
+  figures: Figure[]
+  /** 生成的信息图，可为 null */
+  illustration: Illustration | null
   audio_url: string | null
   audio_duration_sec: number | null
   audio_bytes: number | null
@@ -79,8 +112,12 @@ export interface Episode {
   updated_at: string
 }
 
-/** 列表接口返回的 Episode：analysis / script 为 null（契约 §1） */
-export type EpisodeSummary = Episode
+/**
+ * 列表接口返回的 Episode（契约 §1）：
+ * 省略 analysis / script（置为 null）、figures（置为 []）、illustration（置为 null）。
+ * 但 cover_url / cover_width / cover_height 在列表里保留，列表卡片要显示封面缩略图。
+ */
+export type EpisodeSummary = Omit<Episode, 'analysis' | 'script' | 'figures' | 'illustration'>
 
 export interface ListEpisodesParams {
   limit?: number

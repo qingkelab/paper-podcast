@@ -1,5 +1,7 @@
 import { ApiError } from './error'
 import { renderMockAudio } from './mockAudio'
+import { buildArtwork } from './mockArt'
+import type { MockArtwork } from './mockArt'
 import { MOCK_PAPERS } from './mockPapers'
 import type { MockPaper, MockScriptSegment } from './mockPapers'
 import type {
@@ -12,6 +14,7 @@ import type {
   EpisodeOptions,
   EpisodeOptionsInput,
   EpisodeStatus,
+  EpisodeSummary,
   HealthPayload,
   ListEpisodesParams,
   ListEpisodesResult,
@@ -273,9 +276,10 @@ function createEpisodeRecord(input: {
   const plan = planContent(paper, input.title)
   const created =
     input.createdAt ?? new Date(Date.now() - (input.createdDaysAgo ?? 0) * 86400000).toISOString()
+  const id = makeId()
 
   const episode: Episode = {
-    id: makeId(),
+    id,
     title: input.title || plan.meta.title || '未命名论文',
     source_type: input.sourceType,
     source_ref: input.sourceRef,
@@ -287,6 +291,8 @@ function createEpisodeRecord(input: {
     paper_meta: plan.meta,
     analysis: plan.analysis,
     script: buildScript(plan, options),
+    // 配图（契约 §1 的新字段）：全部现场生成，见 mockArt.ts
+    ...buildArtworkFor(id, input.sourceType, plan.meta),
     audio_url: null,
     audio_duration_sec: null,
     audio_bytes: null,
@@ -296,6 +302,17 @@ function createEpisodeRecord(input: {
   if (input.shouldFail) failOnce.add(episode.id)
   episodes.push(episode)
   return episode
+}
+
+/** 配图依赖 episode id 作为随机种子，因此必须等 id 定下来之后再生成 */
+function buildArtworkFor(id: string, sourceType: SourceType, meta: PaperMeta): MockArtwork {
+  return buildArtwork({
+    seed: id,
+    title: meta.title ?? '未命名论文',
+    abstract: meta.abstract ?? '',
+    sourceType,
+    track: (url) => trackObjectUrl(id, url),
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +431,7 @@ async function renderAudioFor(episode: Episode): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 持久化（只存元数据，音频在每次加载时重新合成）
+// 持久化（只存元数据；音频与配图都在每次加载时重新现场生成，避免顶爆 localStorage 配额）
 // ---------------------------------------------------------------------------
 
 function persist(): void {
@@ -426,6 +443,12 @@ function persist(): void {
         audio_url: null,
         audio_duration_sec: null,
         audio_bytes: null,
+        // 配图是 Canvas / SVG 现场生成的（data URL + Blob URL），不落盘，加载时按 id 重算
+        cover_url: null,
+        cover_width: null,
+        cover_height: null,
+        figures: [],
+        illustration: null,
       })),
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
@@ -439,19 +462,23 @@ function normalizeStored(raw: unknown): Episode | null {
   const value = raw as Partial<Episode>
   if (typeof value.id !== 'string' || !value.id) return null
   if (typeof value.title !== 'string') return null
+  const sourceType = (value.source_type ?? 'text') as SourceType
+  const meta = value.paper_meta ?? null
   return {
     id: value.id,
     title: value.title,
-    source_type: (value.source_type ?? 'text') as SourceType,
+    source_type: sourceType,
     source_ref: value.source_ref ?? null,
     status: (value.status ?? 'queued') as EpisodeStatus,
     stage_label: value.stage_label ?? '排队中',
     progress: typeof value.progress === 'number' ? value.progress : 0,
     error: value.error ?? null,
     options: { ...DEFAULT_OPTIONS, ...(value.options ?? {}) },
-    paper_meta: value.paper_meta ?? null,
+    paper_meta: meta,
     analysis: value.analysis ?? null,
     script: value.script ?? null,
+    // 配图重新现场生成（seed 用 id，所以和刷新前是同一张图）
+    ...buildArtworkFor(value.id, sourceType, meta ?? { title: value.title } as PaperMeta),
     audio_url: null,
     audio_duration_sec: null,
     audio_bytes: null,
@@ -688,6 +715,34 @@ export async function createEpisodeFromText(input: CreateTextInput): Promise<Epi
   return { ...episode }
 }
 
+/**
+ * 契约 §1：列表项省略 analysis / script（置 null）、figures（置 []）、illustration（置 null），
+ * 但保留 cover_url 一族，因为列表卡片要显示封面缩略图。
+ * 这里显式挑字段而不是「spread 再删」，这样一旦 Episode 新增字段，类型检查会提醒我们同步。
+ */
+function toSummary(episode: Episode): EpisodeSummary {
+  return {
+    id: episode.id,
+    title: episode.title,
+    source_type: episode.source_type,
+    source_ref: episode.source_ref,
+    status: episode.status,
+    stage_label: episode.stage_label,
+    progress: episode.progress,
+    error: episode.error,
+    options: episode.options,
+    paper_meta: episode.paper_meta,
+    cover_url: episode.cover_url,
+    cover_width: episode.cover_width,
+    cover_height: episode.cover_height,
+    audio_url: episode.audio_url,
+    audio_duration_sec: episode.audio_duration_sec,
+    audio_bytes: episode.audio_bytes,
+    created_at: episode.created_at,
+    updated_at: episode.updated_at,
+  }
+}
+
 export async function listEpisodes(params: ListEpisodesParams = {}): Promise<ListEpisodesResult> {
   ensureLoaded()
   await delay(200)
@@ -702,12 +757,7 @@ export async function listEpisodes(params: ListEpisodesParams = {}): Promise<Lis
   items.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
 
   const total = items.length
-  const page = items.slice(offset, offset + limit).map((episode) => ({
-    // 契约 §1：列表接口省略 analysis / script
-    ...episode,
-    analysis: null,
-    script: null,
-  }))
+  const page = items.slice(offset, offset + limit).map(toSummary)
   return { items: page, total }
 }
 

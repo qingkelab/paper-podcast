@@ -1,18 +1,24 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import type { Episode } from '../api'
+import type { EpisodeSummary } from '../api'
 import StatusBadge from './StatusBadge.vue'
 import { SOURCE_LABELS } from '../utils/stages'
 import { formatBytes, formatDuration, formatRelative } from '../utils/format'
 
-const props = defineProps<{
-  episode: Episode
-}>()
+// 列表中后端不返回 figures / illustration，所以这里只依赖 EpisodeSummary
+const props = withDefaults(
+  defineProps<{
+    episode: EpisodeSummary
+    /** 首屏可见的卡片用 eager，别让 LCP 图卡在懒加载上 */
+    priority?: boolean
+  }>(),
+  { priority: false },
+)
 
 const emit = defineEmits<{
-  (event: 'delete', episode: Episode): void
-  (event: 'retry', episode: Episode): void
+  (event: 'delete', episode: EpisodeSummary): void
+  (event: 'retry', episode: EpisodeSummary): void
 }>()
 
 const isDone = computed(() => props.episode.status === 'completed')
@@ -28,12 +34,38 @@ const durationText = computed(() => {
 })
 
 const refText = computed(() => props.episode.source_ref ?? '—')
+
+/** 封面可能为 null（如 text 来源），也可能 404：两种都退化成占位色块，绝不显示破图 */
+const thumbFailed = ref(false)
+const thumbUrl = computed(() => {
+  if (thumbFailed.value) return null
+  return props.episode.cover_url || null
+})
 </script>
 
 <template>
   <article class="episode-card">
     <div class="episode-card__top">
-      <div style="min-width: 0">
+      <RouterLink
+        :to="target"
+        class="episode-card__thumb"
+        :class="{ 'is-empty': !thumbUrl }"
+        tabindex="-1"
+        aria-hidden="true"
+      >
+        <img
+          v-if="thumbUrl"
+          :src="thumbUrl"
+          alt=""
+          :loading="props.priority ? 'eager' : 'lazy'"
+          :fetchpriority="props.priority ? 'high' : 'auto'"
+          decoding="async"
+          @error="thumbFailed = true"
+        />
+        <span v-else class="episode-card__thumb-glyph">◫</span>
+      </RouterLink>
+
+      <div class="episode-card__head-text">
         <RouterLink :to="target" class="episode-card__title">{{ episode.title }}</RouterLink>
         <div class="episode-card__meta">
           <span>{{ SOURCE_LABELS[episode.source_type] }}</span>
@@ -41,6 +73,7 @@ const refText = computed(() => props.episode.source_ref ?? '—')
           <span>{{ formatRelative(episode.created_at) }}</span>
         </div>
       </div>
+
       <StatusBadge :status="episode.status" :label="episode.stage_label" />
     </div>
 

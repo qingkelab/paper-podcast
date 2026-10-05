@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
   IS_MOCK,
@@ -12,9 +12,10 @@ import {
   retryEpisode,
   scriptTxtUrl,
 } from '../api'
-import type { Episode } from '../api'
+import type { Episode, Figure } from '../api'
 import AudioPlayer from '../components/AudioPlayer.vue'
 import AnalysisView from '../components/AnalysisView.vue'
+import FigureLightbox from '../components/FigureLightbox.vue'
 import ScriptView from '../components/ScriptView.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
@@ -42,6 +43,82 @@ const arxivUrl = computed(() =>
 )
 /** 失败原因既可能来自 episode.error，也可能来自网络异常 */
 const failureText = computed(() => episode.value?.error ?? error.value)
+
+// ---------------------------------------------------------------------------
+// 封面（hero）：按 cover_width / cover_height 预留宽高比，加载时不会跳布局
+// ---------------------------------------------------------------------------
+
+const coverFailed = ref(false)
+const coverLoaded = ref(false)
+const coverSrc = computed(() => {
+  if (coverFailed.value) return null
+  return episode.value?.cover_url || null
+})
+/** 契约保证这两个字段可同时为 null；缺失时退回 A4 纸的比例（0.773），照样预留得住 */
+const coverRatio = computed(() => {
+  const width = episode.value?.cover_width
+  const height = episode.value?.cover_height
+  if (width && height) return `${width} / ${height}`
+  return '1 / 1.294'
+})
+
+// ---------------------------------------------------------------------------
+// 生成信息图：必须用 <object type="image/svg+xml"> 才能播 SMIL 动画
+// ---------------------------------------------------------------------------
+
+const illustration = computed(() => episode.value?.illustration ?? null)
+const illustrationSvg = computed(() => illustration.value?.svg_url || null)
+const illustrationPng = computed(() => illustration.value?.png_url || null)
+const illustrationRatio = computed(() => {
+  const width = illustration.value?.width ?? 16
+  const height = illustration.value?.height ?? 9
+  return `${width} / ${height}`
+})
+
+function downloadIllustration(): void {
+  const url = illustrationPng.value
+  if (!url) return
+  downloadUrl(url, `${safeName()}-信息图.png`)
+}
+
+// ---------------------------------------------------------------------------
+// 论文原图画廊 + 灯箱
+// ---------------------------------------------------------------------------
+
+const figures = computed<Figure[]>(() => episode.value?.figures ?? [])
+const lightboxIndex = ref<number | null>(null)
+/** 加载失败的图：退化成占位卡，不留破图 */
+const brokenFigures = ref<string[]>([])
+
+function isBroken(figure: Figure): boolean {
+  return brokenFigures.value.includes(figure.id)
+}
+
+function markBroken(figureId: string): void {
+  if (!brokenFigures.value.includes(figureId)) brokenFigures.value = [...brokenFigures.value, figureId]
+}
+
+function openFigure(index: number): void {
+  lightboxIndex.value = index
+}
+
+function navigateFigure(delta: number): void {
+  const count = figures.value.length
+  const current = lightboxIndex.value
+  if (!count || current === null) return
+  lightboxIndex.value = (current + delta + count) % count
+}
+
+// /episode/:id → /episode/:other 命中同一个路由记录，组件会被复用、onMounted 不会重跑。
+// 不监听 id 的话，页面会继续显示上一集的封面与配图（URL 已经变了），所以这里必须重新拉数据。
+watch(id, () => {
+  coverFailed.value = false
+  coverLoaded.value = false
+  lightboxIndex.value = null
+  brokenFigures.value = []
+  episode.value = null
+  void load()
+})
 
 const metaItems = computed(() => {
   const value = paper.value
@@ -155,7 +232,43 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <!-- 非 404 的读取失败（后端没起来 / 网络抖动）：给个明确的重试入口，不要留白屏 -->
+    <div v-else-if="error" class="card card--pad">
+      <div class="empty">
+        <p class="empty__title">暂时读不到这条播客</p>
+        <p style="margin-bottom: 18px">{{ error }}</p>
+        <div class="row" style="justify-content: center">
+          <button type="button" class="btn btn--primary" @click="load()">重新加载</button>
+          <RouterLink to="/library" class="btn btn--ghost">回到播客库</RouterLink>
+        </div>
+      </div>
+    </div>
+
     <template v-else-if="episode">
+      <!-- 封面 hero：放在标题上方。cover_url 为 null 或加载失败时整块不渲染（不留空白、不留破图） -->
+      <figure v-if="coverSrc" class="hero">
+        <div class="hero__art" :style="{ aspectRatio: coverRatio }">
+          <img class="hero__glow" :src="coverSrc" alt="" aria-hidden="true" decoding="async" />
+          <img
+            class="hero__img"
+            :class="{ 'is-loaded': coverLoaded }"
+            :src="coverSrc"
+            :alt="`《${episode.title}》论文首页渲染图`"
+            decoding="async"
+            @load="coverLoaded = true"
+            @error="coverFailed = true"
+          />
+        </div>
+        <figcaption class="hero__caption">
+          <span class="badge badge--neutral">论文首页</span>
+          <span class="section__hint">
+            封面取自 PDF 第一页整页渲染<template v-if="episode.cover_width && episode.cover_height">
+              · {{ episode.cover_width }}×{{ episode.cover_height }}</template
+            >
+          </span>
+        </figcaption>
+      </figure>
+
       <header style="margin-bottom: 26px">
         <p class="eyebrow">Episode · 播客详情</p>
         <div class="row row--between" style="align-items: flex-start">
@@ -196,7 +309,7 @@ onBeforeUnmount(() => {
         <span class="alert__body">
           <span class="alert__title">离线 Mock 模式</span>
           本页的解读与脚本来自内置示例数据；音频由 Web Audio API 现场合成的正弦波生成（约 36 秒），
-          用于验证播放器、倍速与拖动进度条。
+          封面、论文原图与信息图也全部由 Canvas / 内联 SVG 现场生成，不请求任何网络资源。
         </span>
       </div>
 
@@ -242,7 +355,100 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <section v-if="paper" class="section" style="margin-top: 34px">
+      <!-- 模型生成的信息图：用 <object> 引用，SVG 里的 SMIL 动画才会播放；内嵌 <img> 作降级 -->
+      <section v-if="illustration" class="section">
+        <div class="section__head">
+          <h2 class="section__title">生成信息图</h2>
+          <span class="section__hint">
+            模型把这篇论文提炼成一页图解<template v-if="illustration.source === 'fallback'">
+              （后端兜底模板）</template
+            >
+          </span>
+        </div>
+        <div class="illus card card--pad">
+          <div class="illus__stage" :style="{ aspectRatio: illustrationRatio }">
+            <object
+              v-if="illustrationSvg"
+              class="illus__media"
+              :data="illustrationSvg"
+              type="image/svg+xml"
+              :aria-label="`《${episode.title}》生成信息图`"
+            >
+              <img
+                v-if="illustrationPng"
+                class="illus__media"
+                :src="illustrationPng"
+                :alt="`《${episode.title}》生成信息图（静态 PNG 降级）`"
+              />
+            </object>
+            <img
+              v-else-if="illustrationPng"
+              class="illus__media"
+              :src="illustrationPng"
+              :alt="`《${episode.title}》生成信息图`"
+            />
+          </div>
+          <div class="row illus__foot">
+            <span class="badge badge--accent">SMIL 动画</span>
+            <span class="section__hint">
+              用 <code>&lt;object type="image/svg+xml"&gt;</code> 引用，SVG 内的动画才会播放
+              （用 <code>&lt;img&gt;</code> 引用时部分浏览器不会跑）
+            </span>
+            <span class="spacer" />
+            <span v-if="illustration.width && illustration.height" class="file-pill__size">
+              {{ illustration.width }}×{{ illustration.height }}
+            </span>
+            <button
+              v-if="illustrationPng"
+              type="button"
+              class="btn btn--sm btn--ghost"
+              @click="downloadIllustration"
+            >
+              ↓ 下载 PNG
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 论文原图画廊：figures 为空数组时整块不渲染 -->
+      <section v-if="figures.length" class="section">
+        <div class="section__head">
+          <h2 class="section__title">论文原图</h2>
+          <span class="section__hint">
+            从 PDF 按「Figure N:」图注提取 · 共 {{ figures.length }} 张 · 点击放大
+          </span>
+        </div>
+        <div class="figure-grid">
+          <button
+            v-for="(figure, index) in figures"
+            :key="figure.id"
+            type="button"
+            class="figure-card"
+            @click="openFigure(index)"
+          >
+            <span class="figure-card__frame">
+              <img
+                v-if="!isBroken(figure)"
+                :src="figure.url"
+                :alt="figure.caption"
+                loading="lazy"
+                decoding="async"
+                @error="markBroken(figure.id)"
+              />
+              <span v-else class="figure-card__broken">
+                <span class="figure-card__broken-glyph" aria-hidden="true">◫</span>
+                图片暂时加载不出来
+              </span>
+            </span>
+            <span class="figure-card__body">
+              <span class="figure-card__label">{{ figure.label }}</span>
+              <span class="figure-card__caption" :title="figure.caption">{{ figure.caption }}</span>
+            </span>
+          </button>
+        </div>
+      </section>
+
+      <section v-if="paper" class="section">
         <div class="section__head">
           <h2 class="section__title">论文元信息</h2>
           <span class="section__hint">{{ episode.source_ref ?? '—' }}</span>
@@ -307,6 +513,14 @@ onBeforeUnmount(() => {
         </div>
         <AnalysisView :analysis="episode.analysis" />
       </section>
+
+      <FigureLightbox
+        :figures="figures"
+        :open-index="lightboxIndex"
+        :title="episode.title"
+        @close="lightboxIndex = null"
+        @navigate="navigateFigure"
+      />
     </template>
   </div>
 </template>
