@@ -13,6 +13,17 @@ const props = withDefaults(
   { fallbackDuration: null, title: '' },
 )
 
+/**
+ * 详情页同时有「音频播放器」和「视频解读」两个播放器，两者绝不能同时出声。
+ * 组件本身不知道视频的存在，所以把播放/暂停事件抛给页面，由页面统一做互斥
+ * （见 EpisodeView.vue 的 pauseInactiveMedia）。
+ */
+const emit = defineEmits<{
+  /** 开始播放；带上元素，方便页面把「其他」媒体都暂停掉 */
+  (event: 'play', element: HTMLAudioElement): void
+  (event: 'pause'): void
+}>()
+
 const RATES = [0.75, 1, 1.25, 1.5]
 
 const audioEl = ref<HTMLAudioElement | null>(null)
@@ -124,6 +135,28 @@ function onEnded(): void {
   if (el) el.currentTime = 0
 }
 
+/** 播放：把状态同步出去，页面据此暂停视频 */
+function onNativePlay(): void {
+  playing.value = true
+  const el = audioEl.value
+  if (el) emit('play', el)
+}
+
+function onNativePause(): void {
+  playing.value = false
+  emit('pause')
+}
+
+/** 供页面调用（视频开始播放时把音频停掉） */
+function pause(): void {
+  audioEl.value?.pause()
+}
+
+/** 当前是否在出声（含缓冲中的播放态） */
+function isPlaying(): boolean {
+  return playing.value
+}
+
 function setRate(value: number): void {
   rate.value = value
   const el = audioEl.value
@@ -200,7 +233,7 @@ onBeforeUnmount(() => {
   audioEl.value?.pause()
 })
 
-defineExpose({ toggle })
+defineExpose({ toggle, pause, isPlaying })
 </script>
 
 <template>
@@ -305,8 +338,8 @@ defineExpose({ toggle })
       @loadedmetadata="onLoadedMetadata"
       @durationchange="onDurationChange"
       @timeupdate="onTimeUpdate"
-      @play="playing = true"
-      @pause="playing = false"
+      @play="onNativePlay"
+      @pause="onNativePause"
       @waiting="buffering = true"
       @playing="buffering = false"
       @canplay="buffering = false"

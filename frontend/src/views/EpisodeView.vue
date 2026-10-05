@@ -12,7 +12,7 @@ import {
   retryEpisode,
   scriptTxtUrl,
 } from '../api'
-import type { Episode, Figure } from '../api'
+import type { Episode, Figure, VideoInfo } from '../api'
 import AudioPlayer from '../components/AudioPlayer.vue'
 import AnalysisView from '../components/AnalysisView.vue'
 import FigureLightbox from '../components/FigureLightbox.vue'
@@ -82,6 +82,90 @@ function downloadIllustration(): void {
 }
 
 // ---------------------------------------------------------------------------
+// 视频解读播客（契约 §2：竖版 936×1210，H.264 + AAC）
+// ---------------------------------------------------------------------------
+
+/** 契约 §2 固定画幅：论文首页是 935×1210，宽度取 936 是因为 H.264 要求宽高都能被 2 整除 */
+const VIDEO_ASPECT = '936 / 1210'
+const VIDEO_NOMINAL_SIZE = '936×1210'
+
+const video = computed<VideoInfo | null>(() => episode.value?.video ?? null)
+/** 音频播放器的公开方法（pause），用于音视频互斥 */
+const audioRef = ref<InstanceType<typeof AudioPlayer> | null>(null)
+const videoEl = ref<HTMLVideoElement | null>(null)
+/** 加载成功后用元素读到的真实尺寸/时长覆盖契约值（读不到就退回契约值） */
+const videoSize = ref<{ width: number; height: number } | null>(null)
+const videoMediaDuration = ref(0)
+/** video.url 打不开（404 / 编码不支持）：整块换成提示，绝不显示破播放器 */
+const videoFailed = ref(false)
+
+const videoDuration = computed(() =>
+  videoMediaDuration.value > 0 ? videoMediaDuration.value : (video.value?.duration_sec ?? null),
+)
+const videoSizeLabel = computed(() => {
+  const size = videoSize.value
+  return size ? `${size.width}×${size.height}` : VIDEO_NOMINAL_SIZE
+})
+
+function downloadVideo(): void {
+  const url = video.value?.url
+  if (!url) return
+  downloadUrl(url, `${safeName()}-视频解读.mp4`)
+}
+
+function onVideoMetadata(): void {
+  const el = videoEl.value
+  if (!el) return
+  const value = el.duration
+  if (Number.isFinite(value) && value > 0) videoMediaDuration.value = value
+  if (el.videoWidth > 0 && el.videoHeight > 0) {
+    videoSize.value = { width: el.videoWidth, height: el.videoHeight }
+  }
+}
+
+function onVideoError(): void {
+  videoFailed.value = true
+}
+
+/** 重试：把 <video> 整个重建（v-if 切回来），比调 load() 更干净 */
+function retryVideo(): void {
+  videoFailed.value = false
+  videoMediaDuration.value = 0
+  videoSize.value = null
+}
+
+function resetVideoState(): void {
+  videoEl.value?.pause()
+  videoFailed.value = false
+  videoMediaDuration.value = 0
+  videoSize.value = null
+}
+
+// --- 音视频互斥：同一页面上两路声音绝不能同时响 -----------------------------
+
+/**
+ * 兜底：把页面上除「刚开播的那个元素」之外的 media 全部暂停。
+ * 主路径是下面的双向事件（视频 play → 音频 pause()，音频 play → 视频 pause()），
+ * 这层兜底是为了事件链路万一没接上时也不出现两路声音。
+ */
+function pauseInactiveMedia(active: HTMLMediaElement | null): void {
+  document.querySelectorAll<HTMLMediaElement>('audio, video').forEach((el) => {
+    if (el !== active && !el.paused) el.pause()
+  })
+}
+
+function onVideoPlay(event: Event): void {
+  audioRef.value?.pause()
+  pauseInactiveMedia(event.target as HTMLMediaElement)
+}
+
+function onAudioPlay(element: HTMLAudioElement): void {
+  const el = videoEl.value
+  if (el && !el.paused) el.pause()
+  pauseInactiveMedia(element)
+}
+
+// ---------------------------------------------------------------------------
 // 论文原图画廊 + 灯箱
 // ---------------------------------------------------------------------------
 
@@ -116,6 +200,7 @@ watch(id, () => {
   coverLoaded.value = false
   lightboxIndex.value = null
   brokenFigures.value = []
+  resetVideoState()
   episode.value = null
   void load()
 })
@@ -213,6 +298,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (audioRetryTimer !== undefined) window.clearTimeout(audioRetryTimer)
+  // 离开详情页时别把声音带走（音频侧由 AudioPlayer 自己暂停）
+  videoEl.value?.pause()
 })
 </script>
 
@@ -310,14 +397,102 @@ onBeforeUnmount(() => {
           <span class="alert__title">离线 Mock 模式</span>
           本页的解读与脚本来自内置示例数据；音频由 Web Audio API 现场合成的正弦波生成（约 36 秒），
           封面、论文原图与信息图也全部由 Canvas / 内联 SVG 现场生成，不请求任何网络资源。
+          视频解读由 Canvas + MediaRecorder 现场录制一段 6 秒占位片（浏览器需要真实录制时间，
+          首次进入详情页会稍等一两秒），同样是占位，不是真实产物。
         </span>
       </div>
 
+      <!--
+        视频解读播客：video 为 null 时整块不渲染（不留空标题、不留空白块）。
+        位置放在音频播放器之前：视频是「完整版」产物，先看视频再听音频更符合使用顺序。
+      -->
+      <section v-if="video" id="section-video" class="section">
+        <div class="section__head">
+          <h2 class="section__title">视频解读播客</h2>
+          <span class="section__hint">
+            竖版 {{ videoSizeLabel }} · 画面按脚本逐段切换、与音频轮次对齐 · 字幕按主播分色
+          </span>
+        </div>
+
+        <div class="vplayer card card--pad">
+          <div class="vplayer__body">
+            <!--
+              竖版 936×1210（比例约 0.773）：用 aspect-ratio 按契约比例预留位置
+              （加载前后不跳布局），max-height 兜住矮屏不至于把页面撑爆，
+              object-fit: contain 保证画面不变形、不裁切。
+            -->
+            <div class="vplayer__stage" :style="{ aspectRatio: VIDEO_ASPECT }">
+              <video
+                v-if="!videoFailed"
+                ref="videoEl"
+                class="vplayer__media"
+                :src="video.url"
+                :poster="coverSrc ?? undefined"
+                controls
+                playsinline
+                preload="metadata"
+                :aria-label="`《${episode.title}》视频解读播客`"
+                @loadedmetadata="onVideoMetadata"
+                @play="onVideoPlay"
+                @error="onVideoError"
+              />
+              <!-- 降级：地址不可用（404 / 编码不支持 / 还在合成）时不给破播放器 -->
+              <div v-else class="vplayer__broken">
+                <span class="vplayer__broken-glyph" aria-hidden="true">▶</span>
+                <p class="vplayer__broken-title">视频暂时加载不出来</p>
+                <p class="section__hint" style="margin-bottom: 14px">
+                  视频地址不可用，可能还在合成中或已被清理。音频、脚本与解读都不受影响。
+                </p>
+                <button type="button" class="btn btn--sm" @click="retryVideo">重新加载视频</button>
+              </div>
+            </div>
+
+            <div class="vplayer__side">
+              <div class="meta-grid">
+                <div class="meta-item">
+                  <div class="meta-item__label">时长</div>
+                  <div class="meta-item__value">{{ formatDuration(videoDuration) }}</div>
+                </div>
+                <div class="meta-item">
+                  <div class="meta-item__label">画幅</div>
+                  <div class="meta-item__value">{{ videoSizeLabel }}</div>
+                </div>
+                <div v-if="video.scene_count" class="meta-item">
+                  <div class="meta-item__label">画面</div>
+                  <div class="meta-item__value">{{ video.scene_count }} 段</div>
+                </div>
+                <div v-if="video.bytes" class="meta-item">
+                  <div class="meta-item__label">体积</div>
+                  <div class="meta-item__value">{{ formatBytes(video.bytes) }}</div>
+                </div>
+              </div>
+
+              <p class="vplayer__note">
+                片头显示论文首页，正文按内容相关性切换论文原图，片尾显示生成的信息图；
+                每段画面底部有字幕条，主播 A / 主播 B 用不同颜色区分。
+              </p>
+              <p class="section__hint">
+                本页音频与视频互斥播放：播放其中一个会自动暂停另一个，不会同时出声。
+              </p>
+
+              <div class="vplayer__actions">
+                <button type="button" class="btn btn--sm btn--primary" @click="downloadVideo">
+                  ↓ 下载视频（mp4）
+                </button>
+                <span v-if="IS_MOCK" class="badge badge--neutral">演示模式：视频为占位</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <template v-if="isCompleted">
         <AudioPlayer
+          ref="audioRef"
           :src="audioSrc"
           :fallback-duration="episode.audio_duration_sec"
           :title="episode.title"
+          @play="onAudioPlay"
         />
 
         <div class="row" style="margin-top: 18px; gap: 10px">

@@ -1,5 +1,6 @@
 import { ApiError } from './error'
 import { renderMockAudio } from './mockAudio'
+import { renderMockVideo } from './mockVideo'
 import { buildArtwork } from './mockArt'
 import type { MockArtwork } from './mockArt'
 import { MOCK_PAPERS } from './mockPapers'
@@ -23,6 +24,7 @@ import type {
   Script,
   ScriptSegment,
   SourceType,
+  VideoInfo,
 } from './types'
 import { STAGES } from '../utils/stages'
 import { countWords } from '../utils/format'
@@ -48,6 +50,12 @@ const FAIL_DEMO = /fail-demo/i
 
 /** Mock 音频片段时长：太长会拖慢浏览器渲染，36 秒足够验证播放器 */
 const MOCK_AUDIO_SEC = 36
+
+/**
+ * Mock 视频片段时长。演示视频是用 MediaRecorder **实时**录制的，
+ * 录多久就要等多久，所以只录 6 秒（画面按片头/正文/片尾切换，够验证结构与互斥播放）。
+ */
+const MOCK_VIDEO_SEC = 6
 
 const DEFAULT_OPTIONS: EpisodeOptions = {
   duration_min: 5,
@@ -117,6 +125,15 @@ const audioJobs = new Map<string, Promise<void>>()
 const objectUrls = new Map<string, Set<string>>()
 /** 需要模拟一次失败的单集（首次推进到「深度解读」时失败） */
 const failOnce = new Set<string>()
+
+/**
+ * 现场录制的演示视频。录制是真实时间的，所以全站只录一次、所有单集共用同一个 Blob URL。
+ * 注意：**不能**登记进 objectUrls（那是按单集回收的）——否则删掉某一集时会把
+ * 其他集正在用的 URL 一起 revoke 掉，视频就成了破播放器。
+ */
+let sharedVideo: VideoInfo | null = null
+let sharedVideoUrl: string | null = null
+let videoJob: Promise<VideoInfo | null> | null = null
 
 let loaded = false
 
@@ -293,6 +310,8 @@ function createEpisodeRecord(input: {
     script: buildScript(plan, options),
     // 配图（契约 §1 的新字段）：全部现场生成，见 mockArt.ts
     ...buildArtworkFor(id, input.sourceType, plan.meta),
+    // 视频解读（契约 §1 的 video 字段）：等单集完成时现场录制，见 ensureVideo
+    video: null,
     audio_url: null,
     audio_duration_sec: null,
     audio_bytes: null,
@@ -431,6 +450,62 @@ async function renderAudioFor(episode: Episode): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 视频（视频解读播客）
+// ---------------------------------------------------------------------------
+
+/**
+ * 组装一次演示视频的元数据。用第一篇内置论文的脚本做画面素材
+ * （字幕条用的是真实脚本句子，看起来才像「视频解读」而不是随便一块黑板）。
+ */
+async function renderSharedVideo(): Promise<VideoInfo | null> {
+  try {
+    const paper = MOCK_PAPERS[0] ?? genericPaper()
+    const result = await renderMockVideo({
+      title: paper.meta.title ?? '示例论文',
+      segments: paper.script,
+      durationSec: MOCK_VIDEO_SEC,
+    })
+    if (!result) {
+      // 浏览器不支持 canvas.captureStream + MediaRecorder：降级为「没有视频」，
+      // 详情页的视频区整块不渲染（不是破播放器，也不报错）
+      console.warn('[mock] 当前浏览器不支持现场录制演示视频，视频区将不显示')
+      return null
+    }
+    const url = URL.createObjectURL(result.blob)
+    sharedVideoUrl = url
+    sharedVideo = {
+      url,
+      duration_sec: result.durationSec,
+      scene_count: result.sceneCount,
+      bytes: result.blob.size,
+    }
+    return sharedVideo
+  } catch (error) {
+    console.warn('[mock] 演示视频生成失败，视频区将不显示', error)
+    return null
+  }
+}
+
+/** 取共享的演示视频（并发调用共用同一个渲染任务） */
+function ensureSharedVideo(): Promise<VideoInfo | null> {
+  if (sharedVideo) return Promise.resolve(sharedVideo)
+  if (!videoJob) {
+    videoJob = renderSharedVideo().finally(() => {
+      videoJob = null
+    })
+  }
+  return videoJob
+}
+
+/** 完成态的单集才有视频；录制中的任务给 null（与真实后端的时序一致） */
+async function ensureVideo(episode: Episode): Promise<void> {
+  if (episode.status !== 'completed') return
+  const info = await ensureSharedVideo()
+  const current = findEpisode(episode.id)
+  if (info && current) current.video = info
+}
+
+// ---------------------------------------------------------------------------
 // 持久化（只存元数据；音频与配图都在每次加载时重新现场生成，避免顶爆 localStorage 配额）
 // ---------------------------------------------------------------------------
 
@@ -449,6 +524,8 @@ function persist(): void {
         cover_height: null,
         figures: [],
         illustration: null,
+        // 视频是 MediaRecorder 现场录的 Blob URL，同样不落盘（存进去刷新后就是失效 URL）
+        video: null,
       })),
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
@@ -479,6 +556,8 @@ function normalizeStored(raw: unknown): Episode | null {
     script: value.script ?? null,
     // 配图重新现场生成（seed 用 id，所以和刷新前是同一张图）
     ...buildArtworkFor(value.id, sourceType, meta ?? { title: value.title } as PaperMeta),
+    // 视频同样是现场生成物，加载后按需重录（这里先置 null，见 ensureLoaded / ensureVideo）
+    video: null,
     audio_url: null,
     audio_duration_sec: null,
     audio_bytes: null,
@@ -571,6 +650,11 @@ function ensureLoaded(): void {
       resumePipeline(episode)
     }
   })
+
+  // 演示视频是实时录制的：这里先在后台开录（不 await），用户点进详情页时通常已经好了。
+  // 直接深链到详情页的极端情况由 getEpisode 里的 await 兜住。
+  if (episodes.some((episode) => episode.status === 'completed')) void ensureSharedVideo()
+
   persist()
 }
 
@@ -716,7 +800,7 @@ export async function createEpisodeFromText(input: CreateTextInput): Promise<Epi
 }
 
 /**
- * 契约 §1：列表项省略 analysis / script（置 null）、figures（置 []）、illustration（置 null），
+ * 契约 §1：列表项省略 analysis / script（置 null）、figures（置 []）、illustration / video（置 null），
  * 但保留 cover_url 一族，因为列表卡片要显示封面缩略图。
  * 这里显式挑字段而不是「spread 再删」，这样一旦 Episode 新增字段，类型检查会提醒我们同步。
  */
@@ -768,6 +852,8 @@ export async function getEpisode(id: string): Promise<Episode> {
   if (episode.status === 'completed' && !episode.audio_url) {
     await ensureAudio(episode)
   }
+  // 与真实后端一致：详情接口才带 video（列表接口不带）
+  await ensureVideo(episode)
   return { ...episode }
 }
 
@@ -822,6 +908,12 @@ export function resetMockStore(): void {
   timers.forEach((timer) => window.clearTimeout(timer))
   timers.clear()
   audioJobs.clear()
+  videoJob = null
+  sharedVideo = null
+  if (sharedVideoUrl) {
+    URL.revokeObjectURL(sharedVideoUrl)
+    sharedVideoUrl = null
+  }
   failOnce.clear()
   objectUrls.forEach((set) => set.forEach((url) => URL.revokeObjectURL(url)))
   objectUrls.clear()

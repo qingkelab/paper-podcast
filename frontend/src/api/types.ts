@@ -84,6 +84,21 @@ export interface Illustration {
   source: 'model' | 'fallback' | string
 }
 
+/**
+ * 视频解读播客（契约 §1 / §2：GET /api/episodes/{id}/video，video/mp4，H.264 + AAC）。
+ * 画幅固定 936×1210（竖版，与论文 PDF 首页同尺寸）。
+ */
+export interface VideoInfo {
+  /** 视频资源地址 */
+  url: string
+  /** 视频时长（秒） */
+  duration_sec: number | null
+  /** 画面段数：脚本每轮对应一个画面 */
+  scene_count: number | null
+  /** 文件体积（字节） */
+  bytes: number | null
+}
+
 export interface Episode {
   id: string
   title: string
@@ -105,6 +120,8 @@ export interface Episode {
   figures: Figure[]
   /** 生成的信息图，可为 null */
   illustration: Illustration | null
+  /** 视频解读播客，无则 null（未启用视频合成 / 合成失败 / 老数据） */
+  video: VideoInfo | null
   audio_url: string | null
   audio_duration_sec: number | null
   audio_bytes: number | null
@@ -114,10 +131,13 @@ export interface Episode {
 
 /**
  * 列表接口返回的 Episode（契约 §1）：
- * 省略 analysis / script（置为 null）、figures（置为 []）、illustration（置为 null）。
+ * 省略 analysis / script（置为 null）、figures（置为 []）、illustration / video（置为 null）。
  * 但 cover_url / cover_width / cover_height 在列表里保留，列表卡片要显示封面缩略图。
  */
-export type EpisodeSummary = Omit<Episode, 'analysis' | 'script' | 'figures' | 'illustration'>
+export type EpisodeSummary = Omit<
+  Episode,
+  'analysis' | 'script' | 'figures' | 'illustration' | 'video'
+>
 
 export interface ListEpisodesParams {
   limit?: number

@@ -103,5 +103,6 @@ export type {
   Script,
   ScriptSegment,
   SourceType,
+  VideoInfo,
   VoiceOption,
 } from './types'
