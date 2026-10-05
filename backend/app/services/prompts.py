@@ -325,3 +325,45 @@ def build_expand_messages(
         {"role": "system", "content": EXPAND_SYSTEM},
         {"role": "user", "content": user},
     ]
+
+
+TRIM_SYSTEM = """你是播客剪辑师，正在把一版偏长的稿子压到目标长度。\
+时长超标会让听众觉得拖沓，所以要砍掉冗余，而不是把话说快点。
+
+【怎么砍】
+- 优先删掉重复表达同一个意思的段落，保留信息量更高的那一版。
+- 删掉铺垫句、客套话、不承担信息功能的过渡。
+- 保留：开场方式、收尾方式、所有关键数字、所有技术要点、B 的核心质疑。
+- 合并连续的短发言，不要为了凑数把一段话拆成两段。
+
+【不要做】
+- 不要改写观点、结论或数据。
+- 不要因为压缩就让句子变得书面化，口语感必须保留。
+- 不要输出「（略）」之类的省略标记，要输出可以直接用的完整台词。
+
+输出 JSON：{"segments": [{"speaker": "A", "text": "..."}]}，speaker 只能是 A 或 B，\
+每段 30-120 字，禁止 Markdown。"""
+
+
+def build_trim_messages(
+    segments: list[dict],
+    *,
+    current_chars: int,
+    target: int,
+) -> list[dict[str, str]]:
+    script_text = "\n".join(
+        f"主播{'A' if seg.get('speaker') == 'A' else 'B'}：{seg.get('text', '')}"
+        for seg in segments
+    )
+    excess = max(current_chars - target, 0)
+    user = f"""下面这版播客脚本共 {current_chars} 字，目标长度是 {target} 字左右，\
+需要精简掉约 {excess} 字。请在保持观点、数据、开场与收尾不变的前提下压缩。
+
+【当前脚本】
+{script_text}
+
+请输出精简后的完整脚本 JSON（是完整替换，不是只输出要删的部分）。"""
+    return [
+        {"role": "system", "content": TRIM_SYSTEM},
+        {"role": "user", "content": user},
+    ]

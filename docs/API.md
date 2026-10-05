@@ -44,6 +44,22 @@
     "word_count": 1840,
     "est_duration_sec": 300
   },
+  "cover_url": "/api/episodes/3f2a9c1e/cover",  // 封面：PDF 第一页渲染图；无则 null
+  "cover_width": 935,
+  "cover_height": 1210,
+  "figures": [                                  // 从论文 PDF 提取的原图/表
+    { "id": "f1", "kind": "figure", "label": "Figure 1",
+      "caption": "Figure 1: The Transformer - model architecture.",
+      "page": 3,
+      "url": "/api/episodes/3f2a9c1e/figures/f1",
+      "width": 473, "height": 690 }
+  ],
+  "illustration": {                             // 模型生成的信息图
+    "png_url": "/api/episodes/3f2a9c1e/illustration.png",
+    "svg_url": "/api/episodes/3f2a9c1e/illustration.svg",
+    "width": 1280, "height": 720,
+    "source": "model"                           // "model" | "fallback"
+  },
   "audio_url": "/api/episodes/3f2a9c1e/audio",  // 无音频时 null
   "audio_duration_sec": 302.5,
   "audio_bytes": 2411724,
@@ -52,7 +68,9 @@
 }
 ```
 
-列表接口返回的 Episode **省略** `analysis` 和 `script` 两个大字段（置为 `null`），详情接口才返回。
+列表接口返回的 Episode **省略** `analysis`、`script`、`figures`、`illustration`
+（分别置为 `null` / `[]`），详情接口才返回。但 **`cover_url` 在列表里保留**，
+因为列表卡片要显示封面缩略图。
 
 ### 状态机
 
@@ -155,6 +173,25 @@
 仅 `status="failed"` 时允许；重置为 `queued` 并重新入队。返回完整 Episode。
 `409` 表示当前状态不可重试。
 
+### `GET /api/episodes/{id}/cover`
+
+封面图，`image/png`。内容 = **论文 PDF 第一页的整页渲染**（首页有标题、作者、
+摘要和 teaser 图，辨识度最高）。text 来源没有 PDF，则退回用生成的信息图当封面。
+无封面时 `404`。
+
+### `GET /api/episodes/{id}/figures/{figure_id}`
+
+论文原图，`image/png`。按 `Figure N:` 图注定位后从 PDF 渲染出的区域。
+`figure_id` 形如 `f1`（图）/ `t1`（表）。不存在时 `404`。
+
+### `GET /api/episodes/{id}/illustration.png` / `.svg`
+
+模型生成的论文信息图。
+- `.png` 用于列表缩略图等静态场景
+- `.svg` **保留 SMIL 动画**，详情页请用 `<object type="image/svg+xml">` 引用，
+  这样动画会播放；用 `<img>` 引用时部分浏览器不会跑动画。
+  不要内联进页面 HTML（内容是模型生成的，虽然已在入库前白名单清洗）。
+
 ### `GET /api/episodes/{id}/audio`
 
 返回音频文件流，`Content-Type` 依格式（`audio/mpeg`）。
@@ -183,7 +220,7 @@
 | 首页/导入 | `/` | `POST /api/episodes`、`GET /api/options`、`GET /api/health` |
 | 任务进度 | `/task/:id` | `GET /api/episodes/{id}`（轮询）、`POST .../retry` |
 | 播客库 | `/library` | `GET /api/episodes`、`DELETE /api/episodes/{id}` |
-| 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../audio`、`.../script.txt`、`.../analysis.md` |
+| 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md` |
 | 设置 | `/settings` | `GET /api/options`、`GET /api/health`（本地存储偏好） |
 
 ---

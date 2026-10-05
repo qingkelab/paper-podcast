@@ -315,6 +315,10 @@ class TestManagement:
         # 列表页不返回大字段，避免列表接口变成几 MB
         assert item["analysis"] is None
         assert item["script"] is None
+        assert item["figures"] == []
+        assert item["illustration"] is None
+        # 但封面要保留，列表卡片要显示缩略图
+        assert "cover_url" in item
 
     def test_list_search_and_filter(self, client):
         episode = create_text_episode(client, title="独一无二的标题XYZ")
@@ -499,3 +503,110 @@ class TestSpaFallback:
 
     def test_api_still_works_with_frontend_mounted(self, spa_client):
         assert spa_client.get("/api/health").json()["status"] == "ok"
+
+
+# --------------------------------------------------------------------------
+# 配图资源
+# --------------------------------------------------------------------------
+
+
+class TestEpisodeAssets:
+    def test_text_episode_gets_generated_cover(self, client):
+        """纯文本来源没有 PDF，封面应当退回用生成的信息图，不能为空。"""
+        created = create_text_episode(client)
+        episode = wait_for_completion(client, created["id"])
+
+        assert episode["cover_url"] == f"/api/episodes/{created['id']}/cover"
+        assert episode["cover_width"] and episode["cover_height"]
+
+        illustration = episode["illustration"]
+        assert illustration is not None
+        assert illustration["source"] in ("model", "fallback")
+        # Mock 模式下没有真实模型，应当是本地兜底图
+        assert illustration["source"] == "fallback"
+
+    def test_cover_endpoint_serves_png(self, client):
+        created = create_text_episode(client)
+        wait_for_completion(client, created["id"])
+
+        response = client.get(f"/api/episodes/{created['id']}/cover")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_illustration_png_and_svg(self, client):
+        created = create_text_episode(client)
+        wait_for_completion(client, created["id"])
+
+        png = client.get(f"/api/episodes/{created['id']}/illustration.png")
+        assert png.status_code == 200
+        assert png.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+        svg = client.get(f"/api/episodes/{created['id']}/illustration.svg")
+        assert svg.status_code == 200
+        assert "image/svg+xml" in svg.headers["content-type"]
+        assert "<svg" in svg.text
+        # 模型生成的内容，必须带防脚本执行的兜底头
+        assert "Content-Security-Policy" in svg.headers
+
+    def test_assets_404_for_unknown_episode(self, client):
+        assert client.get("/api/episodes/nope/cover").status_code == 404
+        assert client.get("/api/episodes/nope/illustration.png").status_code == 404
+        assert client.get("/api/episodes/nope/illustration.svg").status_code == 404
+        assert client.get("/api/episodes/nope/figures/f1").status_code == 404
+
+    def test_unknown_figure_404(self, client):
+        created = create_text_episode(client)
+        wait_for_completion(client, created["id"])
+        response = client.get(f"/api/episodes/{created['id']}/figures/nosuch")
+        assert response.status_code == 404
+
+    def test_pdf_episode_extracts_cover_and_figures(self, client, tmp_path):
+        """上传含图形的 PDF，应当产出封面 + 原图。"""
+        import pymupdf
+
+        # 需要同时满足两个条件：有矢量图形（才提得到图）、正文够 200 字
+        # （否则会被当成扫描版 PDF 拒掉）
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.draw_rect(pymupdf.Rect(80, 120, 515, 380), width=1.5)
+        page.draw_rect(pymupdf.Rect(120, 160, 300, 300), fill=(0.75, 0.82, 0.93))
+        page.draw_line(pymupdf.Point(300, 230), pymupdf.Point(460, 230), width=2)
+        page.insert_text((80, 410), "Figure 1: The overall architecture of our model.", fontsize=10)
+        for line in range(14):
+            page.insert_text(
+                (80, 450 + line * 14),
+                "We propose a simple and effective approach for sequence modeling. "
+                "Experiments show consistent improvements over strong baselines.",
+                fontsize=9,
+            )
+        pdf_bytes = doc.tobytes()
+        doc.close()
+
+        response = client.post(
+            "/api/episodes",
+            files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+        )
+        assert response.status_code == 201
+        created = response.json()
+
+        # 封面在解析阶段就生成，不必等整条流水线跑完
+        deadline = time.time() + 30
+        episode = {}
+        while time.time() < deadline:
+            episode = client.get(f"/api/episodes/{created['id']}").json()
+            if episode["cover_url"]:
+                break
+            time.sleep(0.2)
+
+        assert episode["cover_url"], "PDF 来源应当有封面"
+        assert episode["cover_width"] > 300
+        assert client.get(f"/api/episodes/{created['id']}/cover").status_code == 200
+
+    def test_delete_removes_asset_files(self, client):
+        created = create_text_episode(client)
+        wait_for_completion(client, created["id"])
+        assert client.get(f"/api/episodes/{created['id']}/cover").status_code == 200
+
+        assert client.delete(f"/api/episodes/{created['id']}").status_code == 204
+        assert client.get(f"/api/episodes/{created['id']}/cover").status_code == 404

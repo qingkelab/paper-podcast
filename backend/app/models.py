@@ -60,6 +60,29 @@ class Script(BaseModel):
     est_duration_sec: int = 0
 
 
+class Figure(BaseModel):
+    """从论文 PDF 里提取的一张图或表。"""
+
+    id: str
+    kind: Literal["figure", "table"]
+    label: str          # "Figure 1"
+    caption: str = ""
+    page: int = 1
+    url: str
+    width: int
+    height: int
+
+
+class Illustration(BaseModel):
+    """模型生成的信息图。svg_url 保留动画能力，png_url 用于列表缩略图。"""
+
+    png_url: str
+    svg_url: str
+    width: int
+    height: int
+    source: Literal["model", "fallback"]
+
+
 class Episode(BaseModel):
     id: str
     title: str
@@ -73,6 +96,11 @@ class Episode(BaseModel):
     paper_meta: PaperMeta | None = None
     analysis: Analysis | None = None
     script: Script | None = None
+    cover_url: str | None = None
+    cover_width: int | None = None
+    cover_height: int | None = None
+    figures: list[Figure] = Field(default_factory=list)
+    illustration: Illustration | None = None
     audio_url: str | None = None
     audio_duration_sec: float | None = None
     audio_bytes: int | None = None
@@ -81,10 +109,16 @@ class Episode(BaseModel):
 
 
 class EpisodeListItem(Episode):
-    """列表接口：省略 analysis / script 大字段。"""
+    """列表接口：省略 analysis / script 大字段。
+
+    但保留 cover_url —— 列表卡片要显示封面缩略图。
+    figures / illustration 也省略，列表用不到。
+    """
 
     analysis: None = None
     script: None = None
+    figures: list[Figure] = Field(default_factory=list)
+    illustration: None = None
 
 
 class EpisodeList(BaseModel):

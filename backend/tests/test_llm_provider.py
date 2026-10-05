@@ -305,3 +305,98 @@ class TestLengthRepair:
         )
         script = client.generate_script({}, {}, duration_min=5, level="intro")
         assert script["word_count"] >= original * 0.9
+
+
+class TestLengthTrim:
+    """超长也要兜。实测 3 分钟档产出 221.5 秒（+23%），而原来只处理偏短。"""
+
+    @staticmethod
+    def _client(monkeypatch, script_chars: int, trimmed_chars: int | None):
+        calls: list[dict] = []
+
+        def fake_chat_json(self, messages, *, max_tokens, temperature=0.6):
+            calls.append({"messages": messages})
+            n = script_chars if len(calls) == 1 else (trimmed_chars or script_chars)
+            per = max(n // 6, 1)
+            return {
+                "segments": [
+                    {"speaker": "A" if i % 2 == 0 else "B", "text": "字" * per}
+                    for i in range(6)
+                ]
+            }
+
+        monkeypatch.setattr(LLMClient, "_chat_json", fake_chat_json)
+        return LLMClient(make_settings(deepseek_api_key="k")), calls
+
+    def test_overlong_script_triggers_trim(self, monkeypatch):
+        from app.services import prompts
+
+        target = prompts.target_chars(5)
+        client, calls = self._client(
+            monkeypatch, script_chars=int(target * 1.6), trimmed_chars=target
+        )
+        script = client.generate_script({}, {}, duration_min=5, level="intro")
+
+        assert len(calls) == 2, "超长脚本应当触发第二次精简调用"
+        assert script["word_count"] < target * 1.5
+
+    def test_trim_prompt_asks_for_whole_script(self, monkeypatch):
+        from app.services import prompts
+
+        target = prompts.target_chars(5)
+        client, calls = self._client(
+            monkeypatch, script_chars=int(target * 1.6), trimmed_chars=target
+        )
+        client.generate_script({}, {}, duration_min=5, level="intro")
+
+        user = calls[1]["messages"][-1]["content"]
+        assert "完整脚本" in user
+        assert "不是只输出要删的部分" in user
+
+    def test_acceptable_length_skips_trim(self, monkeypatch):
+        """在容差范围内就不该多花钱调用模型。"""
+        from app.services import prompts
+
+        target = prompts.target_chars(5)
+        client, calls = self._client(
+            monkeypatch, script_chars=int(target * 1.05), trimmed_chars=None
+        )
+        client.generate_script({}, {}, duration_min=5, level="intro")
+        assert len(calls) == 1
+
+    def test_trim_that_overshoots_is_discarded(self, monkeypatch):
+        """精简过头（低于目标下限）也要保留原稿——宁可长一点也不要丢信息。"""
+        from app.services import prompts
+
+        target = prompts.target_chars(5)
+        original = int(target * 1.6)
+        client, _ = self._client(
+            monkeypatch, script_chars=original, trimmed_chars=int(target * 0.3)
+        )
+        script = client.generate_script({}, {}, duration_min=5, level="intro")
+        assert script["word_count"] >= original * 0.9
+
+    def test_trim_failure_keeps_original(self, monkeypatch):
+        from app.services import prompts
+
+        target = prompts.target_chars(5)
+        original = int(target * 1.6)
+
+        def fake_chat_json(self, messages, *, max_tokens, temperature=0.6):
+            if not hasattr(fake_chat_json, "n"):
+                fake_chat_json.n = 0
+            fake_chat_json.n += 1
+            if fake_chat_json.n > 1:
+                raise LLMError("精简调用失败")
+            per = max(original // 6, 1)
+            return {
+                "segments": [
+                    {"speaker": "A" if i % 2 == 0 else "B", "text": "字" * per}
+                    for i in range(6)
+                ]
+            }
+
+        monkeypatch.setattr(LLMClient, "_chat_json", fake_chat_json)
+        client = LLMClient(make_settings(deepseek_api_key="k"))
+        script = client.generate_script({}, {}, duration_min=5, level="intro")
+        assert script["word_count"] > 0

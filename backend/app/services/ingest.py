@@ -235,10 +235,12 @@ def _get(client: httpx.Client, url: str, headers: dict[str, str]) -> httpx.Respo
         raise IngestError(f"抓取链接失败：{exc}") from exc
 
 
-def fetch_url_text(url: str, timeout: float = 25.0) -> tuple[str, str]:
+def fetch_url_text(url: str, timeout: float = 25.0) -> tuple[str, str, bytes | None]:
     """抓取链接正文。
 
-    返回 (清洗后文本, 内容类型标识)。内容类型为 'pdf' 或 'html'。
+    返回 (清洗后文本, 内容类型标识, PDF 原始字节)。
+    内容类型为 'pdf' 或 'html'；只有拿到 PDF 时第三项才非空——
+    配图提取需要原始 PDF 字节，所以这里一并带出来，避免二次下载。
     """
     if not re.match(r"^https?://", url, re.I):
         raise IngestError("链接必须以 http:// 或 https:// 开头")
@@ -254,7 +256,11 @@ def fetch_url_text(url: str, timeout: float = 25.0) -> tuple[str, str]:
             except httpx.HTTPError as exc:
                 raise IngestError(f"抓取 arXiv PDF 失败：{exc}") from exc
             if pdf_response.status_code < 400 and pdf_response.content[:5] == b"%PDF-":
-                return clean_text(extract_pdf_text(pdf_response.content)), "pdf"
+                return (
+                    clean_text(extract_pdf_text(pdf_response.content)),
+                    "pdf",
+                    pdf_response.content,
+                )
             # 抓不到 PDF 就退回摘要页，至少还有摘要可用
             response = _get(client, url, headers)
         else:
@@ -268,7 +274,7 @@ def fetch_url_text(url: str, timeout: float = 25.0) -> tuple[str, str]:
 
     content_type = (response.headers.get("content-type") or "").lower()
     if "application/pdf" in content_type or response.content[:5] == b"%PDF-":
-        return clean_text(extract_pdf_text(response.content)), "pdf"
+        return clean_text(extract_pdf_text(response.content)), "pdf", response.content
 
     body = _html_to_text(response.text)
     if len(body) < 400:
@@ -276,4 +282,4 @@ def fetch_url_text(url: str, timeout: float = 25.0) -> tuple[str, str]:
             "这个页面提取不到足够正文，可能是动态渲染或需要登录的页面。"
             "请改用 PDF 上传或文本粘贴。"
         )
-    return body, "html"
+    return body, "html", None

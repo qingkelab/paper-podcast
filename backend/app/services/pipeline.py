@@ -22,6 +22,8 @@ from .ingest import (
     guess_title,
     truncate_smart,
 )
+from .figures import extract_figures, render_first_page
+from .illustration import generate_illustration
 from .llm import LLMClient, LLMError
 from .podcast_tts import PodcastTTSClient, PodcastTTSError, probe_duration
 
@@ -63,19 +65,25 @@ class Pipeline:
 
     # ---------- 解析阶段 ----------
 
-    def resolve_paper_text(self, episode: dict[str, Any]) -> str:
-        """把三种来源统一成清洗后的正文。"""
+    def resolve_paper(self, episode: dict[str, Any]) -> tuple[str, bytes | None]:
+        """把三种来源统一成清洗后的正文，并尽量带出 PDF 原始字节。
+
+        返回 (正文, PDF字节或None)。配图和封面都要从原始 PDF 渲染，
+        所以这里把字节一并带出来，避免二次下载。
+        """
         source_type = episode["source_type"]
         source_ref = episode.get("source_ref") or ""
+        pdf_bytes: bytes | None = None
 
         if source_type == "pdf":
             path = Path(source_ref)
             if not path.exists():
                 raise IngestError("上传的 PDF 文件已丢失，请重新上传")
-            raw = extract_pdf_text(path.read_bytes())
+            pdf_bytes = path.read_bytes()
+            raw = extract_pdf_text(pdf_bytes)
 
         elif source_type == "url":
-            raw, _ = fetch_url_text(source_ref)
+            raw, _, pdf_bytes = fetch_url_text(source_ref)
 
         elif source_type == "text":
             raw = episode.get("raw_text") or source_ref
@@ -88,7 +96,7 @@ class Pipeline:
         if len(text) < 200:
             raise IngestError("论文有效正文过短（少于 200 字），无法生成有内容的解读")
 
-        return truncate_smart(text, self.settings.max_paper_chars)
+        return truncate_smart(text, self.settings.max_paper_chars), pdf_bytes
 
     # ---------- 主流程 ----------
 
@@ -109,7 +117,29 @@ class Pipeline:
         try:
             # ---- 1. 解析 ----
             self._set_stage(episode_id, "parsing")
-            paper_text = self.resolve_paper_text(episode)
+            paper_text, pdf_bytes = self.resolve_paper(episode)
+
+            # 封面 = PDF 第一页；正文插图按图注提取。
+            # 两者都是增强项，失败只记日志，绝不让整期播客失败。
+            cover_fields: dict[str, Any] = {}
+            if pdf_bytes:
+                cover = render_first_page(pdf_bytes, self.settings.cover_dir / f"{episode_id}.png")
+                if cover:
+                    cover_path, cover_w, cover_h = cover
+                    cover_fields = {
+                        "cover_path": str(cover_path),
+                        "cover_width": cover_w,
+                        "cover_height": cover_h,
+                    }
+                figures = extract_figures(
+                    pdf_bytes, self.settings.figure_dir, episode_id
+                )
+                if figures:
+                    self.db.update_episode(
+                        episode_id, figures=[f.to_dict() for f in figures]
+                    )
+                if cover_fields:
+                    self.db.update_episode(episode_id, **cover_fields)
 
             title_hint = episode.get("title") or ""
             if not title_hint or title_hint == "处理中":
@@ -132,6 +162,23 @@ class Pipeline:
                 paper_meta=paper_meta,
                 analysis=analysis,
             )
+
+            # 生成信息图。text 来源没有 PDF，就用它当封面。
+            illustration = generate_illustration(
+                self.llm,
+                analysis,
+                paper_meta,
+                self.settings.illustration_dir,
+                episode_id,
+            )
+            update_fields: dict[str, Any] = {
+                "illustration": illustration.to_dict()
+            }
+            if not cover_fields and illustration.png_path:
+                update_fields["cover_path"] = illustration.png_path
+                update_fields["cover_width"] = illustration.width
+                update_fields["cover_height"] = illustration.height
+            self.db.update_episode(episode_id, **update_fields)
 
             # ---- 3. 脚本 ----
             self._set_stage(episode_id, "scripting")

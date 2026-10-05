@@ -38,6 +38,9 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   别把它当装饰删掉。
 - **音频接口必须支持 Range 请求**。播放器拖动进度条依赖 `206 + Content-Range`，
   改成普通 `FileResponse` 会让 Safari 完全不能播。
+- **生成的信息图要走 `<object type="image/svg+xml">` 引用**，不要用 `<img>`
+  （部分浏览器不会跑 `<img>` 里 SVG 的 SMIL 动画），也**不要内联进 HTML**
+  （内容是模型生成的）。后端已做白名单清洗并加了 CSP 兜底。
 
 ## 踩过的坑（别重犯）
 
@@ -64,13 +67,27 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   不可靠（实测欠过 35%），所以有 `_repair_length_if_needed` 做生成后兜底。
 - **macOS 系统代理开着 SOCKS 时**，websockets 会自动读取系统代理，缺 python-socks
   会直接连接失败。
+- **论文里的图大多是矢量图形，不是位图**。只调 `page.get_images()` 会漏掉几乎
+  所有真正的图（实测 Attention 那篇只有 3 张位图，但单页有 600~1000 个矢量绘图）。
+  必须「按图注定位 + 图形包围盒渲染区域」。
+- **图注在图下方，表注在表上方**。方向搞反会截到一片空白。
+- **`page.get_text(clip=...)` 返回的是相交的整个文本块，不是严格裁剪的文字**。
+  取图注要用 `get_text("words")` 逐词过滤，否则会把图里的坐标轴标签带进来。
+- **`Figure 4` 和 `Fig. 4` 指同一张图**，正文里的交叉引用又常落在行首，
+  正则分不开，必须后处理去重 + 优先全文写法。
+- **清洗模型生成的 SVG 时不要手动 `set("xmlns")`**。ElementTree 在注册了默认
+  命名空间后会自动输出 xmlns，手动再加会产生重复属性 → XML 非法
+  （resvg 宽容能渲染，浏览器直接报错）。
+- **本环境无法做 HTML→图片**：Chrome headless 会挂死，Playwright 装浏览器超时。
+  需要「生成配图」时走 SVG + resvg-py（自包含，且 SVG 原生支持 SMIL 动画）。
 
 ## 结构
 
 ```
-backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟) podcast_tts(语音) pipeline(编排)
+backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟) podcast_tts(语音)
+                          figures(PDF封面+论文原图) illustration(生成信息图) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            126 项，改完必须全绿
+backend/tests/            173 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 

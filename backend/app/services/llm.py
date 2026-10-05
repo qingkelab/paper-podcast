@@ -18,9 +18,11 @@ from . import prompts
 
 logger = logging.getLogger(__name__)
 
-# 脚本字数低于目标的这个比例时，触发一次扩写补救。
-# 0.9 的意思是「允许比目标短 10%」，超出这个范围才多花一次模型调用。
-LENGTH_REPAIR_THRESHOLD = 0.9
+# 长度容差。实测模型对字数预算的遵守程度不稳定（3 分钟档一度欠 35%、
+# 另一轮又超 23%），所以两头都要兜：低于下限补一次扩写，高于上限压一次。
+# 超出这个区间才多花一次模型调用。
+LENGTH_REPAIR_THRESHOLD = 0.9   # 低于目标的 90% → 扩写
+LENGTH_TRIM_THRESHOLD = 1.15    # 高于目标的 115% → 精简
 
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
@@ -142,6 +144,30 @@ class LLMClient:
             raise LLMError("模型未能给出有效的论文解读内容")
         return meta, analysis
 
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int = 4000,
+        temperature: float = 0.7,
+    ) -> str:
+        """通用文本补全，返回模型原始输出。
+
+        用在不需要 JSON 的场景（比如让模型写一张配图 SVG）。
+        Mock 模式下抛错，由调用方决定降级策略。
+        """
+        if self.mock:
+            raise LLMError("Mock 模式不支持通用补全")
+
+        payload_messages = messages
+        # 这里是自由文本输出（SVG），不能被 response_format=json_object 干扰
+        return self._chat(
+            payload_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            json_mode=False,
+        )
+
     def generate_script(
         self,
         analysis: dict[str, Any],
@@ -204,6 +230,9 @@ class LLMClient:
         target = prompts.target_chars(duration_min, speech_rate)
         actual = script.get("word_count", 0)
 
+        if actual > target * LENGTH_TRIM_THRESHOLD:
+            return self._trim_script(script, target=target, speech_rate=speech_rate)
+
         if actual >= target * LENGTH_REPAIR_THRESHOLD:
             return script
 
@@ -248,6 +277,61 @@ class LLMClient:
         )
         return repaired
 
+    def _trim_script(
+        self, script: dict[str, Any], *, target: int, speech_rate: int
+    ) -> dict[str, Any]:
+        """脚本超长时压缩一次。
+
+        与扩写对称：只做一次、失败就保留原稿。超长比偏短危害小，
+        所以宁可保留原稿（听众多听一会儿）也不要因为压缩丢掉关键信息。
+        """
+        actual = script.get("word_count", 0)
+        logger.info(
+            "脚本偏长（%d 字 / 目标 %d 字，达 %.0f%%），追加一次精简",
+            actual,
+            target,
+            actual / max(target, 1) * 100,
+        )
+
+        try:
+            data = self._chat_json(
+                prompts.build_trim_messages(
+                    script["segments"], current_chars=actual, target=target
+                ),
+                max_tokens=8000,
+                temperature=0.4,  # 压缩要稳，不要发挥
+            )
+        except LLMError as exc:
+            logger.warning("精简失败，沿用原脚本：%s", exc)
+            return script
+
+        trimmed_segments = _normalize_segments(data.get("segments"))
+        if len(trimmed_segments) < 4:
+            logger.warning("精简结果无效（%d 段），沿用原脚本", len(trimmed_segments))
+            return script
+
+        trimmed = build_script_payload(trimmed_segments, speech_rate=speech_rate)
+
+        # 精简后反而更长/没变，说明模型没按要求做
+        if trimmed["word_count"] >= actual:
+            logger.warning(
+                "精简后并未变短（%d → %d 字），沿用原脚本", actual, trimmed["word_count"]
+            )
+            return script
+
+        # 压过头了（低于下限）也不要——宁可长一点
+        if trimmed["word_count"] < target * LENGTH_REPAIR_THRESHOLD:
+            logger.warning(
+                "精简过度（%d 字，低于目标 %d 字的 %d%%），沿用原脚本",
+                trimmed["word_count"],
+                target,
+                int(LENGTH_REPAIR_THRESHOLD * 100),
+            )
+            return script
+
+        logger.info("精简完成：%d → %d 字（目标 %d 字）", actual, trimmed["word_count"], target)
+        return trimmed
+
     # ---------- 内部 ----------
 
     def _chat_json(
@@ -257,7 +341,9 @@ class LLMClient:
         max_tokens: int,
         temperature: float = 0.6,
     ) -> dict[str, Any]:
-        raw = self._chat(messages, max_tokens=max_tokens, temperature=temperature)
+        raw = self._chat(
+            messages, max_tokens=max_tokens, temperature=temperature, json_mode=True
+        )
         return parse_json_response(raw)
 
     def _chat(
@@ -266,16 +352,19 @@ class LLMClient:
         *,
         max_tokens: int,
         temperature: float,
+        json_mode: bool = True,
     ) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+        }
+        if json_mode:
             # 两个提供方都支持 JSON 输出模式。开启后模型不会在外面裹客套话，
             # 解析成功率显著提升（parse_json_response 仍保留兜底）。
-            "response_format": {"type": "json_object"},
-        }
+            # 但生成 SVG 时必须关掉，否则模型会把 SVG 塞进 JSON 字符串里。
+            payload["response_format"] = {"type": "json_object"}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

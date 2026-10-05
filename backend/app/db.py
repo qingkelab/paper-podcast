@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS episodes (
     podcast_task_id    TEXT,
     finished_round     INTEGER NOT NULL DEFAULT -1,
     retry_count        INTEGER NOT NULL DEFAULT 0,
+    cover_path         TEXT,
+    cover_width        INTEGER,
+    cover_height       INTEGER,
+    figures_json       TEXT,
+    illustration_json  TEXT,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
 );
@@ -64,7 +69,29 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """给已存在的旧库补上后来新增的列。
+
+        用 PRAGMA table_info 对比而不是直接 ALTER，否则重复执行会报错。
+        本项目刻意不做完整迁移框架：加列是唯一需要的演进方式。
+        """
+        existing = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(episodes)").fetchall()
+        }
+        additions = {
+            "cover_path": "TEXT",
+            "cover_width": "INTEGER",
+            "cover_height": "INTEGER",
+            "figures_json": "TEXT",
+            "illustration_json": "TEXT",
+        }
+        for column, sql_type in additions.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE episodes ADD COLUMN {column} {sql_type}")
 
     def close(self) -> None:
         with self._lock:
@@ -118,6 +145,11 @@ class Database:
             "podcast_task_id": row["podcast_task_id"],
             "finished_round": row["finished_round"],
             "retry_count": row["retry_count"],
+            "cover_path": row["cover_path"],
+            "cover_width": row["cover_width"],
+            "cover_height": row["cover_height"],
+            "figures": load(row["figures_json"]) or [],
+            "illustration": load(row["illustration_json"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -190,7 +222,14 @@ class Database:
 
     def update_episode(self, episode_id: str, **fields: Any) -> None:
         """按字段名更新。JSON 字段传 dict/list，会自动序列化。"""
-        json_fields = {"options", "paper_meta", "analysis", "script"}
+        json_fields = {
+            "options",
+            "paper_meta",
+            "analysis",
+            "script",
+            "figures",
+            "illustration",
+        }
         sets: list[str] = []
         params: list[Any] = []
         for key, value in fields.items():
@@ -199,6 +238,8 @@ class Database:
                 "paper_meta": "paper_meta_json",
                 "analysis": "analysis_json",
                 "script": "script_json",
+                "figures": "figures_json",
+                "illustration": "illustration_json",
             }.get(key, key)
             if key in json_fields:
                 value = json.dumps(value, ensure_ascii=False) if value is not None else None

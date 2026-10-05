@@ -98,6 +98,18 @@ class Settings(BaseSettings):
         return self.data_dir / "uploads"
 
     @property
+    def cover_dir(self) -> Path:
+        return self.data_dir / "covers"
+
+    @property
+    def figure_dir(self) -> Path:
+        return self.data_dir / "figures"
+
+    @property
+    def illustration_dir(self) -> Path:
+        return self.data_dir / "illustrations"
+
+    @property
     def cors_origin_list(self) -> list[str]:
         raw = [o.strip() for o in self.cors_origins.split(",") if o.strip()]
         return raw or ["http://127.0.0.1:5173"]
@@ -151,7 +163,14 @@ class Settings(BaseSettings):
         return "doubao" if has_auth else "mock"
 
     def ensure_dirs(self) -> None:
-        for path in (self.data_dir, self.audio_dir, self.upload_dir):
+        for path in (
+            self.data_dir,
+            self.audio_dir,
+            self.upload_dir,
+            self.cover_dir,
+            self.figure_dir,
+            self.illustration_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
 

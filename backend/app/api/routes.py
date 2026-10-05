@@ -58,9 +58,46 @@ def _queue(request: Request) -> TaskQueue:
 
 
 def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[str, Any]:
+    episode_id = record["id"]
     audio_url = None
     if record.get("audio_path") and Path(record["audio_path"]).exists():
-        audio_url = f"/api/episodes/{record['id']}/audio"
+        audio_url = f"/api/episodes/{episode_id}/audio"
+
+    cover_url = None
+    cover_path = record.get("cover_path")
+    if cover_path and Path(cover_path).exists():
+        cover_url = f"/api/episodes/{episode_id}/cover"
+
+    # 列表接口不返回 figures/illustration：详情页才用得到，列表带了会让响应变大。
+    # 但 cover_url 要保留 —— 列表卡片显示封面缩略图。
+    figures = []
+    for figure in (record.get("figures") or []) if include_large else []:
+        path = figure.get("path")
+        if not path or not Path(path).exists():
+            continue
+        figures.append(
+            {
+                "id": figure["id"],
+                "kind": figure.get("kind") or "figure",
+                "label": figure.get("label") or "",
+                "caption": figure.get("caption") or "",
+                "page": int(figure.get("page") or 1),
+                "url": f"/api/episodes/{episode_id}/figures/{figure['id']}",
+                "width": int(figure.get("width") or 0),
+                "height": int(figure.get("height") or 0),
+            }
+        )
+
+    illustration = None
+    stored = record.get("illustration") if include_large else None
+    if stored and stored.get("png_path") and Path(stored["png_path"]).exists():
+        illustration = {
+            "png_url": f"/api/episodes/{episode_id}/illustration.png",
+            "svg_url": f"/api/episodes/{episode_id}/illustration.svg",
+            "width": int(stored.get("width") or 0),
+            "height": int(stored.get("height") or 0),
+            "source": stored.get("source") or "fallback",
+        }
 
     options = record.get("options") or {}
     data = {
@@ -81,6 +118,11 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
         "paper_meta": record.get("paper_meta"),
         "analysis": record.get("analysis") if include_large else None,
         "script": record.get("script") if include_large else None,
+        "cover_url": cover_url,
+        "cover_width": record.get("cover_width"),
+        "cover_height": record.get("cover_height"),
+        "figures": figures,
+        "illustration": illustration,
         "audio_url": audio_url,
         "audio_duration_sec": record.get("audio_duration_sec"),
         "audio_bytes": record.get("audio_bytes"),
@@ -207,7 +249,7 @@ async def _create_from_json(request: Request, settings: Settings) -> dict[str, A
         # 建任务前先探一次链接，能把「抓不到」的失败提前反馈给用户，
         # 而不是让他等两分钟才看到 failed。
         try:
-            text, _ = fetch_url_text(url)
+            text, _, _ = fetch_url_text(url)
         except IngestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -327,13 +369,27 @@ async def get_episode(request: Request, episode_id: str):
 async def delete_episode(request: Request, episode_id: str) -> Response:
     record = _require_episode(request, episode_id)
 
-    for key in ("audio_path",):
+    for key in ("audio_path", "cover_path"):
         path_value = record.get(key)
         if path_value:
             try:
                 Path(path_value).unlink(missing_ok=True)
             except OSError as exc:
-                logger.warning("删除音频文件失败 %s：%s", path_value, exc)
+                logger.warning("删除文件失败 %s：%s", path_value, exc)
+
+    for figure in record.get("figures") or []:
+        try:
+            Path(figure.get("path") or "").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    for key in ("svg_path", "png_path"):
+        path_value = (record.get("illustration") or {}).get(key)
+        if path_value:
+            try:
+                Path(path_value).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     if record.get("source_type") == "pdf" and record.get("source_ref"):
         try:
@@ -463,6 +519,77 @@ async def get_analysis(request: Request, episode_id: str):
         media_type="text/markdown; charset=utf-8",
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{_quote(filename)}"
+        },
+    )
+
+
+# --------------------------------------------------------------------------
+# 配图资源
+# --------------------------------------------------------------------------
+
+# 配图是长缓存资源：文件名里带 episode id，内容不会变
+_IMAGE_CACHE = "public, max-age=86400"
+
+
+def _png_response(path: Path) -> FileResponse | Response:
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="配图不存在")
+    return FileResponse(
+        path, media_type="image/png", headers={"Cache-Control": _IMAGE_CACHE}
+    )
+
+
+@router.get("/episodes/{episode_id}/cover")
+async def get_cover(request: Request, episode_id: str):
+    """封面：PDF 第一页的渲染图（text 来源则是生成的信息图）。"""
+    record = _require_episode(request, episode_id)
+    cover_path = record.get("cover_path")
+    if not cover_path:
+        raise HTTPException(status_code=404, detail="这一集还没有封面")
+    return _png_response(Path(cover_path))
+
+
+@router.get("/episodes/{episode_id}/figures/{figure_id}")
+async def get_figure(request: Request, episode_id: str, figure_id: str):
+    """论文原图。按图注定位后从 PDF 渲染出来的区域。"""
+    record = _require_episode(request, episode_id)
+    for figure in record.get("figures") or []:
+        if figure.get("id") == figure_id:
+            return _png_response(Path(figure.get("path") or ""))
+    raise HTTPException(status_code=404, detail="配图不存在")
+
+
+@router.get("/episodes/{episode_id}/illustration.png")
+async def get_illustration_png(request: Request, episode_id: str):
+    """生成的信息图（栅格版），用于列表缩略图等场景。"""
+    record = _require_episode(request, episode_id)
+    stored = record.get("illustration") or {}
+    if not stored.get("png_path"):
+        raise HTTPException(status_code=404, detail="这一集还没有生成配图")
+    return _png_response(Path(stored["png_path"]))
+
+
+@router.get("/episodes/{episode_id}/illustration.svg")
+async def get_illustration_svg(request: Request, episode_id: str):
+    """生成的信息图（原始 SVG）。
+
+    直出 SVG 是为了让里面的 SMIL 动画能播放——截图成 PNG 就变死图了。
+    内容是模型生成的，已在入库前做过白名单清洗（无 script / 无外链），
+    这里再补一层 CSP 兜底。前端务必用 <img>/<object> 引用，不要内联进 HTML。
+    """
+    record = _require_episode(request, episode_id)
+    stored = record.get("illustration") or {}
+    svg_path = stored.get("svg_path")
+    if not svg_path or not Path(svg_path).exists():
+        raise HTTPException(status_code=404, detail="这一集还没有生成配图")
+
+    return FileResponse(
+        Path(svg_path),
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": _IMAGE_CACHE,
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
