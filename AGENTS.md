@@ -105,7 +105,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            203 项，改完必须全绿
+backend/tests/            222 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 
