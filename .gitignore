@@ -1,0 +1,34 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.uvcache/
+
+# ---- Node ----
+node_modules/
+dist/
+*.local
+.vite/
+.pnpm-store/
+
+# ---- 运行时数据（含数据库、上传的论文、生成的音频）----
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- 密钥：绝对不要提交 ----
+.env
+.env.*
+!.env.example
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

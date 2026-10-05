@@ -1,0 +1,278 @@
+"""业务逻辑测试：文本清洗、JSON 容错、Prompt 约束、时长探测。"""
+
+from __future__ import annotations
+
+import math
+import struct
+import wave
+
+import pytest
+
+from app.services import prompts
+from app.services.ingest import clean_text, guess_arxiv_id, guess_title, truncate_smart
+from app.services.llm import (
+    build_script_payload,
+    mock_analysis,
+    mock_script,
+    parse_json_response,
+    _normalize_segments,
+)
+from app.services.podcast_tts import probe_duration
+
+
+class TestCleanText:
+    def test_repairs_hyphenated_line_breaks(self):
+        assert "transformer" in clean_text("trans-\nformer")
+
+    def test_drops_references_section(self):
+        text = "正文内容。" * 60 + "\nReferences\n[1] Someone. A paper.\n[2] Another."
+        cleaned = clean_text(text)
+        assert "Someone. A paper." not in cleaned
+
+    def test_drops_chinese_thanks_section(self):
+        text = "正文内容。" * 60 + "\n致谢\n感谢我的导师。\n"
+        cleaned = clean_text(text)
+        assert "感谢我的导师" not in cleaned
+
+    def test_drops_noise_lines(self):
+        text = "正文第一段内容。\n42\nFigure 3\n正文第二段内容。"
+        cleaned = clean_text(text)
+        assert "Figure 3" not in cleaned
+        assert "正文第一段内容" in cleaned
+
+    def test_collapses_extra_whitespace(self):
+        assert "\n\n\n" not in clean_text("a\n\n\n\n\nb")
+
+    def test_empty_input(self):
+        assert clean_text("") == ""
+
+
+class TestTruncateSmart:
+    def test_short_text_untouched(self):
+        assert truncate_smart("abc", 100) == "abc"
+
+    def test_keeps_both_ends(self):
+        """超长时开头和结尾都要保留——论文的结论在结尾，不能丢。"""
+        text = "开头" + "x" * 5000 + "结尾"
+        result = truncate_smart(text, 1000)
+        assert result.startswith("开头")
+        assert result.endswith("结尾")
+        assert "省略中间部分" in result
+        assert len(result) < 1100
+
+
+class TestGuessing:
+    def test_extracts_arxiv_id(self):
+        assert guess_arxiv_id("https://arxiv.org/abs/1706.03762") == "1706.03762"
+        assert guess_arxiv_id("https://arxiv.org/pdf/1706.03762v5") == "1706.03762"
+        assert guess_arxiv_id("https://example.com/paper") is None
+
+    def test_guess_title_skips_abstract(self):
+        text = "Abstract\nWe propose something.\n\nAttention Is All You Need\nAshish Vaswani"
+        assert guess_title(text) == "Attention Is All You Need"
+
+    def test_guess_title_falls_back(self):
+        assert guess_title("Abstract\n短", fallback="兜底") == "兜底"
+
+
+class TestParseJsonResponse:
+    def test_plain_json(self):
+        assert parse_json_response('{"a": 1}') == {"a": 1}
+
+    def test_strips_markdown_fence(self):
+        raw = '```json\n{"a": 1}\n```'
+        assert parse_json_response(raw) == {"a": 1}
+
+    def test_recovers_from_surrounding_prose(self):
+        raw = '好的，以下是结果：\n{"a": 1}\n希望有帮助。'
+        assert parse_json_response(raw) == {"a": 1}
+
+    def test_handles_braces_inside_strings(self):
+        raw = '{"text": "这里有个 } 花括号", "b": 2}'
+        parsed = parse_json_response(raw)
+        assert parsed["b"] == 2
+        assert "花括号" in parsed["text"]
+
+    def test_rejects_non_json(self):
+        with pytest.raises(Exception):
+            parse_json_response("完全没有 JSON")
+
+
+class TestNormalizeSegments:
+    def test_accepts_plain_form(self):
+        result = _normalize_segments(
+            [{"speaker": "A", "text": "一"}, {"speaker": "B", "text": "二"}]
+        )
+        assert [s["speaker"] for s in result] == ["A", "B"]
+
+    def test_strips_speaker_prefix_in_text(self):
+        """模型有时会把「主播A：」也写进 text，要清掉，否则会被念出来。"""
+        result = _normalize_segments([{"speaker": "A", "text": "主播A：大家好"}])
+        assert result[0]["text"] == "大家好"
+
+    def test_tolerates_chinese_speaker_label(self):
+        result = _normalize_segments([{"speaker": "主播B", "text": "问题"}])
+        assert result[0]["speaker"] == "B"
+
+    def test_lowercase_speaker(self):
+        result = _normalize_segments([{"speaker": "b", "text": "x"}])
+        assert result[0]["speaker"] == "B"
+
+    def test_drops_empty_segments(self):
+        result = _normalize_segments([{"speaker": "A", "text": "  "}, {"speaker": "B", "text": "y"}])
+        assert len(result) == 1
+
+    def test_non_list_returns_empty(self):
+        assert _normalize_segments("不是列表") == []
+
+
+class TestBuildScriptPayload:
+    def test_numbers_rounds_sequentially(self):
+        payload = build_script_payload(
+            [{"speaker": "A", "text": "一二三"}, {"speaker": "B", "text": "四五六"}]
+        )
+        assert [s["round"] for s in payload["segments"]] == [0, 1]
+
+    def test_counts_characters_and_estimates_duration(self):
+        payload = build_script_payload([{"speaker": "A", "text": "字" * 250}])
+        assert payload["word_count"] == 250
+        assert payload["est_duration_sec"] == 60
+
+
+class TestPromptConstraints:
+    def test_target_chars_scales_with_duration(self):
+        assert prompts.target_chars(10) == prompts.target_chars(5) * 2
+
+    def test_script_prompt_states_word_budget(self):
+        messages = prompts.build_script_messages(
+            {"background": "bg"}, {"title": "T"}, duration_min=5, level="intro"
+        )
+        user = messages[-1]["content"]
+        target = prompts.target_chars(5)
+        # prompt 里给的是区间而不是单点，两端都要出现，模型才有明确的目标
+        assert str(int(target * 0.85)) in user
+        assert str(int(target * 1.1)) in user
+        assert "硬约束" in user
+        assert "5 分钟" in user
+
+    def test_level_guide_differs_by_level(self):
+        intro = prompts.build_script_messages({}, {}, duration_min=5, level="intro")[-1]["content"]
+        expert = prompts.build_script_messages({}, {}, duration_min=5, level="expert")[-1]["content"]
+        assert "非本专业" in intro
+        assert "科研人员" in expert
+
+    def test_prompt_forbids_ai_cliches(self):
+        """反 AI 腔的负面清单是产品质量的关键，不能被人删掉。"""
+        system = prompts.SCRIPT_SYSTEM
+        for banned in ("综上所述", "值得注意的是", "首先"):
+            assert banned in system
+
+    def test_analysis_prompt_demands_json(self):
+        assert '"innovations"' in prompts.ANALYSIS_SYSTEM
+        assert '"limitations"' in prompts.ANALYSIS_SYSTEM
+
+
+class TestMockGeneration:
+    def test_mock_picks_relevant_paper(self):
+        meta, _ = mock_analysis("this paper is about the transformer and self-attention")
+        assert "Attention" in meta["title"]
+
+        meta, _ = mock_analysis("we study residual learning for image recognition")
+        assert "Residual" in meta["title"]
+
+    def test_mock_analysis_has_all_fields(self):
+        _, analysis = mock_analysis("some paper text")
+        for field in (
+            "background",
+            "innovations",
+            "method",
+            "experiments",
+            "conclusion",
+            "limitations",
+            "value",
+            "future",
+        ):
+            assert analysis[field], f"{field} 不应为空"
+
+    def test_mock_script_respects_short_duration(self):
+        """Mock 脚本也要按目标时长裁剪，否则 3 分钟档会明显超长。"""
+        _, analysis = mock_analysis("x")
+        short = mock_script(analysis, {"title": "T"}, duration_min=3, level="intro")
+        assert short["word_count"] < prompts.target_chars(3) * 1.5
+
+    def test_mock_script_alternates_speakers(self):
+        _, analysis = mock_analysis("x")
+        script = mock_script(analysis, {"title": "T"}, duration_min=5, level="intro")
+        speakers = {s["speaker"] for s in script["segments"]}
+        assert speakers == {"A", "B"}
+
+
+class TestProbeDuration:
+    def test_reads_wav_duration(self, tmp_path):
+        path = tmp_path / "t.wav"
+        rate = 8000
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(b"\x00\x00" * rate * 2)  # 2 秒
+        assert probe_duration(path) == pytest.approx(2.0, abs=0.05)
+
+    def test_estimates_mp3_duration_from_header(self, tmp_path):
+        """构造一个 128kbps / 44.1kHz 的 MP3 帧头，估算时长应接近真实值。"""
+        path = tmp_path / "t.mp3"
+        header = bytes([0xFF, 0xFB, 0x90, 0x00])  # MPEG1 Layer3, 128kbps, 44100Hz
+        body = header + b"\x00" * (16000 * 10)  # 16000 字节 ≈ 1 秒 @128kbps
+        path.write_bytes(body)
+        duration = probe_duration(path)
+        assert duration is not None
+        assert duration == pytest.approx(10.0, abs=0.5)
+
+    def test_returns_none_for_unknown_format(self, tmp_path):
+        path = tmp_path / "t.bin"
+        path.write_bytes(b"not audio at all")
+        assert probe_duration(path) is None
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        assert probe_duration(tmp_path / "nope.wav") is None
+
+
+class TestArxivUrlRewrite:
+    """arXiv 摘要页没有正文，必须改抓 PDF，否则解读只能靠摘要（会写空、会编）。"""
+
+    def test_abs_url_maps_to_pdf(self):
+        from app.services.ingest import arxiv_pdf_url
+
+        assert arxiv_pdf_url("https://arxiv.org/abs/1706.03762") == "https://arxiv.org/pdf/1706.03762"
+
+    def test_versioned_abs_url_strips_version(self):
+        from app.services.ingest import arxiv_pdf_url
+
+        assert arxiv_pdf_url("https://arxiv.org/abs/1706.03762v5") == "https://arxiv.org/pdf/1706.03762"
+
+    def test_pdf_url_maps_to_itself(self):
+        from app.services.ingest import arxiv_pdf_url
+
+        assert arxiv_pdf_url("https://arxiv.org/pdf/1706.03762") == "https://arxiv.org/pdf/1706.03762"
+
+    def test_non_arxiv_url_returns_none(self):
+        from app.services.ingest import arxiv_pdf_url
+
+        assert arxiv_pdf_url("https://example.com/paper.pdf") is None
+
+    def test_drops_inline_references_heading(self):
+        """PDF 抽取时标题常和正文挤在同一行，这种形态也要认出来。"""
+        text = "正文内容。" * 60 + "\nReferences [1] Someone. A paper. [2] Another."
+        cleaned = clean_text(text)
+        assert "Someone. A paper." not in cleaned
+        assert "正文内容" in cleaned
+
+    def test_drops_inline_acknowledgements(self):
+        text = "正文内容。" * 60 + "\nAcknowledgements We are grateful to our reviewers."
+        cleaned = clean_text(text)
+        assert "grateful" not in cleaned
+
+    def test_keeps_early_mention_of_references(self):
+        """正文前半段合法地提到 references 时不能被误砍。"""
+        text = "References to prior work are common.\n" + "正文内容。" * 60
+        assert "References to prior work" in clean_text(text)
