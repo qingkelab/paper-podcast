@@ -32,7 +32,7 @@ import html
 import logging
 import shutil
 import subprocess
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +117,15 @@ class VideoResult:
     scene_count: int
     bytes_written: int
     assignment: str  # "model" | "heuristic"
+    # 每一段用的是哪张图（图片 id，如 f1 / cover / topic2）。
+    # 存下来是为了「重新合成视频」时**复用**，而不是再问一次模型 ——
+    # 再问一次结果会变、还会把主题图重新生成一遍（4 次调用 + 几十秒）。
+    scenes: list[dict[str, Any]] = field(default_factory=list)
+    # 用到的素材 id -> 文件路径，重建时按它找图
+    assets: dict[str, str] = field(default_factory=dict)
+    # 合成时各素材的版本号（mtime-size），用来判断视频是否已经过时：
+    # 用户手动旋转了配图、或重新提取过，视频里还是旧画面
+    asset_versions: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +133,9 @@ class VideoResult:
             "scene_count": self.scene_count,
             "bytes": self.bytes_written,
             "assignment": self.assignment,
+            "scenes": self.scenes,
+            "assets": self.assets,
+            "asset_versions": self.asset_versions,
         }
 
 
@@ -588,6 +600,39 @@ def _rasterize_custom(svg_text: str, output_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
+def asset_version(path: Any) -> str:
+    """素材版本号：修改时间 + 大小。
+
+    与路由层给 URL 加的 `?v=` 是同一套口径。这里存下来是为了能判断
+    「视频生成之后配图有没有被改过」—— 改过就说明视频里还是旧画面，
+    前端应当提示可以重新合成。
+    """
+    try:
+        stat = Path(path).stat()
+    except (OSError, TypeError):
+        return "0"
+    return f"{int(stat.st_mtime)}-{stat.st_size}"
+
+
+def is_video_stale(stored_video: dict[str, Any] | None) -> bool:
+    """视频是否已经跟不上素材了（配图被人工校正 / 重新提取过）。"""
+    if not stored_video:
+        return False
+    recorded = stored_video.get("asset_versions") or {}
+    assets = stored_video.get("assets") or {}
+    if not recorded or not assets:
+        return False
+    for asset_id, version in recorded.items():
+        path = assets.get(asset_id)
+        if not path:
+            continue
+        if not Path(path).exists():
+            return True
+        if asset_version(path) != version:
+            return True
+    return False
+
+
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
@@ -789,8 +834,15 @@ def compose_video(
     llm: Any | None = None,
     analysis: dict[str, Any] | None = None,
     max_topic_images: int = 4,
+    preset_scenes: list[dict[str, Any]] | None = None,
+    preset_assets: dict[str, str] | None = None,
 ) -> VideoResult:
-    """合成视频解读播客。任何一步失败都抛 VideoError，由调用方降级。"""
+    """合成视频解读播客。任何一步失败都抛 VideoError，由调用方降级。
+
+    preset_scenes / preset_assets 用于**重新合成**：上一次已经把「哪一段用哪张图」
+    算好了并存了下来，重做时直接复用，不再问模型 —— 既省钱省时间，
+    也保证重做前后画面选择一致（否则再问一次结果可能就不一样了）。
+    """
     pool = build_asset_pool(
         cover_path=cover_path, figures=figures, illustration_png=illustration_png
     )
@@ -800,11 +852,51 @@ def compose_video(
     default_id = default_asset_id(pool)
     figure_ids = [i for i in pool if i not in ("cover", "illustration")]
 
+    # 复用模式：把上次用到的素材（含现场生成的主题图）补回池子里
+    if preset_scenes:
+        for asset_id, asset_path in (preset_assets or {}).items():
+            if asset_id in pool:
+                continue
+            if asset_path and Path(asset_path).exists():
+                pool[asset_id] = ImageAsset(
+                    id=asset_id,
+                    path=Path(asset_path),
+                    kind="illustration" if asset_id.startswith("topic") else "figure",
+                    caption="",
+                )
+        default_id = default_asset_id(pool)
+        figure_ids = [i for i in pool if i not in ("cover", "illustration")]
+
     # 逐段语义匹配：优先让模型判断「这一段在讲什么、哪张图正好在讲同一件事」
     image_for_segment: list[str] | None = None
     strategy = "heuristic"
 
-    if llm is not None and not getattr(llm, "mock", True):
+    if preset_scenes:
+        # 复用上次的选择，只做有效性校验（图可能被删了/文件丢了）
+        picked: list[str] = []
+        last_valid = default_id
+        for index in range(len(segments)):
+            entry = next(
+                (sc for sc in preset_scenes if sc.get("index") == index), None
+            )
+            candidate = (entry or {}).get("image")
+            if candidate and candidate in pool and pool[candidate].exists:
+                last_valid = candidate
+            picked.append(last_valid)
+        image_for_segment = picked
+        strategy = "reused"
+        missing = sum(
+            1
+            for index in range(len(segments))
+            if not (
+                next((sc for sc in preset_scenes if sc.get("index") == index), {}) or {}
+            ).get("image") in pool
+        )
+        logger.info("重新合成：复用上次的画面分配（%d 段）", len(picked))
+        if missing:
+            logger.info("其中有 %d 段引用的图已失效，回退到中性图", missing)
+
+    elif llm is not None and not getattr(llm, "mock", True):
         assets = [
             {"id": asset.id, "caption": asset.caption}
             for asset in pool.values()
@@ -903,6 +995,14 @@ def compose_video(
         scenes, slide_paths, audio_path, output_path, target_duration=audio_duration
     )
     result.assignment = strategy
+    result.scenes = [
+        {"index": index, "image": image_for_segment[index]}
+        for index in range(min(len(segments), len(image_for_segment)))
+    ]
+    result.assets = {asset_id: str(asset.path) for asset_id, asset in pool.items()}
+    result.asset_versions = {
+        asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
+    }
 
     for slide_path in slide_paths:
         try:

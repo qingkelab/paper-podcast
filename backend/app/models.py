@@ -80,6 +80,9 @@ class VideoInfo(BaseModel):
     duration_sec: float | None = None
     scene_count: int | None = None
     bytes: int | None = None
+    # 配图在视频生成之后被改过（人工校正 / 重新提取）时为 true，
+    # 此时视频里还是旧画面，前端应提示可以重新合成
+    stale: bool = False
 
 
 class Illustration(BaseModel):

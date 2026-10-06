@@ -137,6 +137,77 @@ class Pipeline:
             },
         }
 
+    async def rebuild_video(self, episode_id: str) -> dict[str, Any]:
+        """用现有素材重新合成视频（配图被人工校正后用）。
+
+        关键点：**复用上次的画面分配，不再问模型**。因为
+        1) 再问一次结果可能不一样，用户会觉得「我就转了个图，怎么画面全变了」
+        2) 主题图会被重新生成一遍（4 次模型调用 + 几十秒），纯属浪费
+
+        音频、脚本、解读都不动 —— 只重新渲染幻灯片并编码。
+        """
+        record = self.db.get_episode(episode_id)
+        if not record:
+            raise VideoError("播客不存在")
+
+        stored = record.get("video") or {}
+        timings_raw = record.get("timings") or []
+        script = record.get("script") or {}
+        segments = script.get("segments") or []
+
+        if not timings_raw or not segments:
+            raise VideoError("缺少脚本或时间轴，无法重新合成")
+        if not record.get("audio_path") or not Path(record["audio_path"]).exists():
+            raise VideoError("音频已丢失，无法重新合成")
+        if not ffmpeg_available():
+            raise VideoError("系统未安装 ffmpeg，无法合成视频")
+
+        from .podcast_tts import RoundTiming
+
+        timings = [
+            RoundTiming(
+                index=int(t.get("index", i)),
+                speaker=str(t.get("speaker") or ""),
+                start=float(t.get("start") or 0.0),
+                end=float(t.get("end") or 0.0),
+            )
+            for i, t in enumerate(timings_raw)
+        ]
+
+        result = await asyncio.to_thread(
+            compose_video,
+            segments=segments,
+            timings=timings,
+            audio_path=Path(record["audio_path"]),
+            audio_duration=float(record.get("audio_duration_sec") or 0.0),
+            cover_path=record.get("cover_path"),
+            figures=record.get("figures") or [],
+            illustration_png=(record.get("illustration") or {}).get("png_path"),
+            work_dir=self.settings.video_work_dir / episode_id,
+            output_path=self.settings.video_dir / f"{episode_id}.mp4",
+            title=record.get("title") or "论文解读",
+            llm=None,
+            analysis=record.get("analysis") or {},
+            preset_scenes=stored.get("scenes") or None,
+            preset_assets=stored.get("assets") or None,
+        )
+
+        fields = {
+            "video_path": str(result.video_path),
+            "video": {
+                **result.to_dict(),
+                "url": f"/api/episodes/{episode_id}/video",
+            },
+        }
+        self.db.update_episode(episode_id, **fields)
+        logger.info(
+            "视频已重新合成：%d 帧 / %.1f 秒（复用画面分配：%s）",
+            result.scene_count,
+            result.duration_sec,
+            result.assignment,
+        )
+        return fields
+
     # ---------- 解析阶段 ----------
 
     def resolve_paper(self, episode: dict[str, Any]) -> tuple[str, bytes | None]:

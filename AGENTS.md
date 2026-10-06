@@ -122,6 +122,14 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   成本和耗时都会失控。连续几段通常本来就在讲同一件事，共用一张更贴切。
   超过上限（`MAX_TOPIC_IMAGES`）时**合并而不是丢弃** —— 丢弃会让那些段落
   退回中性图，又变回图文不符。
+- **视频是把配图烘焙进 MP4 的**，所以人工校正配图后，已生成的视频里还是旧画面。
+  为此存了 `video.scenes`（每段用哪张图）、`video.assets`（id→路径）、
+  `video.asset_versions`（合成时的素材版本号）。前两个让 `POST /video/rebuild`
+  能**复用画面分配**而不必再问模型；第三个用来判断 `video.stale`。
+  没有版本记录的旧视频保守判为过时 —— 无法证明它跟当前配图一致。
+- **重新合成视频必须复用画面分配**。再问一次模型结果会变（用户会觉得
+  「我就转了个图，怎么画面全变了」），而且主题图会被重新生成一遍
+  （4 次调用 + 几十秒）。实测复用后重合成只要 11 秒。
 - **`compose_video` 必须用 `asyncio.to_thread` 跑**。它是同步函数，
   加上现场生成配图后会阻塞几十秒，直接 await 会让事件循环卡死，
   前端轮询拿不到响应，看起来像服务挂了。
@@ -135,7 +143,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            256 项，改完必须全绿
+backend/tests/            263 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 

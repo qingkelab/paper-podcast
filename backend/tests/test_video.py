@@ -643,3 +643,158 @@ class TestTopicGeneration:
             stem="s",
         )
         assert result == {}
+
+
+# --------------------------------------------------------------------------
+# 视频过时检测 + 重新合成
+# --------------------------------------------------------------------------
+
+
+class TestStaleness:
+    """视频是用当时的配图烘焙进 MP4 的。用户人工校正配图后，
+    已生成的视频里还是旧画面 —— 必须能判断出来并支持重新合成。
+
+    重新合成时**复用上次的画面分配**，不再问模型：否则「我只转了一张图，
+    怎么画面全变了」，而且主题图会被重新生成一遍（4 次调用 + 几十秒）。
+    """
+
+    def test_same_version_is_fresh(self, tmp_path):
+        from app.services.video import asset_version, is_video_stale
+
+        path = make_png(tmp_path / "a.png")
+        stored = {
+            "assets": {"f1": str(path)},
+            "asset_versions": {"f1": asset_version(path)},
+        }
+        assert is_video_stale(stored) is False
+
+    def test_changed_version_is_stale(self, tmp_path):
+        from app.services.video import is_video_stale
+
+        path = make_png(tmp_path / "a.png")
+        stored = {"assets": {"f1": str(path)}, "asset_versions": {"f1": "old-value"}}
+        assert is_video_stale(stored) is True
+
+    def test_missing_file_is_stale(self, tmp_path):
+        from app.services.video import is_video_stale
+
+        stored = {
+            "assets": {"f1": str(tmp_path / "gone.png")},
+            "asset_versions": {"f1": "1-1"},
+        }
+        assert is_video_stale(stored) is True
+
+    def test_rotation_marks_video_stale(self, tmp_path):
+        """真的转一下配图，版本号必须变（这是「过时」判定的实际触发点）。"""
+        from app.services.figures import rotate_image_file
+        from app.services.video import asset_version, is_video_stale
+
+        path = make_png(tmp_path / "a.png", 300, 200)
+        stored = {
+            "assets": {"f1": str(path)},
+            "asset_versions": {"f1": asset_version(path)},
+        }
+        assert is_video_stale(stored) is False
+
+        rotate_image_file(path, "cw")
+        assert is_video_stale(stored) is True, "旋转配图后视频应当被判定为过时"
+
+    def test_no_metadata_is_not_stale(self):
+        """老数据没有这些字段时不该误报过时。"""
+        from app.services.video import is_video_stale
+
+        assert is_video_stale(None) is False
+        assert is_video_stale({}) is False
+        assert is_video_stale({"duration_sec": 1}) is False
+
+
+class TestPresetReuse:
+    """复用既有画面分配。"""
+
+    def test_uses_preset_scenes_without_touching_llm(self, tmp_path):
+        from app.services.video import compose_video
+
+        class ExplodingLLM:
+            mock = False
+
+            def _chat_json(self, *a, **k):
+                raise AssertionError("复用模式下不该再调用模型")
+
+        pool_dir = tmp_path / "assets"
+        pool_dir.mkdir()
+        cover = make_png(pool_dir / "cover.png")
+        f1 = make_png(pool_dir / "f1.png")
+        illu = make_png(pool_dir / "illu.png")
+
+        audio = tmp_path / "a.wav"
+        import wave
+
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 2)  # 2 秒
+
+        segments = [{"speaker": "A", "text": "第一段"}, {"speaker": "B", "text": "第二段"}]
+        timings = [
+            FakeTiming(0, "A", 0.0, 1.0),
+            FakeTiming(1, "B", 1.0, 2.0),
+        ]
+
+        result = compose_video(
+            segments=segments,
+            timings=timings,
+            audio_path=audio,
+            audio_duration=2.0,
+            cover_path=str(cover),
+            figures=[{"id": "f1", "path": str(f1), "caption": "Figure 1"}],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "work",
+            output_path=tmp_path / "out.mp4",
+            title="t",
+            llm=ExplodingLLM(),
+            preset_scenes=[
+                {"index": 0, "image": "cover"},
+                {"index": 1, "image": "f1"},
+            ],
+            preset_assets={"cover": str(cover), "f1": str(f1), "illustration": str(illu)},
+        )
+        assert result.assignment == "reused"
+        assert [s["image"] for s in result.scenes] == ["cover", "f1"]
+
+    def test_deleted_figure_falls_back(self, tmp_path):
+        """被删掉的图不能再引用，要回退到中性图而不是崩掉。"""
+        from app.services.video import compose_video
+
+        pool_dir = tmp_path / "assets2"
+        pool_dir.mkdir()
+        cover = make_png(pool_dir / "cover.png")
+        illu = make_png(pool_dir / "illu.png")
+
+        audio = tmp_path / "b.wav"
+        import wave
+
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 2)
+
+        result = compose_video(
+            segments=[{"speaker": "A", "text": "x"}],
+            timings=[FakeTiming(0, "A", 0.0, 2.0)],
+            audio_path=audio,
+            audio_duration=2.0,
+            cover_path=str(cover),
+            figures=[],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "work2",
+            output_path=tmp_path / "out2.mp4",
+            title="t",
+            llm=None,
+            preset_scenes=[{"index": 0, "image": "f_deleted"}],
+            preset_assets={"f_deleted": str(tmp_path / "never-existed.png")},
+        )
+        assert result.assignment == "reused"
+        # 引用的图不存在 → 回退到中性图，而不是抛错
+        assert result.scenes[0]["image"] in {"illustration", "cover"}

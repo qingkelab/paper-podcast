@@ -24,6 +24,7 @@ from ..models import (
     OptionsResponse,
 )
 from ..services.figures import PdfAssetsError, rotate_image_file
+from ..services.video import VideoError, is_video_stale
 from ..services.ingest import IngestError, fetch_url_text, guess_title
 from ..services.pipeline import render_analysis_markdown, render_script_text
 from ..voices import DURATIONS, LEVELS, VOICES, normalize_voice
@@ -57,6 +58,23 @@ def _queue(request: Request) -> TaskQueue:
 # --------------------------------------------------------------------------
 # 记录 -> 响应模型
 # --------------------------------------------------------------------------
+
+
+def _video_provenance_unknown(stored_video: dict[str, Any], record: dict[str, Any]) -> bool:
+    """视频没有留下素材版本记录时，保守地认为它可能过时。
+
+    这类是「加版本追踪之前」生成的旧视频。无法证明它跟当前配图一致，
+    与其假装没问题，不如提示可以重新合成 —— 重合成一次之后就准了。
+    没有配图的集不存在这个问题。
+    """
+    if stored_video.get("asset_versions"):
+        return False
+    has_assets = bool(
+        record.get("cover_path")
+        or record.get("figures")
+        or (record.get("illustration") or {}).get("png_path")
+    )
+    return has_assets
 
 
 def _asset_version(path: Any) -> str:
@@ -119,6 +137,9 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
             "duration_sec": stored_video.get("duration_sec"),
             "scene_count": stored_video.get("scene_count"),
             "bytes": stored_video.get("bytes"),
+            "stale": is_video_stale(stored_video) or _video_provenance_unknown(
+                stored_video, record
+            ),
         }
 
     illustration = None
@@ -544,6 +565,30 @@ async def get_audio(request: Request, episode_id: str):
     path = Path(audio_path)
     media_type = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
     return _ranged_response(request, path, media_type)
+
+
+@router.post("/episodes/{episode_id}/video/rebuild", response_model=Episode)
+async def rebuild_video(request: Request, episode_id: str):
+    """用现有素材重新合成视频（配图人工校正后用）。
+
+    音频、脚本、解读都不动，只重新渲染画面并编码。**复用上次的画面分配**，
+    不再调用模型 —— 否则「我只转了一张图，怎么画面全变了」。
+
+    重新合成是重活（渲染 + 编码，约 20 秒），所以同步等待而不是丢进队列：
+    调用方（前端）要明确知道什么时候能看到新视频。
+    """
+    record = _require_episode(request, episode_id)
+    if not record.get("video_path"):
+        raise HTTPException(status_code=409, detail="这一集还没有视频，无法重新合成")
+
+    try:
+        await _queue(request).pipeline.rebuild_video(episode_id)
+    except VideoError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    refreshed = _db(request).get_episode(episode_id)
+    assert refreshed is not None
+    return to_episode(refreshed)
 
 
 @router.get("/episodes/{episode_id}/video")
