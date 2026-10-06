@@ -58,6 +58,18 @@ const MOCK_AUDIO_SEC = 36
  */
 const MOCK_VIDEO_SEC = 6
 
+/**
+ * 重新合成视频的模拟耗时。
+ *
+ * 真实后端复用画面分配、不调模型，实测约 11 秒。Mock 里有两点不同：
+ *   - 画面根本不含真实配图（是 Canvas 画的通用占位场景），没有「按新配图重渲染」这回事，
+ *     所以不必真的重录一遍（重录一次要 6 秒实时时间，纯浪费）；
+ *   - 演示时要看得清「loading 态」，也不宜太快。
+ * 取 3 秒：足够让 loading/禁用态被看见，又不至于让演示卡住。
+ * 契约层面的语义完全一致：延迟 → 换掉视频 URL（内容变，URL 就变）→ video.stale 归位 false。
+ */
+const MOCK_VIDEO_REBUILD_MS = 3000
+
 const DEFAULT_OPTIONS: EpisodeOptions = {
   duration_min: 5,
   level: 'intro',
@@ -134,6 +146,8 @@ const failOnce = new Set<string>()
  */
 let sharedVideo: VideoInfo | null = null
 let sharedVideoUrl: string | null = null
+/** 录制出来的原始 Blob：重新合成时用它造一个新的 Blob URL（内容一样，URL 必须变） */
+let sharedVideoBlob: Blob | null = null
 let videoJob: Promise<VideoInfo | null> | null = null
 
 let loaded = false
@@ -474,11 +488,14 @@ async function renderSharedVideo(): Promise<VideoInfo | null> {
     }
     const url = URL.createObjectURL(result.blob)
     sharedVideoUrl = url
+    sharedVideoBlob = result.blob
     sharedVideo = {
       url,
       duration_sec: result.durationSec,
       scene_count: result.sceneCount,
       bytes: result.blob.size,
+      // 刚录出来就是「跟当前配图一致」的状态
+      stale: false,
     }
     return sharedVideo
   } catch (error) {
@@ -503,7 +520,58 @@ async function ensureVideo(episode: Episode): Promise<void> {
   if (episode.status !== 'completed') return
   const info = await ensureSharedVideo()
   const current = findEpisode(episode.id)
-  if (info && current) current.video = info
+  // 已经有视频就别覆盖：那一份可能是「配图改过、画面已过时」的副本（stale=true），
+  // 覆盖回共享的 fresh 版本会让提示条凭空消失。刷新页面后 video 本来就是 null，
+  // 走不到这条分支，所以「刷新即重置」的行为不变。
+  if (info && current && !current.video) current.video = info
+}
+
+/**
+ * 配图被人工校正过 → 视频里的画面就跟不上了（真实后端同样会置 video.stale=true）。
+ *
+ * 必须**换成新对象**：所有单集共用同一个 sharedVideo，原地改 stale 会把别的单集一起标脏。
+ */
+function markVideoStale(episode: Episode): void {
+  if (!episode.video) return
+  episode.video = { ...episode.video, stale: true }
+}
+
+/** 把 Blob URL 的内容取回来（重新合成时用它造一个新 URL；失败返回 null，降级为沿用旧 URL） */
+async function blobFromUrl(url: string): Promise<Blob | null> {
+  try {
+    if (!url.startsWith('blob:')) return null
+    const response = await fetch(url)
+    if (!response.ok) return null
+    const blob = await response.blob()
+    return blob.size > 0 ? blob : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 用现有素材重新合成视频（契约 §2：POST /video/rebuild）。
+ *
+ * Mock 里没有真实的「把配图烘焙进 MP4」这一步（画面是 Canvas 画的占位场景），
+ * 所以不重录，只复刻契约语义：等待 → 视频 URL 换新（内容/URL 一起变，缓存失效）
+ * → video.stale 归位 false。没有视频时抛 409，与真实后端一致。
+ */
+export async function rebuildVideo(id: string): Promise<Episode> {
+  ensureLoaded()
+  await delay(60)
+  const episode = requireEpisode(id)
+  if (!episode.video) throw new ApiError('这一集还没有视频，无法重新合成', 409)
+
+  await delay(MOCK_VIDEO_REBUILD_MS)
+
+  const blob = sharedVideoBlob ?? (await blobFromUrl(episode.video.url))
+  // 拿不到内容（浏览器不支持 fetch blob: 之类）时沿用旧 URL：stale 仍然归位，
+  // 只是「URL 变了」这条没兑现 —— 演示里看不到差别，但不该因此报错
+  const url = blob ? trackObjectUrl(id, URL.createObjectURL(blob)) : episode.video.url
+  episode.video = { ...episode.video, url, stale: false }
+  episode.updated_at = nowIso()
+  persist()
+  return copyEpisode(episode)
 }
 
 // ---------------------------------------------------------------------------
@@ -938,9 +1006,16 @@ function rotateDataUrl(url: string, direction: FigureRotateDirection): Promise<s
   })
 }
 
-/** 复制一份 Episode，避免调用方拿到的 figures 与内存态共用同一个数组 */
+/**
+ * 复制一份 Episode，避免调用方拿到的 figures / video 与内存态共用同一个对象。
+ * video 尤其重要：它是全站共用的共享对象，直接漏出去会让外部误改到别的单集。
+ */
 function copyEpisode(episode: Episode): Episode {
-  return { ...episode, figures: episode.figures.map((figure) => ({ ...figure })) }
+  return {
+    ...episode,
+    figures: episode.figures.map((figure) => ({ ...figure })),
+    video: episode.video ? { ...episode.video } : null,
+  }
 }
 
 export async function rotateFigure(
@@ -960,6 +1035,8 @@ export async function rotateFigure(
   const width = figure.width
   figure.width = figure.height
   figure.height = width
+  // 配图变了，已生成的视频里还是旧画面（真实后端同样会置 video.stale=true）
+  markVideoStale(episode)
   episode.updated_at = nowIso()
   persist()
   return copyEpisode(episode)
@@ -974,6 +1051,7 @@ export async function deleteFigure(id: string, figureId: string): Promise<Episod
 
   // 配图是每次加载重算的 data URL，没有 Blob URL 需要回收，内存里移除即可
   episode.figures.splice(index, 1)
+  markVideoStale(episode)
   episode.updated_at = nowIso()
   persist()
   return copyEpisode(episode)
@@ -1001,6 +1079,7 @@ export function resetMockStore(): void {
   audioJobs.clear()
   videoJob = null
   sharedVideo = null
+  sharedVideoBlob = null
   if (sharedVideoUrl) {
     URL.revokeObjectURL(sharedVideoUrl)
     sharedVideoUrl = null
@@ -1030,6 +1109,7 @@ const adapter: ApiAdapter = {
   retryEpisode,
   rotateFigure,
   deleteFigure,
+  rebuildVideo,
   scriptTxtUrl,
   analysisMdUrl,
 }

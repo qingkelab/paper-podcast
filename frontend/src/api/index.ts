@@ -65,6 +65,14 @@ export function deleteFigure(id: string, figureId: string) {
   return adapter.deleteFigure(id, figureId)
 }
 
+/**
+ * 用现有素材重新合成视频（契约 §2：POST /video/rebuild）。
+ * 复用上次的画面分配、不调用模型，实测约 11 秒 —— 调用方必须给 loading 反馈，别当它瞬间返回。
+ */
+export function rebuildVideo(id: string) {
+  return adapter.rebuildVideo(id)
+}
+
 /** 脚本 txt 下载地址（mock 下是 Blob URL） */
 export function scriptTxtUrl(id: string) {
   return adapter.scriptTxtUrl(id)

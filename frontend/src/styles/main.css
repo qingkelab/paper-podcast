@@ -1413,6 +1413,40 @@ pre {
   color: #e8cf9c;
 }
 
+/*
+  待办型提示（不是错误）：配图改了、视频里的画面跟不上了。
+  用琥珀色 + 左侧一条实心竖线 —— 比 alert--info 显眼，又不像 alert--error 那样报警，
+  毕竟这是「点一下就能修好」的事，不该让用户以为出了故障。
+*/
+.alert--warning {
+  border-color: rgba(211, 162, 74, 0.45);
+  border-left: 3px solid var(--accent);
+  background: var(--accent-dim);
+  color: #ecdcb6;
+  align-items: flex-start;
+}
+
+/* 标题与正文各占一行（.alert__title 本身是 inline，正文跟着它走会挤成一坨） */
+.alert--warning .alert__title,
+.video-stale__text {
+  display: block;
+}
+
+.alert--warning .alert__title {
+  margin-bottom: 4px;
+}
+
+.alert__error {
+  display: block;
+  margin-top: 6px;
+  color: var(--danger);
+}
+
+/* 提示条里的操作行：按钮 + 在途/失败说明（.row 已提供 flex 与 wrap） */
+.alert__actions {
+  margin-top: 12px;
+}
+
 .alert__icon {
   flex-shrink: 0;
   line-height: 1.7;

@@ -10,6 +10,8 @@ import {
   errorMessage,
   getEpisode,
   isApiError,
+  // 组件里已经有一个 video 计算属性，这个请求函数换个名字，避免撞名
+  rebuildVideo as requestVideoRebuild,
   retryEpisode,
   rotateFigure,
   scriptTxtUrl,
@@ -151,6 +153,71 @@ function resetVideoState(): void {
   videoFailed.value = false
   videoMediaDuration.value = 0
   videoSize.value = null
+}
+
+// --- 配图改了之后「重新合成视频」（契约 §2：POST /video/rebuild） ---------------
+
+/**
+ * 视频里的画面是否已经跟不上当前配图。
+ *
+ * 只有严格为 true 才提示：字段缺失（老后端）一律当「没问题」处理 ——
+ * 拿不准的时候宁可少提示，也不要平白吓唬用户。
+ */
+const videoStale = computed(() => video.value?.stale === true)
+
+/**
+ * 重新合成是 **11 秒级** 的操作（真实后端复用画面分配、不调模型），
+ * 按钮必须进 loading 态并禁用，否则用户会以为没反应而连点。
+ */
+const rebuildingVideo = ref(false)
+/** 上一次重新合成的失败原因：留在提示条里不消失，配合按钮就是重试入口，绝不静默失败 */
+const rebuildError = ref<string | null>(null)
+/** 真实已用秒数（不是进度条：后端不给进度，编一个假的百分比出来更骗人） */
+const rebuildElapsed = ref(0)
+let rebuildTimer: number | undefined
+
+/** 真实后端实测约 11 秒；Mock 只模拟 3 秒，文案必须跟着说实话 */
+const rebuildEtaText = computed(() => (IS_MOCK ? '约 3 秒' : '约 11 秒'))
+
+function startRebuildClock(): void {
+  stopRebuildClock()
+  rebuildElapsed.value = 0
+  rebuildTimer = window.setInterval(() => {
+    rebuildElapsed.value += 1
+  }, 1000)
+}
+
+function stopRebuildClock(): void {
+  if (rebuildTimer !== undefined) {
+    window.clearInterval(rebuildTimer)
+    rebuildTimer = undefined
+  }
+}
+
+async function rebuildVideoNow(): Promise<void> {
+  if (rebuildingVideo.value) return // 连点保护：上一次还没回来就不发新请求
+  const targetId = id.value
+  rebuildingVideo.value = true
+  rebuildError.value = null
+  startRebuildClock()
+  try {
+    const updated = await requestVideoRebuild(targetId)
+    // 中途切到了别的单集：这次的结果已经不属于当前页面，丢掉（否则会把上一集的视频写回来）
+    if (id.value !== targetId) return
+    // 视频内容变了、URL 也变了，播放器必须从头加载：清掉旧的时长/尺寸/失败态
+    resetVideoState()
+    // 就地刷新：返回的 Episode 里 video.stale 已经归位 false，提示条随之消失
+    episode.value = updated
+    showToast('ok', '视频已按当前配图重新合成')
+  } catch (cause) {
+    if (id.value !== targetId) return
+    const message = errorMessage(cause, '重新合成视频失败')
+    rebuildError.value = message
+    showToast('error', message)
+  } finally {
+    stopRebuildClock()
+    rebuildingVideo.value = false
+  }
 }
 
 // --- 音视频互斥：同一页面上两路声音绝不能同时响 -----------------------------
@@ -371,6 +438,10 @@ watch(id, () => {
   figureBusyId.value = null
   figureAction.value = null
   figureError.value = null
+  // 重新合成的状态同样不能跨集残留（在途请求由 rebuildVideoNow 里的 id 比对丢弃）
+  rebuildError.value = null
+  rebuildingVideo.value = false
+  stopRebuildClock()
   if (toastTimer !== undefined) {
     window.clearTimeout(toastTimer)
     toastTimer = undefined
@@ -492,6 +563,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (audioRetryTimer !== undefined) window.clearTimeout(audioRetryTimer)
   if (toastTimer !== undefined) window.clearTimeout(toastTimer)
+  stopRebuildClock()
   // 离开详情页时别把声音带走（音频侧由 AudioPlayer 自己暂停）
   videoEl.value?.pause()
 })
@@ -656,6 +728,44 @@ onBeforeUnmount(() => {
           <h2 class="section__title">视频解读播客</h2>
           <span class="section__hint">
             竖版 {{ videoSizeLabel }} · 画面按脚本逐段切换、与音频轮次对齐 · 字幕按主播分色
+          </span>
+        </div>
+
+        <!--
+          配图改过、视频里的画面跟不上了（video.stale === true）。
+          视频是把配图**烘焙进 MP4** 的：旋转/删除配图后，已生成的视频里还是旧画面，
+          校正就白做了 —— 所以这里必须说清楚，并给出「重新合成视频」入口。
+          只有严格为 true 才出现，字段缺失（老后端）不提示。
+        -->
+        <div v-if="videoStale" class="alert alert--warning video-stale">
+          <span class="alert__icon" aria-hidden="true">!</span>
+          <span class="alert__body">
+            <span class="alert__title">配图已更新，当前视频里还是旧画面</span>
+            <span class="video-stale__text">
+              视频是把配图烘焙进 MP4 的，你旋转或删除过论文原图之后，已经生成的视频里仍然是校正前的画面。
+              重新合成会用现有配图再渲染一遍并复用上次的画面分配（不再调用模型，{{ rebuildEtaText }}）。
+            </span>
+            <span v-if="rebuildError" class="alert__error">{{ rebuildError }}</span>
+            <span class="row alert__actions">
+              <button
+                type="button"
+                class="btn btn--sm btn--primary"
+                :disabled="rebuildingVideo"
+                @click="rebuildVideoNow"
+              >
+                <span v-if="rebuildingVideo" class="spinner" aria-hidden="true" />
+                {{ rebuildingVideo ? '重新合成中…' : rebuildError ? '重新合成视频（重试）' : '重新合成视频' }}
+              </button>
+              <span v-if="rebuildingVideo" class="section__hint" role="status" aria-live="polite">
+                正在重新渲染画面并编码，{{ rebuildEtaText }}（已等 {{ rebuildElapsed }} 秒），请先别关闭页面
+              </span>
+              <span v-else-if="rebuildError" class="section__hint">
+                重新合成没有成功，可以再点一次按钮重试；当前视频保持原样，音频、脚本与配图都不受影响。
+              </span>
+              <span v-else class="section__hint">
+                只重新渲染画面，音频、脚本与解读都不动
+              </span>
+            </span>
           </span>
         </div>
 

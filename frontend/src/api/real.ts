@@ -152,6 +152,18 @@ export function deleteFigure(id: string, figureId: string): Promise<Episode> {
   )
 }
 
+/**
+ * 用现有素材重新合成视频（契约 §2：POST /video/rebuild）。
+ *
+ * 音频、脚本、解读都不动，只重新渲染画面并编码；**复用上次的画面分配**，不再调用模型，
+ * 所以实测约 11 秒（5 分钟片长）—— 这个请求本来就该慢，不要给它加超时。
+ * 返回更新后的完整 Episode：`video.url` 上带着新的 `?v=` 版本号（内容变了，缓存自动失效），
+ * `video.stale` 归位为 false。没有视频时后端返回 409，由 ApiError 带到界面上。
+ */
+export function rebuildVideo(id: string): Promise<Episode> {
+  return request<Episode>(`/episodes/${encodeURIComponent(id)}/video/rebuild`, { method: 'POST' })
+}
+
 export function scriptTxtUrl(id: string): string {
   return `${BASE}/episodes/${encodeURIComponent(id)}/script.txt`
 }
@@ -173,6 +185,7 @@ const adapter: ApiAdapter = {
   retryEpisode,
   rotateFigure,
   deleteFigure,
+  rebuildVideo,
   scriptTxtUrl,
   analysisMdUrl,
 }

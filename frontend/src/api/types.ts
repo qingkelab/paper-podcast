@@ -103,6 +103,17 @@ export interface VideoInfo {
   scene_count: number | null
   /** 文件体积（字节） */
   bytes: number | null
+  /**
+   * 视频里的画面已经跟不上当前配图（契约 §2「video.stale 字段」）。
+   *
+   * 为什么会有这个字段：视频是把配图**烘焙进 MP4** 的，用户旋转/删除过配图以后，
+   * 已经生成的视频里还是旧画面 —— 校正就白做了。后端比较存下来的素材版本号与当前文件，
+   * 不一致（以及「没有版本记录的旧视频」这种无法证明一致的情况）就置 true。
+   *
+   * 可选：老后端可能不返回这个字段。**只有严格为 true 才提示**，缺失/undefined 一律
+   * 当作「没问题」处理 —— 拿不准的时候宁可少提示，也不要平白吓唬用户。
+   */
+  stale?: boolean
 }
 
 export interface Episode {
@@ -237,6 +248,15 @@ export interface ApiAdapter {
   rotateFigure(id: string, figureId: string, direction: FigureRotateDirection): Promise<Episode>
   /** 删掉一张不需要的配图（只从这一集移除，不删源 PDF）。返回更新后的完整 Episode。 */
   deleteFigure(id: string, figureId: string): Promise<Episode>
+  /**
+   * 用现有素材**重新合成视频**（契约 §2：POST /video/rebuild）。
+   *
+   * 为什么需要它：视频是把配图烘焙进 MP4 的，人工校正配图后已生成的视频里还是旧画面。
+   * 它复用上次的画面分配、不调用模型，所以只要十几秒（实测约 11 秒），
+   * 而且画面不会因为「我只转了一张图」就全变。返回更新后的完整 Episode
+   * （`video.url` 带上了新的 `?v=` 版本号，`video.stale` 归位为 false）。
+   */
+  rebuildVideo(id: string): Promise<Episode>
   /** 脚本 txt 的下载地址（mock 下是 Blob URL） */
   scriptTxtUrl(id: string): string
   /** 结构化解读 md 的下载地址（mock 下是 Blob URL） */
