@@ -260,7 +260,8 @@ class TestFullPipeline:
         assert script["est_duration_sec"] > 0
 
         # 音频产物
-        assert episode["audio_url"] == f"/api/episodes/{created['id']}/audio"
+        # URL 上带 ?v= 版本号（内容变化时用于击穿缓存）
+        assert episode["audio_url"].startswith(f"/api/episodes/{created['id']}/audio")
         assert episode["audio_bytes"] > 0
         assert episode["audio_duration_sec"] > 0
 
@@ -542,7 +543,7 @@ class TestEpisodeAssets:
         created = create_text_episode(client)
         episode = wait_for_completion(client, created["id"])
 
-        assert episode["cover_url"] == f"/api/episodes/{created['id']}/cover"
+        assert episode["cover_url"].startswith(f"/api/episodes/{created['id']}/cover")
         assert episode["cover_width"] and episode["cover_height"]
 
         illustration = episode["illustration"]
@@ -657,7 +658,7 @@ class TestVideoPipeline:
         assert episode["status"] == "completed", episode.get("error")
         video = episode.get("video")
         assert video is not None, "应当产出视频"
-        assert video["url"] == f"/api/episodes/{created['id']}/video"
+        assert video["url"].startswith(f"/api/episodes/{created['id']}/video")
         assert video["scene_count"] > 0
         assert video["bytes"] > 1000
 
@@ -768,3 +769,129 @@ class TestFigureWipeGuard:
 
         kept = db.get_episode(created["id"])["figures"]
         assert kept, "提取返回空时不该把已有配图清掉"
+
+
+# --------------------------------------------------------------------------
+# 人工校正配图
+# --------------------------------------------------------------------------
+
+
+class TestManualFigureCorrection:
+    """自动判定不可能总对 —— 「图正不正」最终要靠人眼。
+
+    所以给一个手动兜底：看的人觉得歪了就转一下。这是我自己看不了图
+    这个限制的正解，也顺带让提取错方向的图能被人工修回来。
+    """
+
+    @staticmethod
+    def _episode_with_figures(client, count: int = 2) -> str:
+        import pymupdf
+
+        created = create_text_episode(client)
+        wait_for_completion(client, created["id"])
+        db = client.app.state.db
+        settings = client.app.state.settings
+
+        figures = []
+        for index in range(count):
+            path = settings.figure_dir / f"{created['id']}-f{index + 1}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 300, 200), False)
+            pix.save(str(path))
+            figures.append(
+                {
+                    "id": f"f{index + 1}",
+                    "kind": "figure",
+                    "label": f"Figure {index + 1}",
+                    "caption": "c",
+                    "page": 1,
+                    "path": str(path),
+                    "width": 300,
+                    "height": 200,
+                }
+            )
+        db.update_episode(created["id"], figures=figures)
+        return created["id"]
+
+    def test_rotate_clockwise_swaps_dimensions(self, client):
+        episode_id = self._episode_with_figures(client)
+        response = client.post(
+            f"/api/episodes/{episode_id}/figures/f1/rotate", json={"direction": "cw"}
+        )
+        assert response.status_code == 200, response.text
+        figure = next(f for f in response.json()["figures"] if f["id"] == "f1")
+        assert (figure["width"], figure["height"]) == (200, 300)
+
+    def test_rotate_is_reversible(self, client):
+        """PNG 转 90° 无损，转多了转回来即可 —— 四圈应当回到原点。"""
+        episode_id = self._episode_with_figures(client)
+        for _ in range(4):
+            client.post(
+                f"/api/episodes/{episode_id}/figures/f1/rotate", json={"direction": "cw"}
+            )
+        figure = next(
+            f
+            for f in client.get(f"/api/episodes/{episode_id}").json()["figures"]
+            if f["id"] == "f1"
+        )
+        assert (figure["width"], figure["height"]) == (300, 200)
+
+    def test_counter_clockwise_undoes_clockwise(self, client):
+        episode_id = self._episode_with_figures(client)
+        client.post(f"/api/episodes/{episode_id}/figures/f1/rotate", json={"direction": "cw"})
+        response = client.post(
+            f"/api/episodes/{episode_id}/figures/f1/rotate", json={"direction": "ccw"}
+        )
+        figure = next(f for f in response.json()["figures"] if f["id"] == "f1")
+        assert (figure["width"], figure["height"]) == (300, 200)
+
+    def test_rotation_changes_url_version(self, client):
+        """旋转后 URL 上的版本号必须变化，否则浏览器会继续用缓存的旧图。
+
+        这正是之前那个坑：图重生成过，但 URL 没变、又设了 24 小时缓存，
+        用户一直看到旧图，白排查一轮。
+        """
+        episode_id = self._episode_with_figures(client)
+        before = next(
+            f for f in client.get(f"/api/episodes/{episode_id}").json()["figures"]
+            if f["id"] == "f1"
+        )["url"]
+
+        response = client.post(
+            f"/api/episodes/{episode_id}/figures/f1/rotate", json={"direction": "cw"}
+        )
+        after = next(f for f in response.json()["figures"] if f["id"] == "f1")["url"]
+        assert before != after, "旋转后 URL 版本号没变，缓存不会失效"
+
+    def test_asset_urls_carry_version(self, client):
+        """封面与配图 URL 都应带版本号。"""
+        episode_id = self._episode_with_figures(client)
+        body = client.get(f"/api/episodes/{episode_id}").json()
+        assert "?v=" in body["figures"][0]["url"]
+        if body["cover_url"]:
+            assert "?v=" in body["cover_url"]
+
+    def test_invalid_direction_rejected(self, client):
+        episode_id = self._episode_with_figures(client)
+        response = client.post(
+            f"/api/episodes/{episode_id}/figures/f1/rotate", json={"direction": "upside"}
+        )
+        assert response.status_code == 422
+
+    def test_rotate_unknown_figure_404(self, client):
+        episode_id = self._episode_with_figures(client)
+        response = client.post(
+            f"/api/episodes/{episode_id}/figures/nope/rotate", json={"direction": "cw"}
+        )
+        assert response.status_code == 404
+
+    def test_delete_figure_removes_it(self, client):
+        episode_id = self._episode_with_figures(client, count=2)
+        response = client.delete(f"/api/episodes/{episode_id}/figures/f1")
+        assert response.status_code == 200
+        ids = [f["id"] for f in response.json()["figures"]]
+        assert ids == ["f2"]
+
+    def test_delete_unknown_figure_404(self, client):
+        episode_id = self._episode_with_figures(client)
+        assert client.delete(f"/api/episodes/{episode_id}/figures/nope").status_code == 404

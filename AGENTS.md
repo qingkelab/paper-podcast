@@ -84,6 +84,14 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **不要把「提取到 0 张配图」写回数据库**。我在手工重建某一集时踩过：
   抓错了 URL（abs 页面而非 PDF）→ 提取到 0 张 → 直接写回 → 那一集 5 张配图全没了。
   `pipeline.py` 里有 `if figures:` 保护，任何批量重建脚本也必须带上同样的判断。
+- **静态资源的 URL 必须带版本号**。配图/封面/音频的 URL 是固定的
+  （`/figures/f3` 之类），但内容会因为「重新提取」「改进算法」「人工校正」而变化。
+  只按 URL 做长缓存的话，客户端会一直用旧图 —— 实测踩过：修正了配图方向并重新生成，
+  浏览器里看到的还是没转过的旧图，白排查一轮。
+  现在所有资源 URL 都带 `?v=<mtime>-<size>`，内容一变 URL 就变。
+- **「图正不正」最终只能靠人眼**，所以有 `POST /figures/{fid}/rotate` 人工校正接口。
+  自动判定（文字方向 + 墨迹分布）不可能总对，别指望把它调到 100% 准，
+  要保证「判错了人能一键改回来」。PNG 转 90° 无损，转多了转回来即可。
 - **别用宽泛的 `except: continue` 吞掉异常**。配图渲染那里正是因为这么写，
   把「get_pixmap 不认识 rotate 参数」这个真实错误藏了整整一轮，
   表现为「提取到的配图数量为 0」而没有任何报错。
@@ -127,7 +135,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            247 项，改完必须全绿
+backend/tests/            256 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 

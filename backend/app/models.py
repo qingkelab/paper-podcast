@@ -145,6 +145,12 @@ class TextImportRequest(BaseModel):
     options: EpisodeOptions = Field(default_factory=EpisodeOptions)
 
 
+class FigureRotateRequest(BaseModel):
+    """人工校正配图方向。"""
+
+    direction: Literal["cw", "ccw"]
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str

@@ -16,12 +16,14 @@ from ..config import Settings
 from ..db import Database
 from ..models import (
     Episode,
+    FigureRotateRequest,
     EpisodeList,
     EpisodeListItem,
     EpisodeOptions,
     HealthResponse,
     OptionsResponse,
 )
+from ..services.figures import PdfAssetsError, rotate_image_file
 from ..services.ingest import IngestError, fetch_url_text, guess_title
 from ..services.pipeline import render_analysis_markdown, render_script_text
 from ..voices import DURATIONS, LEVELS, VOICES, normalize_voice
@@ -57,6 +59,22 @@ def _queue(request: Request) -> TaskQueue:
 # --------------------------------------------------------------------------
 
 
+def _asset_version(path: Any) -> str:
+    """给静态资源生成一个内容版本号，用于 URL 上的缓存击穿。
+
+    ⚠️ 为什么必需：配图/封面这些资源的 URL 是固定的（/figures/f3 之类），
+    但内容会因为「重新提取」「改进算法」而变化。如果只按 URL 做长缓存，
+    客户端会一直用旧图 —— 实测踩过：把整体转了的配图修正后重新生成，
+    浏览器里看到的还是没转过的旧图，白排查了一轮。
+    用「修改时间 + 大小」拼一个短版本号，内容一变 URL 就变，缓存自然失效。
+    """
+    try:
+        stat = Path(path).stat()
+    except (OSError, TypeError):
+        return "0"
+    return f"{int(stat.st_mtime)}-{stat.st_size}"
+
+
 def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[str, Any]:
     episode_id = record["id"]
     audio_url = None
@@ -66,7 +84,7 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
     cover_url = None
     cover_path = record.get("cover_path")
     if cover_path and Path(cover_path).exists():
-        cover_url = f"/api/episodes/{episode_id}/cover"
+        cover_url = f"/api/episodes/{episode_id}/cover?v={_asset_version(cover_path)}"
 
     # 列表接口不返回 figures/illustration：详情页才用得到，列表带了会让响应变大。
     # 但 cover_url 要保留 —— 列表卡片显示封面缩略图。
@@ -82,7 +100,10 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
                 "label": figure.get("label") or "",
                 "caption": figure.get("caption") or "",
                 "page": int(figure.get("page") or 1),
-                "url": f"/api/episodes/{episode_id}/figures/{figure['id']}",
+                "url": (
+                    f"/api/episodes/{episode_id}/figures/{figure['id']}"
+                    f"?v={_asset_version(path)}"
+                ),
                 "width": int(figure.get("width") or 0),
                 "height": int(figure.get("height") or 0),
             }
@@ -94,7 +115,7 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
     if video_path and Path(video_path).exists():
         stored_video = record.get("video") or {}
         video = {
-            "url": f"/api/episodes/{episode_id}/video",
+            "url": f"/api/episodes/{episode_id}/video?v={_asset_version(video_path)}",
             "duration_sec": stored_video.get("duration_sec"),
             "scene_count": stored_video.get("scene_count"),
             "bytes": stored_video.get("bytes"),
@@ -104,8 +125,14 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
     stored = record.get("illustration") if include_large else None
     if stored and stored.get("png_path") and Path(stored["png_path"]).exists():
         illustration = {
-            "png_url": f"/api/episodes/{episode_id}/illustration.png",
-            "svg_url": f"/api/episodes/{episode_id}/illustration.svg",
+            "png_url": (
+                f"/api/episodes/{episode_id}/illustration.png"
+                f"?v={_asset_version(stored['png_path'])}"
+            ),
+            "svg_url": (
+                f"/api/episodes/{episode_id}/illustration.svg"
+                f"?v={_asset_version(stored.get('svg_path'))}"
+            ),
             "width": int(stored.get("width") or 0),
             "height": int(stored.get("height") or 0),
             "source": stored.get("source") or "fallback",
@@ -136,7 +163,11 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
         "figures": figures,
         "illustration": illustration,
         "video": video,
-        "audio_url": audio_url,
+        "audio_url": (
+            f"{audio_url}?v={_asset_version(record.get('audio_path'))}"
+            if audio_url
+            else None
+        ),
         "audio_duration_sec": record.get("audio_duration_sec"),
         "audio_bytes": record.get("audio_bytes"),
         "created_at": record["created_at"],
@@ -592,6 +623,67 @@ async def get_figure(request: Request, episode_id: str, figure_id: str):
         if figure.get("id") == figure_id:
             return _png_response(Path(figure.get("path") or ""))
     raise HTTPException(status_code=404, detail="配图不存在")
+
+
+@router.post("/episodes/{episode_id}/figures/{figure_id}/rotate", response_model=Episode)
+async def rotate_figure(
+    request: Request, episode_id: str, figure_id: str, payload: FigureRotateRequest
+):
+    """人工校正配图方向（顺时针 / 逆时针 90°）。
+
+    自动判定不可能总是对：论文配图千奇百怪，而判断「图正不正」最终要靠人眼。
+    所以给一个手动兜底 —— 看的人觉得歪了，转一下就好。
+
+    PNG 旋转 90° 无损，转多了转回来即可。文件 mtime 变化会让 URL 上的
+    版本号跟着变，浏览器不会再用缓存的旧图。
+    """
+    record = _require_episode(request, episode_id)
+    figures = record.get("figures") or []
+
+    target = next((f for f in figures if f.get("id") == figure_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="配图不存在")
+
+    path = Path(target.get("path") or "")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="配图文件已丢失")
+
+    try:
+        width, height = rotate_image_file(path, payload.direction)
+    except PdfAssetsError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    target["width"] = width
+    target["height"] = height
+    _db(request).update_episode(episode_id, figures=figures)
+
+    refreshed = _db(request).get_episode(episode_id)
+    assert refreshed is not None
+    return to_episode(refreshed)
+
+
+@router.delete("/episodes/{episode_id}/figures/{figure_id}", response_model=Episode)
+async def delete_figure(request: Request, episode_id: str, figure_id: str):
+    """删掉一张不需要的配图（比如论文里提取到的装饰性图表）。
+
+    只从这一集里移除，不删源 PDF。
+    """
+    record = _require_episode(request, episode_id)
+    figures = record.get("figures") or []
+
+    remaining = [f for f in figures if f.get("id") != figure_id]
+    if len(remaining) == len(figures):
+        raise HTTPException(status_code=404, detail="配图不存在")
+
+    try:
+        Path(next(f["path"] for f in figures if f["id"] == figure_id)).unlink(missing_ok=True)
+    except (OSError, KeyError, StopIteration):
+        pass
+
+    _db(request).update_episode(episode_id, figures=remaining)
+    refreshed = _db(request).get_episode(episode_id)
+    assert refreshed is not None
+    return to_episode(refreshed)
 
 
 @router.get("/episodes/{episode_id}/illustration.png")

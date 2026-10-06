@@ -190,6 +190,28 @@
 论文原图，`image/png`。按 `Figure N:` 图注定位后从 PDF 渲染出的区域。
 `figure_id` 形如 `f1`（图）/ `t1`（表）。不存在时 `404`。
 
+### `POST /api/episodes/{id}/figures/{figure_id}/rotate`
+
+人工校正配图方向。
+
+```json
+{ "direction": "cw" }     // "cw" 顺时针 90° / "ccw" 逆时针 90°
+```
+
+返回更新后的完整 Episode。PNG 旋转 90° 无损，转多了转回来即可。
+
+**为什么需要它**：论文配图千奇百怪，自动判定「图正不正」不可能总对 ——
+最终还是要靠人眼看一眼。看的人觉得歪了，转一下就好。
+
+另一个必要原因是**缓存**：配图 URL 是固定的，如果重生成过内容而 URL 没变，
+浏览器会一直用旧图（实测踩过这个坑）。所以所有静态资源 URL 上都带
+`?v=<mtime>-<size>` 版本号，内容一变 URL 就变，缓存自动失效。
+
+### `DELETE /api/episodes/{id}/figures/{figure_id}`
+
+删掉一张不需要的配图（例如提取到的装饰性图表）。只从这一集移除，
+不删源 PDF。返回更新后的完整 Episode。
+
 ### `GET /api/episodes/{id}/illustration.png` / `.svg`
 
 模型生成的论文信息图。

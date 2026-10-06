@@ -222,6 +222,34 @@ def _rotate_pixmap(pix, angle: int):
         tmp.close()
 
 
+def rotate_image_file(path: Path, direction: str) -> tuple[int, int]:
+    """把一张图原地旋转 90°（人工校正用）。
+
+    PNG 旋转 90° 是无损的，所以反复点也不会糊；转多了转回来即可。
+    返回新的 (宽, 高)。
+
+    注意文件 mtime 会变，而配图 URL 上带了 `?v=<mtime>-<size>` 的版本号，
+    所以浏览器会自动重新拉取，不会继续用旧图。
+    """
+    import pymupdf
+
+    if direction not in ("cw", "ccw"):
+        raise ValueError(f"不支持的旋转方向：{direction}")
+
+    try:
+        pix = pymupdf.Pixmap(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise PdfAssetsError(f"配图无法读取：{path.name}（{exc}）") from exc
+
+    # set_rotation 是顺时针，所以逆时针就是 270°
+    rotated = _rotate_pixmap(pix, 90 if direction == "cw" else 270)
+    try:
+        path.write_bytes(rotated.tobytes("png"))
+    except OSError as exc:
+        raise PdfAssetsError(f"配图写回失败：{exc}") from exc
+    return rotated.width, rotated.height
+
+
 def _ink_ratio(pix) -> float:
     """采样估算非白像素占比，用来判断区域是不是空白。"""
     samples = pix.samples
