@@ -136,7 +136,14 @@ class TestBuildScriptPayload:
     def test_counts_characters_and_estimates_duration(self):
         payload = build_script_payload([{"speaker": "A", "text": "字" * 250}])
         assert payload["word_count"] == 250
-        assert payload["est_duration_sec"] == 60
+        # 无 padding（默认）时就是纯语速换算：250 / 350 * 60 ≈ 43 秒
+        assert payload["est_duration_sec"] == pytest.approx(43, abs=1)
+
+    def test_padding_is_added_to_estimate(self):
+        payload = build_script_payload(
+            [{"speaker": "A", "text": "字" * 250}], padding_sec=17
+        )
+        assert payload["est_duration_sec"] == pytest.approx(60, abs=1)
 
 
 class TestPromptConstraints:
@@ -149,25 +156,61 @@ class TestPromptConstraints:
                 f"选 {minutes} 分钟，按 {chars} 字预测 {predicted} 秒，偏差过大"
             )
 
-    def test_target_chars_amortizes_music_padding(self):
-        """片头片尾音乐是固定开销，时长越长摊得越薄。
+    def test_target_chars_amortizes_padding(self):
+        """正片之外的固定开销（品牌话术 / 音乐）时长越长摊得越薄。
 
         所以每分钟字数随时长**递增**：target_chars(10)/10 > target_chars(5)/5。
         """
-        assert prompts.target_chars(10) > prompts.target_chars(5)
-        per_minute_5 = prompts.target_chars(5) / 5
-        per_minute_10 = prompts.target_chars(10) / 10
+        padding = 20.0
+        assert prompts.target_chars(10, 0, padding) > prompts.target_chars(5, 0, padding)
+        per_minute_5 = prompts.target_chars(5, 0, padding) / 5
+        per_minute_10 = prompts.target_chars(10, 0, padding) / 10
         assert per_minute_10 > per_minute_5
 
-    def test_duration_model_matches_real_measurements(self):
-        """用两次真实合成结果校准过的模型，不能随意改动常量而不复核。
+    def test_no_padding_means_strictly_linear(self):
+        """没有固定开销时，字数严格随时长线性增长。"""
+        assert prompts.target_chars(10) == prompts.target_chars(5) * 2
 
-        实测：
+    def test_brand_padding_counts_toward_budget(self):
+        """品牌片头片尾是固定开销，要从时长预算里扣掉。"""
+        from app.branding import brand_char_count
+
+        chars = brand_char_count()
+        assert chars > 0
+        pad = prompts.compute_padding_sec(
+            head_music=False, tail_music=False, brand_chars=chars
+        )
+        assert pad > 5, "品牌话术应当占用可观的时长"
+        assert prompts.target_chars(5, 0, pad) < prompts.target_chars(5)
+        assert prompts.estimate_duration_sec(
+            prompts.target_chars(5, 0, pad), 0, pad
+        ) == pytest.approx(300, abs=8)
+
+    def test_music_toggle_changes_padding(self):
+        """默认关掉服务端片头片尾音乐后，padding 里就不该再有它。"""
+        off = prompts.compute_padding_sec(head_music=False, tail_music=False)
+        on = prompts.compute_padding_sec(head_music=True, tail_music=True)
+        assert off == 0
+        assert on == pytest.approx(prompts.MUSIC_PADDING_SEC)
+        single = prompts.compute_padding_sec(head_music=True, tail_music=False)
+        assert 0 < single < on, "只开一个时应当只算对应那半"
+
+    def test_duration_model_matches_real_measurements(self):
+        """用真实合成结果校准过的模型，不能随意改动常量而不复核。
+
+        实测（当时服务端片头片尾音乐是开着的，共约 17 秒）：
         - 238 字  → 58.49 秒
         - 1787 字 → 319.01 秒
+
+        现在默认关掉了服务端音乐，所以这里显式传 17 秒 padding 来复核**语速常量本身**；
+        再验证「无音乐」时正好等于总时长减掉音乐那一段。
         """
-        assert prompts.estimate_duration_sec(238) == pytest.approx(58.5, abs=3)
-        assert prompts.estimate_duration_sec(1787) == pytest.approx(319.0, abs=8)
+        music = prompts.MUSIC_PADDING_SEC
+        assert prompts.estimate_duration_sec(238, 0, music) == pytest.approx(58.5, abs=3)
+        assert prompts.estimate_duration_sec(1787, 0, music) == pytest.approx(319.0, abs=8)
+        assert prompts.estimate_duration_sec(238, 0, 0) == pytest.approx(
+            58.5 - music, abs=3
+        )
 
     def test_slower_speech_rate_needs_fewer_chars(self):
         """调慢语速后，同样时长所需的字数必须变少，否则实际时长会超标。"""

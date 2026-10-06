@@ -408,6 +408,9 @@ class PodcastTTSClient:
             voice_a=voice_a,
             voice_b=voice_b,
             speech_rate=speech_rate,
+            # 服务端自带的片头/片尾音乐默认关掉，换成社区自己的品牌话术
+            head_music=settings.podcast_head_music,
+            tail_music=settings.podcast_tail_music,
         )
 
         headers = auth_headers(settings, connect_id)
@@ -641,8 +644,8 @@ class PodcastTTSClient:
         seg_duration = duration / max(len(segments), 1)
         timings: list[RoundTiming] = []
         # 与服务端一致：片头先垫一段音乐，让脚本段从 MUSIC_HEAD 秒开始
-        music_head = 3.0
-        frames += b"\x00\x00" * int(music_head * sample_rate)
+        # Mock 也要跟真实调用保持一致：不再垫片头音乐
+        music_head = 0.0
         cursor = music_head
 
         for index, segment in enumerate(segments):

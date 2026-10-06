@@ -25,8 +25,9 @@ from typing import Any
 # 用户选 10 分钟只会拿到约 7.4 分钟的音频。
 CHARS_PER_MINUTE = 350
 
-# 服务端默认会加片头/片尾音乐，实测各约 7.0s / 9.95s。
-# 估算总时长时必须算进去，否则短节目的预估会明显偏短。
+# 服务端自带片头/片尾音乐时的实测时长（各约 7.0s / 9.95s）。
+# 现在默认**关掉**了服务端音乐（见 config.podcast_head_music），
+# 换成社区自己的品牌话术，所以这个常量只在开关打开时才用得上。
 MUSIC_PADDING_SEC = 17.0
 
 # 各难度档的表达约束
@@ -57,18 +58,46 @@ def effective_rate(speech_rate: int = 0) -> float:
     return CHARS_PER_MINUTE * (1.0 + speech_rate / 100.0)
 
 
-def target_chars(duration_min: int, speech_rate: int = 0) -> int:
-    """把目标时长换算成脚本字数。
+def brand_padding_sec(brand_chars: int, speech_rate: int = 0) -> float:
+    """品牌片头/片尾话术占用的时长。
 
-    要扣掉片头/片尾音乐占用的时间，否则估出来的字数偏多、实际时长超目标。
+    它们和音乐一样是**固定开销**：每期都有、不随正文字数变化。
+    所以要从时长预算里扣掉，否则正文写满之后整期就超时了。
     """
-    speech_seconds = max(duration_min * 60 - MUSIC_PADDING_SEC, 30.0)
+    if brand_chars <= 0:
+        return 0.0
+    return brand_chars / effective_rate(speech_rate) * 60
+
+
+def compute_padding_sec(
+    *, head_music: bool, tail_music: bool, brand_chars: int = 0, speech_rate: int = 0
+) -> float:
+    """正片之外的所有固定开销（音乐 + 品牌话术）。"""
+    total = 0.0
+    if head_music or tail_music:
+        # 实测片头约 7.0s、片尾约 9.95s，只开一个就按对应那半算
+        total += MUSIC_PADDING_SEC * (
+            1.0
+            if (head_music and tail_music)
+            else (0.41 if head_music else 0.59)
+        )
+    total += brand_padding_sec(brand_chars, speech_rate)
+    return total
+
+
+def target_chars(duration_min: int, speech_rate: int = 0, padding_sec: float = 0.0) -> int:
+    """把目标时长换算成正文字数。
+
+    要扣掉正片之外的固定开销（音乐、品牌话术），
+    否则估出来的字数偏多、实际时长会超目标。
+    """
+    speech_seconds = max(duration_min * 60 - padding_sec, 30.0)
     return int(speech_seconds / 60 * effective_rate(speech_rate))
 
 
-def estimate_duration_sec(chars: int, speech_rate: int = 0) -> int:
-    """脚本字数 → 预期音频时长（含片头片尾音乐）。"""
-    return round(chars / effective_rate(speech_rate) * 60 + MUSIC_PADDING_SEC)
+def estimate_duration_sec(chars: int, speech_rate: int = 0, padding_sec: float = 0.0) -> int:
+    """字数 → 预期音频总时长（含音乐与品牌话术）。"""
+    return round(chars / effective_rate(speech_rate) * 60 + padding_sec)
 
 
 # --------------------------------------------------------------------------
@@ -199,15 +228,16 @@ def build_script_messages(
     duration_min: int,
     level: str,
     speech_rate: int = 0,
+    padding_sec: float = 0.0,
 ) -> list[dict[str, str]]:
-    chars = target_chars(duration_min, speech_rate)
+    chars = target_chars(duration_min, speech_rate, padding_sec)
     rate = effective_rate(speech_rate)
     level_text = LEVEL_GUIDE.get(level, LEVEL_GUIDE["intro"])
     meta = paper_meta or {}
 
     brief = [
         f"【目标时长】{duration_min} 分钟（这套音色的实测语速约 {rate:.0f} 字/分钟，"
-        f"另有约 {int(MUSIC_PADDING_SEC)} 秒片头片尾音乐，所以全文总字数控制在 "
+        f"另有约 {int(padding_sec)} 秒的片头片尾，所以正文总字数控制在 "
         f"{int(chars * 0.92)}-{int(chars * 1.05)} 字之间，这是硬约束，超了会被裁掉）",
         f"【讲解难度】{level_text}",
         f"【论文标题】{meta.get('title') or '未知'}",

@@ -60,16 +60,21 @@ CAPTION_TOP = IMAGE_TOP + IMAGE_BOX_H + 6
 SUBTITLE_TOP = 968
 SUBTITLE_LEFT = 40
 SUBTITLE_WIDTH = VIDEO_W - SUBTITLE_LEFT * 2
-SUBTITLE_TEXT_TOP = 1052        # 第一行文字的基线
-SUBTITLE_MAX_HEIGHT = 148       # 留给文字的总高度
+# 去掉主播标签后，文字可以往上提、可用高度也变大，字幕能放得更大更好读
+SUBTITLE_TEXT_TOP = 1012        # 第一行文字的基线
+SUBTITLE_MAX_HEIGHT = 186       # 留给文字的总高度
 
 FONT_STACK = "PingFang SC, Hiragino Sans GB, Microsoft YaHei, Noto Sans CJK SC, sans-serif"
 
-# 主播配色（与前端一致：A 冷蓝、B 暖橙）
-SPEAKER_COLORS = {"A": "#5b9bd5", "B": "#e8a33d"}
-SPEAKER_NAMES = {"A": "主播A", "B": "主播B"}
-
-BG_COLOR = "#0c1524"
+# 画面是**白底**：论文配图本身多数是白底图表，深色画布会把它们衬得像贴图，
+# 白底更接近读论文的观感，也更适合投屏和打印截图。
+BG_COLOR = "#ffffff"
+TITLE_COLOR = "#1a2233"
+CAPTION_COLOR = "#6b7a8f"
+FRAME_STROKE = "#d8dfe8"
+SUBTITLE_BG = "#f4f7fa"
+SUBTITLE_RULE = "#dde5ee"
+SUBTITLE_TEXT = "#16202f"
 
 # 伪 id：模型用它表示「这一段没有对应原图，需要现场生成一张」
 GENERATE_ID = "generate"
@@ -447,7 +452,7 @@ def _wrap(text: str, max_units: float) -> list[str]:
     return lines
 
 
-def _fit_subtitle(text: str, *, max_lines: int = 5) -> tuple[float, list[str]]:
+def _fit_subtitle(text: str, *, max_lines: int = 6) -> tuple[float, list[str]]:
     """选一个既能放下、又不至于太小的字号。
 
     竖版画幅只有 896px 宽，比横版窄很多，所以必须**同时**检查行数和总高度：
@@ -493,14 +498,12 @@ def _fit_subtitle(text: str, *, max_lines: int = 5) -> tuple[float, list[str]]:
 
 
 def render_slide(scene: Scene, output_path: Path, *, title: str = "") -> Path:
-    """渲染一帧画面：配图 + 图注 + 字幕条（竖版，与论文首页同尺寸）。"""
+    """渲染一帧画面：配图 + 图注 + 字幕（白底竖版，与论文首页同尺寸）。"""
     data_uri, img_w, img_h = _prepare_image(scene.image, IMAGE_BOX_W, IMAGE_BOX_H)
     img_x = (VIDEO_W - img_w) / 2
     img_y = IMAGE_TOP + (IMAGE_BOX_H - img_h) / 2
 
     font_size, lines = _fit_subtitle(scene.text)
-    color = SPEAKER_COLORS.get(scene.speaker, SPEAKER_COLORS["A"])
-    speaker_name = SPEAKER_NAMES.get(scene.speaker, "")
 
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{VIDEO_H}" '
@@ -512,13 +515,13 @@ def render_slide(scene: Scene, output_path: Path, *, title: str = "") -> Path:
     if title:
         parts.append(
             f'<text x="40" y="{TITLE_BASELINE}" font-family="{FONT_STACK}" font-size="22" '
-            f'fill="#7f9dc4">{html.escape(title[:40])}</text>'
+            f'fill="{TITLE_COLOR}">{html.escape(title[:40])}</text>'
         )
 
-    # 配图（淡边框 + 居中）
+    # 配图（浅灰细边框，白底上用来界定图片边界）
     parts.append(
         f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" height="{img_h + 4}" '
-        f'rx="10" fill="none" stroke="#22314d" stroke-width="2"/>'
+        f'rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
     )
     parts.append(
         f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" '
@@ -531,37 +534,27 @@ def render_slide(scene: Scene, output_path: Path, *, title: str = "") -> Path:
         for offset, line in enumerate(caption_lines):
             parts.append(
                 f'<text x="{SUBTITLE_LEFT}" y="{CAPTION_TOP + 22 + offset * 23}" '
-                f'font-family="{FONT_STACK}" font-size="18" fill="#6a86ab">'
+                f'font-family="{FONT_STACK}" font-size="18" fill="{CAPTION_COLOR}">'
                 f"{html.escape(line)}</text>"
             )
 
-    # 字幕面板
+    # 字幕区：极浅底 + 一条分隔线，正文用深色。
+    # 这里**不显示「主播A / 主播B」标签** —— 谁在说话听声音就知道，
+    # 画面上多一行标签只会分散注意力、也占掉字幕的空间。
     parts.append(
         f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" '
-        f'height="{VIDEO_H - SUBTITLE_TOP}" fill="#0a1220"/>'
+        f'height="{VIDEO_H - SUBTITLE_TOP}" fill="{SUBTITLE_BG}"/>'
     )
     parts.append(
-        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" height="2" fill="#1d2c46"/>'
+        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" height="2" fill="{SUBTITLE_RULE}"/>'
     )
-
-    if speaker_name and lines:
-        badge_w = 42 + len(speaker_name) * 19
-        parts.append(
-            f'<rect x="{SUBTITLE_LEFT}" y="{SUBTITLE_TOP + 20}" width="{badge_w}" height="32" '
-            f'rx="16" fill="{color}" opacity="0.18"/>'
-        )
-        parts.append(
-            f'<text x="{SUBTITLE_LEFT + badge_w / 2:.0f}" y="{SUBTITLE_TOP + 43}" '
-            f'text-anchor="middle" font-family="{FONT_STACK}" font-size="19" '
-            f'fill="{color}">{html.escape(speaker_name)}</text>'
-        )
 
     line_height = font_size * 1.36
     for offset, line in enumerate(lines):
         parts.append(
             f'<text x="{SUBTITLE_LEFT}" y="{SUBTITLE_TEXT_TOP + offset * line_height:.0f}" '
             f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
-            f'fill="#e8f0fb">{html.escape(line)}</text>'
+            f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
         )
 
     parts.append("</svg>")

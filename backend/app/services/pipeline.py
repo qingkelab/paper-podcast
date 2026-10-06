@@ -23,9 +23,10 @@ from .ingest import (
     guess_title,
     truncate_smart,
 )
+from .. import branding
 from .figures import extract_figures, render_first_page
 from .illustration import generate_illustration
-from .llm import LLMClient, LLMError
+from .llm import LLMClient, LLMError, build_script_payload
 from .podcast_tts import PodcastTTSClient, PodcastTTSError, probe_duration
 from .video import VideoError, compose_video, ffmpeg_available
 
@@ -259,6 +260,18 @@ class Pipeline:
         voice_b = options.get("voice_b") or self.settings.default_voice_b
         speech_rate = int(self.settings.podcast_speech_rate or 0)
 
+        # 正片之外的固定开销：服务端音乐（默认关）+ 社区品牌话术。
+        # 要从时长预算里扣掉，否则正文写满之后整期就超时了。
+        brand_chars = (
+            branding.brand_char_count() if self.settings.enable_brand_intro_outro else 0
+        )
+        padding_sec = prompts.compute_padding_sec(
+            head_music=self.settings.podcast_head_music,
+            tail_music=self.settings.podcast_tail_music,
+            brand_chars=brand_chars,
+            speech_rate=speech_rate,
+        )
+
         try:
             # ---- 1. 解析 ----
             self._set_stage(episode_id, "parsing")
@@ -336,7 +349,33 @@ class Pipeline:
                 duration_min=duration_min,
                 level=level,
                 speech_rate=speech_rate,
+                padding_sec=padding_sec,
             )
+
+            # 注入社区品牌片头/片尾。
+            # 放在长度修复**之后**：它们是固定开销，不该被模型扩写或精简碰到；
+            # 注入后再重算字数与时长，让 UI 上显示的是整期（含片头片尾）的预估。
+            if self.settings.enable_brand_intro_outro:
+                body = script["segments"]
+                merged = [
+                    {k: v for k, v in seg.items() if k != "round"}
+                    for seg in branding.intro_segments() + body + branding.outro_segments()
+                ]
+                script = build_script_payload(
+                    merged,
+                    speech_rate=speech_rate,
+                    padding_sec=prompts.compute_padding_sec(
+                        head_music=self.settings.podcast_head_music,
+                        tail_music=self.settings.podcast_tail_music,
+                        speech_rate=speech_rate,
+                    ),
+                )
+                logger.info(
+                    "已注入品牌片头片尾：正片 %d 段 → 整期 %d 段",
+                    len(body),
+                    len(script["segments"]),
+                )
+
             self.db.update_episode(episode_id, script=script)
 
             # ---- 4. 合成 ----

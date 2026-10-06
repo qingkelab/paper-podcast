@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     default_voice_a: str = "zh_male_dayixiansheng_v2_saturn_bigtts"
     default_voice_b: str = "zh_female_mizaitongxue_v2_saturn_bigtts"
 
+    # ---- 片头 / 片尾音乐 ----
+    # 默认**关掉**：服务端加的片头片尾音乐是通用罐头音乐，放在社区播客里
+    # 品牌感是乱的，音画时长也不好控。社区自己的片头话术由 branding.py 提供。
+    podcast_head_music: bool = False
+    podcast_tail_music: bool = False
+
+    # 是否在每期开头/结尾加上社区品牌话术（见 app/branding.py）
+    enable_brand_intro_outro: bool = True
+
     # 播客合成语速。范围 -50(0.5x) ~ 100(2.0x)，0 为音色标准语速。
     # 这几个音色在 0 档实测约 350 字/分钟，对中文听众偏快（人声叙述通常 240~280），
     # 觉得赶的话调到 -20 ~ -30 会舒服很多。字数预算会随语速自动联动。

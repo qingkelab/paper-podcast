@@ -375,12 +375,12 @@ class TestSubtitleFitting:
         if not text:
             assert lines == []
             return
-        assert len(lines) <= 5
-        assert len(lines) * size * 1.36 <= 148.1, f"溢出：{len(lines)} 行 × {size}pt"
+        assert len(lines) <= 6
+        assert len(lines) * size * 1.36 <= 186.1, f"溢出：{len(lines)} 行 × {size}pt"
 
     def test_shrinks_font_for_long_text(self):
         short_size, _ = _fit_subtitle("好的。")
-        long_size, _ = _fit_subtitle("字" * 200)
+        long_size, _ = _fit_subtitle("字" * 400)
         assert long_size < short_size
 
     def test_keeps_readable_size_for_typical_segment(self):
@@ -798,3 +798,134 @@ class TestPresetReuse:
         assert result.assignment == "reused"
         # 引用的图不存在 → 回退到中性图，而不是抛错
         assert result.scenes[0]["image"] in {"illustration", "cover"}
+
+
+# --------------------------------------------------------------------------
+# 画面风格：白底、不显示主播标签
+# --------------------------------------------------------------------------
+
+
+class TestSlideTheme:
+    """画面改成白底，并且不再显示「主播A / 主播B」标签。
+
+    白底的理由：论文配图本身多数是白底图表，深色画布会把它们衬得像贴图；
+    白底更接近读论文的观感，也方便投屏和截图。
+
+    去掉标签的理由：谁在说话听声音就知道，画面上多一行标签只会分散注意力，
+    还占掉字幕的空间（去掉后字幕可用高度从 148px 提到 186px）。
+    """
+
+    def _slide_pixmap(self, tmp_path, text="这是一句测试字幕"):
+        image = make_png(tmp_path / "img.png", 900, 500)
+        scene = Scene(
+            start=0, end=3, image=image, kind="figure", speaker="A", text=text
+        )
+        out = render_slide(scene, tmp_path / "slide.png", title="测试标题")
+        import pymupdf
+
+        return pymupdf.Pixmap(str(out))
+
+    def test_background_is_white(self, tmp_path):
+        pix = self._slide_pixmap(tmp_path)
+        n, W = pix.n, pix.width
+        s = pix.samples
+
+        def pixel(x: int, y: int):
+            i = (y * W + x) * n
+            return (s[i], s[i + 1], s[i + 2])
+
+        # 画布四角与右侧留白都应当接近纯白
+        for x, y in ((5, 5), (W - 5, 5), (5, 300), (W - 6, 900)):
+            r, g, b = pixel(x, y)
+            assert r > 240 and g > 240 and b > 240, f"({x},{y}) 不是白底：{(r,g,b)}"
+
+    def test_no_speaker_badge_colors(self, tmp_path):
+        """旧版在字幕区左上角画过蓝/橙两色的主播标签，现在不该再有。
+
+        判据要同时满足两个条件才叫「标签」：
+        - **亮**（标签底色是 18% 不透明度的浅蓝/浅橙，盖在浅底上仍是亮的）
+        - **偏色**（max-min 通道差明显）
+        只看偏色会把深色的字幕文字（#16202f 本身就偏蓝）误判成标签，
+        这一点是实测踩出来的。
+        """
+        pix = self._slide_pixmap(tmp_path)
+        n, W, H = pix.n, pix.width, pix.height
+        s = pix.samples
+        from app.services.video import SUBTITLE_TOP
+
+        tinted = 0
+        total = 0
+        for y in range(SUBTITLE_TOP + 2, min(SUBTITLE_TOP + 50, H), 2):
+            for x in range(30, min(300, W), 2):
+                i = (y * W + x) * n
+                r, g, b = s[i], s[i + 1], s[i + 2]
+                total += 1
+                bright = (r + g + b) / 3 > 150
+                colored = (max(r, g, b) - min(r, g, b)) > 15
+                if bright and colored:
+                    tinted += 1
+        assert tinted / max(total, 1) < 0.02, (
+            f"字幕区左侧仍出现亮色块（{tinted}/{total}），像是主播标签还在"
+        )
+
+    def test_subtitle_area_is_light(self, tmp_path):
+        """字幕区也应当是浅色底 + 深色字（白底主题）。"""
+        pix = self._slide_pixmap(tmp_path)
+        n, W, H = pix.n, pix.width, pix.height
+        s = pix.samples
+        from app.services.video import SUBTITLE_TOP
+
+        # 取字幕面板右侧一块空白区域的亮度
+        y = SUBTITLE_TOP + 10
+        i = (y * W + (W - 20)) * n
+        assert s[i] > 230 and s[i + 1] > 230, "字幕区底色不是浅色"
+
+        # 文字应当明显更深。注意要落在**文字实际占据的行**上：
+        # SUBTITLE_TEXT_TOP 是文字**基线**，字在基线之上，采样基线下方的行会取到空白。
+        from app.services.video import SUBTITLE_TEXT_TOP
+
+        darkest = 255
+        for dy in range(-20, 2, 2):
+            yy = SUBTITLE_TEXT_TOP + dy
+            for x in range(40, W - 40, 2):
+                j = (yy * W + x) * n
+                darkest = min(darkest, s[j])
+        assert darkest < 120, "字幕文字不是深色，白底上会看不清"
+
+
+class TestBrandingInjection:
+    """每期都自动加上青稞社区的片头片尾（见 app/branding.py）。"""
+
+    def test_branding_defined_and_interleaved(self):
+        from app import branding
+
+        assert branding.BRAND_INTRO and branding.BRAND_OUTRO
+        # 两个主播都要有台词，否则听着像独白
+        intro_speakers = {speaker for speaker, _ in branding.BRAND_INTRO}
+        outro_speakers = {speaker for speaker, _ in branding.BRAND_OUTRO}
+        assert intro_speakers == {"A", "B"}
+        assert outro_speakers == {"A", "B"}
+
+    def test_branding_is_short(self):
+        """片头片尾每期都听，太长就烦。控制在 20 秒左右。"""
+        from app import branding
+        from app.services import prompts
+
+        seconds = prompts.brand_padding_sec(branding.brand_char_count())
+        assert seconds < 25, f"品牌话术占了 {seconds:.1f} 秒，太长了"
+
+    def test_branding_avoids_cliches(self):
+        """社区的价值观就是反注水，片头自己先注水就自相矛盾了。"""
+        from app import branding
+
+        text = "".join(t for _, t in branding.BRAND_INTRO + branding.BRAND_OUTRO)
+        for cliche in ("欢迎来到", "让我们一起", "深入探讨", "综上所述", "不容错过"):
+            assert cliche not in text, f"片头片尾出现了套话：{cliche}"
+
+    def test_segments_have_expected_shape(self):
+        from app import branding
+
+        for seg in branding.intro_segments() + branding.outro_segments():
+            assert seg["speaker"] in ("A", "B")
+            assert seg["text"].strip()
+            assert seg.get("brand") in ("intro", "outro")

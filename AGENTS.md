@@ -122,6 +122,15 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   成本和耗时都会失控。连续几段通常本来就在讲同一件事，共用一张更贴切。
   超过上限（`MAX_TOPIC_IMAGES`）时**合并而不是丢弃** —— 丢弃会让那些段落
   退回中性图，又变回图文不符。
+- **服务端的片头/片尾音乐默认关掉**（`PODCAST_HEAD_MUSIC` / `PODCAST_TAIL_MUSIC`），
+  换成社区自己的品牌话术（`app/branding.py`）。实测关掉后片头静音从 7.01s 变 0，
+  片尾从 12.25s 降到约 2s。**剩下的那点尾巴不是音乐**：0.84s 是 AIGC 水印
+  （合规要求，别关），其余经测是说话特征（过零率 0.117，与说话区 0.076~0.102 同档）。
+- **品牌话术要从时长预算里扣掉**。它和音乐一样是固定开销，不扣的话正文写满就超时。
+  `prompts.compute_padding_sec()` 统一算，别在别处再手写一遍。
+- **视频画面是白底**。论文配图多数本身就是白底图表，深色画布会把它们衬得像贴图；
+  白底更接近读论文的观感，也方便投屏和截图。**不要显示「主播A / 主播B」标签** ——
+  谁在说话听声音就知道，画面上多一行标签既分散注意力又占掉字幕空间。
 - **视频是把配图烘焙进 MP4 的**，所以人工校正配图后，已生成的视频里还是旧画面。
   为此存了 `video.scenes`（每段用哪张图）、`video.assets`（id→路径）、
   `video.asset_versions`（合成时的素材版本号）。前两个让 `POST /video/rebuild`
@@ -143,7 +152,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            263 项，改完必须全绿
+backend/tests/            274 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 
