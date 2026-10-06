@@ -16,6 +16,7 @@ import type {
   EpisodeOptionsInput,
   EpisodeStatus,
   EpisodeSummary,
+  FigureRotateDirection,
   HealthPayload,
   ListEpisodesParams,
   ListEpisodesResult,
@@ -888,6 +889,96 @@ export async function retryEpisode(id: string): Promise<Episode> {
   return { ...episode }
 }
 
+// ---------------------------------------------------------------------------
+// 人工校正配图（契约 §2：rotate / delete）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把配图真正旋转 90°（Canvas 重画），返回**内容已变**的新 URL。
+ *
+ * Mock 里的配图是 Canvas 现场画出来的 data URL，所以这里不能只换个 query 参数糊弄，
+ * 而是真的把像素转过去：新的 data URL 内容不同，URL 自然就变了，
+ * 与真实后端「转完 URL 上 `?v=` 版本号变化、浏览器重新取图」的效果一致。
+ * 环境没有 Canvas / 图读不出来时退回原 URL（此时仍会对调 width/height）。
+ */
+function rotateDataUrl(url: string, direction: FigureRotateDirection): Promise<string> {
+  return new Promise((resolve) => {
+    if (!url || typeof document === 'undefined' || typeof Image === 'undefined') {
+      resolve(url)
+      return
+    }
+    const image = new Image()
+    image.onload = () => {
+      try {
+        const width = image.naturalWidth
+        const height = image.naturalHeight
+        if (!width || !height) {
+          resolve(url)
+          return
+        }
+        const canvas = document.createElement('canvas')
+        // 转 90°：画布宽高互换
+        canvas.width = height
+        canvas.height = width
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          resolve(url)
+          return
+        }
+        ctx.translate(canvas.width / 2, canvas.height / 2)
+        ctx.rotate(direction === 'cw' ? Math.PI / 2 : -Math.PI / 2)
+        ctx.drawImage(image, -width / 2, -height / 2)
+        resolve(canvas.toDataURL('image/png'))
+      } catch {
+        resolve(url)
+      }
+    }
+    image.onerror = () => resolve(url)
+    image.src = url
+  })
+}
+
+/** 复制一份 Episode，避免调用方拿到的 figures 与内存态共用同一个数组 */
+function copyEpisode(episode: Episode): Episode {
+  return { ...episode, figures: episode.figures.map((figure) => ({ ...figure })) }
+}
+
+export async function rotateFigure(
+  id: string,
+  figureId: string,
+  direction: FigureRotateDirection,
+): Promise<Episode> {
+  ensureLoaded()
+  await delay(200)
+  const episode = requireEpisode(id)
+  const figure = episode.figures.find((item) => item.id === figureId)
+  if (!figure) throw new ApiError('配图不存在', 404)
+
+  const nextUrl = await rotateDataUrl(figure.url, direction)
+  figure.url = nextUrl
+  // 宽高对调（新图的内容已经转过来了，字段必须跟着变，否则前端按旧比例留位会错）
+  const width = figure.width
+  figure.width = figure.height
+  figure.height = width
+  episode.updated_at = nowIso()
+  persist()
+  return copyEpisode(episode)
+}
+
+export async function deleteFigure(id: string, figureId: string): Promise<Episode> {
+  ensureLoaded()
+  await delay(160)
+  const episode = requireEpisode(id)
+  const index = episode.figures.findIndex((item) => item.id === figureId)
+  if (index < 0) throw new ApiError('配图不存在', 404)
+
+  // 配图是每次加载重算的 data URL，没有 Blob URL 需要回收，内存里移除即可
+  episode.figures.splice(index, 1)
+  episode.updated_at = nowIso()
+  persist()
+  return copyEpisode(episode)
+}
+
 export function scriptTxtUrl(id: string): string {
   ensureLoaded()
   const episode = findEpisode(id)
@@ -937,6 +1028,8 @@ const adapter: ApiAdapter = {
   getEpisode,
   deleteEpisode,
   retryEpisode,
+  rotateFigure,
+  deleteFigure,
   scriptTxtUrl,
   analysisMdUrl,
 }

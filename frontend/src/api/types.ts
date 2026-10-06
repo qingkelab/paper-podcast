@@ -74,6 +74,12 @@ export interface Figure {
   height: number | null
 }
 
+/**
+ * 人工校正配图的旋转方向（契约 §2：POST /figures/{fid}/rotate）。
+ * `cw` = 顺时针 90°，`ccw` = 逆时针 90°；PNG 转 90° 无损，转多了转回来即可。
+ */
+export type FigureRotateDirection = 'cw' | 'ccw'
+
 /** 模型生成的论文信息图（契约 §2：svg_url 保留 SMIL 动画，需用 <object> 引用） */
 export interface Illustration {
   png_url: string
@@ -221,6 +227,16 @@ export interface ApiAdapter {
   getEpisode(id: string): Promise<Episode>
   deleteEpisode(id: string): Promise<void>
   retryEpisode(id: string): Promise<Episode>
+  /**
+   * 人工校正配图方向。
+   *
+   * 为什么需要它：论文配图千奇百怪，自动判定「图正不正」不可能总对，
+   * 最终只能靠人眼看一眼 —— 觉得歪了就转一下。返回更新后的完整 Episode。
+   * 图片文件变了，资源 URL 上的 `?v=<mtime>-<size>` 也跟着变，浏览器不会再用缓存的旧图。
+   */
+  rotateFigure(id: string, figureId: string, direction: FigureRotateDirection): Promise<Episode>
+  /** 删掉一张不需要的配图（只从这一集移除，不删源 PDF）。返回更新后的完整 Episode。 */
+  deleteFigure(id: string, figureId: string): Promise<Episode>
   /** 脚本 txt 的下载地址（mock 下是 Blob URL） */
   scriptTxtUrl(id: string): string
   /** 结构化解读 md 的下载地址（mock 下是 Blob URL） */

@@ -6,6 +6,7 @@ import type {
   CreateUrlInput,
   Episode,
   EpisodeOptionsInput,
+  FigureRotateDirection,
   HealthPayload,
   ListEpisodesParams,
   ListEpisodesResult,
@@ -123,6 +124,34 @@ export function retryEpisode(id: string): Promise<Episode> {
   return request<Episode>(`/episodes/${encodeURIComponent(id)}/retry`, { method: 'POST' })
 }
 
+/**
+ * 人工校正配图方向（契约 §2）：`cw` 顺时针 90° / `ccw` 逆时针 90°。
+ * 返回更新后的完整 Episode —— 注意它的 figures[].url 上带着新的 `?v=` 版本号，
+ * 直接把返回的 Episode 覆盖到页面状态上，浏览器就会重新拉图（不会继续用缓存的旧图）。
+ */
+export function rotateFigure(
+  id: string,
+  figureId: string,
+  direction: FigureRotateDirection,
+): Promise<Episode> {
+  return request<Episode>(
+    `/episodes/${encodeURIComponent(id)}/figures/${encodeURIComponent(figureId)}/rotate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ direction }),
+    },
+  )
+}
+
+/** 删除一张配图（契约 §2）。返回更新后的完整 Episode。 */
+export function deleteFigure(id: string, figureId: string): Promise<Episode> {
+  return request<Episode>(
+    `/episodes/${encodeURIComponent(id)}/figures/${encodeURIComponent(figureId)}`,
+    { method: 'DELETE' },
+  )
+}
+
 export function scriptTxtUrl(id: string): string {
   return `${BASE}/episodes/${encodeURIComponent(id)}/script.txt`
 }
@@ -142,6 +171,8 @@ const adapter: ApiAdapter = {
   getEpisode,
   deleteEpisode,
   retryEpisode,
+  rotateFigure,
+  deleteFigure,
   scriptTxtUrl,
   analysisMdUrl,
 }

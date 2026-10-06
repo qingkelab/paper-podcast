@@ -51,6 +51,20 @@ export function retryEpisode(id: string) {
   return adapter.retryEpisode(id)
 }
 
+/** 人工校正配图方向（契约 §2）：返回更新后的完整 Episode */
+export function rotateFigure(
+  id: string,
+  figureId: string,
+  direction: Parameters<ApiAdapter['rotateFigure']>[2],
+) {
+  return adapter.rotateFigure(id, figureId, direction)
+}
+
+/** 删除一张配图（契约 §2）：返回更新后的完整 Episode */
+export function deleteFigure(id: string, figureId: string) {
+  return adapter.deleteFigure(id, figureId)
+}
+
 /** 脚本 txt 下载地址（mock 下是 Blob URL） */
 export function scriptTxtUrl(id: string) {
   return adapter.scriptTxtUrl(id)
@@ -91,6 +105,7 @@ export type {
   EpisodeStatus,
   EpisodeSummary,
   Figure,
+  FigureRotateDirection,
   HealthPayload,
   Illustration,
   LevelOption,

@@ -32,3 +32,6 @@ data/
 .idea/
 .vscode/
 *.swp
+
+# 子代理的验证截图（临时产物，不属于代码）
+frontend/.verify/

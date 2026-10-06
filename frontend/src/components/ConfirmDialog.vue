@@ -10,6 +10,11 @@ const props = withDefaults(
     cancelText?: string
     danger?: boolean
     busy?: boolean
+    /**
+     * 浮到灯箱之上（灯箱 z-index 70，普通遮罩 60）。
+     * 在灯箱里做二次确认时必须打开，否则对话框会藏在灯箱下面看不见也点不到。
+     */
+    elevated?: boolean
   }>(),
   {
     title: '确认操作',
@@ -18,6 +23,7 @@ const props = withDefaults(
     cancelText: '取消',
     danger: false,
     busy: false,
+    elevated: false,
   },
 )
 
@@ -46,6 +52,7 @@ function onKeydown(event: KeyboardEvent): void {
     <div
       v-if="open"
       class="modal-backdrop"
+      :class="{ 'modal-backdrop--elevated': elevated }"
       role="dialog"
       aria-modal="true"
       :aria-label="title"

@@ -5,14 +5,16 @@ import {
   IS_MOCK,
   analysisMdUrl,
   audioUrl,
+  deleteFigure,
   downloadUrl,
   errorMessage,
   getEpisode,
   isApiError,
   retryEpisode,
+  rotateFigure,
   scriptTxtUrl,
 } from '../api'
-import type { Analysis, Episode, Figure, VideoInfo } from '../api'
+import type { Analysis, Episode, Figure, FigureRotateDirection, VideoInfo } from '../api'
 import AudioPlayer from '../components/AudioPlayer.vue'
 import AnalysisView from '../components/AnalysisView.vue'
 import FigureGallery from '../components/FigureGallery.vue'
@@ -193,6 +195,118 @@ function navigateFigure(delta: number): void {
   lightboxIndex.value = (current + delta + count) % count
 }
 
+// --- 人工校正配图（契约 §2：rotate / delete，都返回更新后的完整 Episode） -------
+
+/**
+ * 正在写操作的配图 id。非 null 时所有相关按钮都禁用——既是 loading 反馈，
+ * 也是防连点：旋转/删除不是幂等操作（转两下就是 180°），重复请求必须挡掉。
+ */
+const figureBusyId = ref<string | null>(null)
+/** 具体在做什么，用来决定哪个按钮显示 spinner（灯箱里的三个按钮共用 pending 状态） */
+const figureAction = ref<FigureRotateDirection | 'delete' | null>(null)
+/** 上一次校正操作的失败原因：留在灯箱里，不要静默失败 */
+const figureError = ref<string | null>(null)
+
+/**
+ * 本次会话内被人工校正过的配图 —— 后端**没有**记录「是否人工改过」这个字段，
+ * 所以只在组件内存里记（episodeId + figureId 作为 key），刷新页面就没了。
+ * 绝不把它伪造成后端字段。
+ */
+const correctedFigureKeys = ref(new Set<string>())
+
+function correctedKey(figureId: string): string {
+  return `${id.value}:${figureId}`
+}
+
+const correctedFigureIds = computed(() =>
+  figures.value
+    .filter((figure) => correctedFigureKeys.value.has(correctedKey(figure.id)))
+    .map((figure) => figure.id),
+)
+
+/** 灯箱当前那张（删除后要按 id 找到对应配图，不要用按钮传进来的索引） */
+const lightboxFigure = computed<Figure | null>(() => {
+  const index = lightboxIndex.value
+  if (index === null) return null
+  return figures.value[index] ?? null
+})
+
+// --- 保存反馈：保存是即时的，没有「保存」按钮，必须给明确的短暂提示 ------------
+
+const toast = ref<{ kind: 'ok' | 'error'; text: string } | null>(null)
+let toastTimer: number | undefined
+
+function showToast(kind: 'ok' | 'error', text: string): void {
+  if (toastTimer !== undefined) window.clearTimeout(toastTimer)
+  toast.value = { kind, text }
+  toastTimer = window.setTimeout(
+    () => {
+      toastTimer = undefined
+      toast.value = null
+    },
+    kind === 'ok' ? 2000 : 4500,
+  )
+}
+
+async function rotateFigureBy(figureId: string, direction: FigureRotateDirection): Promise<void> {
+  if (figureBusyId.value) return // 连点保护：上一次还没回来就不发新请求
+  figureBusyId.value = figureId
+  figureAction.value = direction
+  figureError.value = null
+  try {
+    const updated = await rotateFigure(id.value, figureId, direction)
+    // 就地刷新：返回的 Episode 里 figures[].url 已经带上新的 ?v= 版本号，
+    // 覆盖上去以后灯箱与画廊都会重新拉图（不会继续显示缓存里的旧图）
+    episode.value = updated
+    correctedFigureKeys.value.add(correctedKey(figureId))
+    showToast('ok', direction === 'cw' ? '已保存 · 顺时针 90°' : '已保存 · 逆时针 90°')
+  } catch (cause) {
+    const message = errorMessage(cause, '校正配图失败')
+    figureError.value = message
+    showToast('error', message)
+  } finally {
+    figureBusyId.value = null
+    figureAction.value = null
+  }
+}
+
+async function removeFigure(figure: Figure): Promise<void> {
+  if (figureBusyId.value) return
+  figureBusyId.value = figure.id
+  figureAction.value = 'delete'
+  figureError.value = null
+  try {
+    const updated = await deleteFigure(id.value, figure.id)
+    episode.value = updated
+    correctedFigureKeys.value.delete(correctedKey(figure.id))
+    // 这张图没了，灯箱停在旧索引上会指向别的图（甚至越界），直接关掉
+    lightboxIndex.value = null
+    showToast('ok', `已删除 ${figure.label}`)
+  } catch (cause) {
+    const message = errorMessage(cause, '删除配图失败')
+    figureError.value = message
+    showToast('error', message)
+  } finally {
+    figureBusyId.value = null
+    figureAction.value = null
+  }
+}
+
+function rotateFromLightbox(direction: FigureRotateDirection): void {
+  const figure = lightboxFigure.value
+  if (figure) void rotateFigureBy(figure.id, direction)
+}
+
+function deleteFromLightbox(): void {
+  const figure = lightboxFigure.value
+  if (figure) void removeFigure(figure)
+}
+
+/** 画廊卡片上的快捷「↻」：只转顺时针，需要逆时针或删除就点开大图 */
+function rotateFromGallery(figure: Figure): void {
+  void rotateFigureBy(figure.id, 'cw')
+}
+
 // ---------------------------------------------------------------------------
 // 折叠区（只有「有视频」形态才用得上）
 // ---------------------------------------------------------------------------
@@ -251,6 +365,17 @@ watch(id, () => {
   coverFailed.value = false
   coverLoaded.value = false
   lightboxIndex.value = null
+  // 换了一集：校正相关的状态必须清掉（「已人工校正」是按 episodeId+figureId 记的，
+  // 留着上一集的标记会张冠李戴）
+  correctedFigureKeys.value = new Set<string>()
+  figureBusyId.value = null
+  figureAction.value = null
+  figureError.value = null
+  if (toastTimer !== undefined) {
+    window.clearTimeout(toastTimer)
+    toastTimer = undefined
+  }
+  toast.value = null
   resetVideoState()
   episode.value = null
   void load()
@@ -366,6 +491,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (audioRetryTimer !== undefined) window.clearTimeout(audioRetryTimer)
+  if (toastTimer !== undefined) window.clearTimeout(toastTimer)
   // 离开详情页时别把声音带走（音频侧由 AudioPlayer 自己暂停）
   videoEl.value?.pause()
 })
@@ -727,18 +853,26 @@ onBeforeUnmount(() => {
         -->
         <summary
           class="fold__summary"
-          :aria-label="`论文原图（${figures.length} 张）：从 PDF 图注提取，展开后点击任意一张放大`"
+          :aria-label="`论文原图（${figures.length} 张）：从 PDF 图注提取，展开后点击任意一张放大；方向由程序自动判定，可能出错，可以手动旋转纠正或删除`"
           @keydown.enter.prevent="onSummaryEnter"
         >
           <h2 class="section__title">论文原图（{{ figures.length }} 张）</h2>
-          <span class="section__hint">从 PDF 按「Figure N:」图注提取 · 展开后点击任意一张放大</span>
+          <span class="section__hint">
+            从 PDF 按「Figure N:」图注提取 · 展开后点击放大 · 方向可手动校正
+          </span>
           <span class="fold__state" aria-hidden="true">
             <span class="fold__state-closed">展开</span>
             <span class="fold__state-open">收起</span>
           </span>
         </summary>
         <div class="fold__body">
-          <FigureGallery :figures="figures" @open="openFigure" />
+          <FigureGallery
+            :figures="figures"
+            :busy-id="figureBusyId"
+            :corrected-ids="correctedFigureIds"
+            @open="openFigure"
+            @rotate="rotateFromGallery"
+          />
         </div>
       </details>
 
@@ -749,7 +883,13 @@ onBeforeUnmount(() => {
             从 PDF 按「Figure N:」图注提取 · 共 {{ figures.length }} 张 · 点击放大
           </span>
         </div>
-        <FigureGallery :figures="figures" @open="openFigure" />
+        <FigureGallery
+          :figures="figures"
+          :busy-id="figureBusyId"
+          :corrected-ids="correctedFigureIds"
+          @open="openFigure"
+          @rotate="rotateFromGallery"
+        />
       </section>
 
       <!-- 论文元信息：没有视频时的原位（有视频时上面已经渲染过一次） -->
@@ -839,9 +979,34 @@ onBeforeUnmount(() => {
         :figures="figures"
         :open-index="lightboxIndex"
         :title="episode.title"
+        :pending="figureAction"
+        :error="figureError"
+        :corrected-ids="correctedFigureIds"
         @close="lightboxIndex = null"
         @navigate="navigateFigure"
+        @rotate="rotateFromLightbox"
+        @delete="deleteFromLightbox"
       />
+
+      <!--
+        保存反馈：校正没有「保存」按钮，操作一发生就已经落库了，
+        所以必须给一个短暂但明确的结果提示，失败时更不能静默。
+        Teleport 到 body 并压在灯箱（z-index 70）上面：在灯箱里转图时也要看得见。
+      -->
+      <Teleport to="body">
+        <Transition name="toast">
+          <div
+            v-if="toast"
+            class="toast"
+            :class="toast.kind === 'error' ? 'toast--error' : 'toast--ok'"
+            role="status"
+            aria-live="polite"
+          >
+            <span class="toast__icon" aria-hidden="true">{{ toast.kind === 'error' ? '!' : '✓' }}</span>
+            {{ toast.text }}
+          </div>
+        </Transition>
+      </Teleport>
     </template>
   </div>
 </template>
