@@ -1,0 +1,100 @@
+name: Deploy offline demo to GitHub Pages
+
+# 部署的是**离线演示版**（VITE_USE_MOCK=1）：前端内置了浏览器端 Mock 适配器，
+# 不依赖任何后端、不调用任何 API，打开就能完整点通
+# 「导入 → 进度 → 脚本 → 播放器 → 配图 → 视频区」。
+#
+# 为什么只能部署演示版：这个应用真正的生成链路需要 Python 后端、
+# ffmpeg（系统二进制）、持久磁盘和 API 密钥，静态托管做不到。
+# 详见 README 的「部署」一节。
+
+on:
+  push:
+    branches: [master]
+    # 只有前端变动才重新构建，后端改动不影响演示站
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/pages-demo.yml'
+  workflow_dispatch:
+
+# Pages 部署需要的权限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只跑一个部署；新的推送取消排队中的旧任务
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      # 类型检查先跑，防止把有类型错误的版本发上去
+      - name: Typecheck
+        working-directory: frontend
+        run: pnpm typecheck
+
+      # VITE_USE_MOCK=1 会同时做两件事：
+      # 1. 打包浏览器端 Mock 适配器（不发起任何 /api 请求）
+      # 2. vite.config.ts 里把 base 切成 './'，资源用相对路径 ——
+      #    Pages 的站点在 /<仓库名>/ 子路径下，绝对路径会 404
+      - name: Build offline demo
+        working-directory: frontend
+        env:
+          VITE_USE_MOCK: '1'
+        run: pnpm build
+
+      # hash 路由下深链接本来就是 /#/xxx，正常用不到 404。
+      # 但万一有人手输 /<repo>/library 这种路径，有这个文件至少能拿到应用壳。
+      - name: Add SPA fallback
+        run: cp frontend/dist/index.html frontend/dist/404.html
+
+      - name: Verify the build is really offline
+        run: |
+          set -e
+          # 演示版必须没有真实 API 调用残留
+          if grep -rq '"/api/' frontend/dist/assets/; then
+            echo "::error::离线构建里出现了真实 API 调用，Pages 上会全部失败"
+            exit 1
+          fi
+          # 资源必须是相对路径，否则子路径下白屏
+          if ! grep -q 'src="./assets/' frontend/dist/index.html; then
+            echo "::error::资源路径不是相对的，GitHub Pages 子路径下会 404"
+            exit 1
+          fi
+          echo "✓ 离线构建校验通过"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
