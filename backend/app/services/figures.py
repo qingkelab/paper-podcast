@@ -43,6 +43,18 @@ MIN_FIGURE_HEIGHT_PT = 40
 MIN_INK_RATIO = 0.008  # 低于这个比例基本是空白区域
 MIN_AREA_PX = 120 * 60
 
+# 判定「这张图的文字是歪的」
+#
+# 背景：有些论文的图（典型是注意力可视化那种词对齐网格）把轴标签整个转了 90°，
+# 于是图里所有文字的方向都是 (0,-1)（从下往上排）。实测 Attention 那篇的
+# Figure 3/4/5 就是 108 行文字**全部**竖直，没有一行横排。
+# 这种图按原样截出来，在一堆正常图里看就很别扭。
+#
+# 判定条件刻意保守：文字行数够多、且竖直占比极高，才认为「整张图该转」。
+# 只有少数几行标签是竖的图（大量正常图都有一两个竖排轴标签）不会被误转。
+VERTICAL_TEXT_RATIO = 0.9
+MIN_TEXT_LINES_FOR_ROTATION = 5
+
 
 @dataclass
 class ExtractedFigure:
@@ -142,6 +154,74 @@ def _graphics_bbox(page):
     return union
 
 
+def _text_direction(page, region) -> tuple[float, float] | None:
+    """统计区域内的文字方向，返回占绝对多数的那个方向。
+
+    返回值是 PDF 的文字推进方向向量：
+    - (1, 0)  正常横排
+    - (0, -1) 从下往上排（逆时针转了 90°）
+    - (0, 1)  从上往下排（顺时针转了 90°）
+    - (-1, 0) 从右往左排（转了 180°，真正的倒置）
+
+    没有文字、或方向不集中时返回 None —— 那种情况保持原样，不做猜测。
+    """
+    try:
+        data = page.get_text("dict", clip=region)
+    except Exception:  # noqa: BLE001
+        return None
+
+    counts: dict[tuple[float, float], int] = {}
+    for block in data.get("blocks", []):
+        for line in block.get("lines", []):
+            text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+            if not text:
+                continue
+            direction = tuple(round(float(v), 1) for v in line.get("dir", (1.0, 0.0)))
+            counts[direction] = counts.get(direction, 0) + 1
+
+    total = sum(counts.values())
+    if total < MIN_TEXT_LINES_FOR_ROTATION:
+        return None
+
+    dominant, hits = max(counts.items(), key=lambda item: item[1])
+    if hits / total < VERTICAL_TEXT_RATIO:
+        return None
+    return dominant  # 占绝对多数
+
+
+def _rotation_for(direction: tuple[float, float] | None) -> int:
+    """文字方向 → 让文字横过来所需的顺时针旋转角度。"""
+    if direction is None:
+        return 0
+    dx, dy = direction
+    if abs(dx) >= abs(dy):
+        # 横向：(-1,0) 是从右往左，属于真正倒置，转 180°
+        return 180 if dx < 0 else 0
+    # 纵向：(0,-1) 从下往上 → 顺时针转 90；(0,1) 从上往下 → 逆时针转 90（即 270）
+    return 90 if dy < 0 else 270
+
+
+def _rotate_pixmap(pix, angle: int):
+    """把 Pixmap 顺时针旋转指定角度。
+
+    ⚠️ PyMuPDF 的 `Page.get_pixmap()` **没有 rotate 参数**（试过，直接 TypeError）。
+    这里绕一下：把 pixmap 放回一个临时 PDF 页，设置页面的 /Rotate，再渲染出来。
+    实测 set_rotation(90) 就是顺时针 90°（用不对称色块验证过方向）。
+    """
+    if angle % 360 == 0:
+        return pix
+    import pymupdf
+
+    tmp = pymupdf.open()
+    try:
+        page = tmp.new_page(width=pix.width, height=pix.height)
+        page.insert_image(page.rect, pixmap=pix)
+        page.set_rotation(angle % 360)
+        return page.get_pixmap(dpi=72)
+    finally:
+        tmp.close()
+
+
 def _ink_ratio(pix) -> float:
     """采样估算非白像素占比，用来判断区域是不是空白。"""
     samples = pix.samples
@@ -213,8 +293,12 @@ def extract_figures(
     stem: str,
     *,
     max_figures: int = MAX_FIGURES,
+    auto_upright: bool = True,
 ) -> list[ExtractedFigure]:
     """按图注定位并渲染论文里的图和表。
+
+    auto_upright=True 时，会检测图内文字方向，把整体转了 90°/180° 的图摆正
+    （关闭就完全按 PDF 原样输出）。
 
     失败一律降级为「没有配图」，不抛异常——配图是锦上添花，
     不该因为它没提取到就让整期播客生成失败。
@@ -319,11 +403,31 @@ def extract_figures(
             if len(figures) >= max_figures:
                 break
             page = entry["page_obj"]
+            padded = pymupdf.Rect(region.x0 - 4, region.y0 - 4, region.x1 + 4, region.y1 + 4)
+            padded &= page.rect
+
+            # 图里文字全是竖排时，把图转正再输出（见 _text_direction 的说明）
+            rotation = 0
+            if auto_upright:
+                direction = _text_direction(page, region)
+                rotation = _rotation_for(direction)
+                if rotation:
+                    entry["rotation"] = rotation
+                    logger.info(
+                        "配图 %s 的文字方向为 %s，已顺时针旋转 %d° 摆正",
+                        entry["label"],
+                        direction,
+                        rotation,
+                    )
+
             try:
-                padded = pymupdf.Rect(region.x0 - 4, region.y0 - 4, region.x1 + 4, region.y1 + 4)
-                padded &= page.rect
                 pix = page.get_pixmap(clip=padded, dpi=FIGURE_DPI)
-            except Exception:  # noqa: BLE001
+                if rotation:
+                    pix = _rotate_pixmap(pix, rotation)
+            except Exception as exc:  # noqa: BLE001
+                # 不要把异常静默吞掉：之前正是因为 except 后直接 continue，
+                # 把「get_pixmap 不认识 rotate 参数」这个真实错误藏了整整一轮。
+                logger.warning("配图 %s 渲染失败：%s", entry.get("label"), exc)
                 continue
 
             if pix.width * pix.height < MIN_AREA_PX:

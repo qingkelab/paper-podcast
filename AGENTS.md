@@ -74,6 +74,19 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   所有真正的图（实测 Attention 那篇只有 3 张位图，但单页有 600~1000 个矢量绘图）。
   必须「按图注定位 + 图形包围盒渲染区域」。
 - **图注在图下方，表注在表上方**。方向搞反会截到一片空白。
+- **有些论文的图里文字全是竖排的**（典型是注意力可视化的词对齐网格）。
+  实测 Attention 那篇 Figure 3/4/5 是 108 行文字全部方向 (0,-1)、没有一行横排。
+  代码会把这类图转正（`_text_direction` + `_rotate_pixmap`），判定很保守
+  （行数够多且竖直占比 ≥90%），ResNet 那类有横排文字的图一张都不会被误转。
+- **PyMuPDF 的 `Page.get_pixmap()` 没有 `rotate` 参数**（传了直接 TypeError）。
+  要旋转只能把 pixmap 放回临时 PDF 页、设页面 /Rotate 再渲染。
+  实测 `set_rotation(90)` 是顺时针（用不对称色块验证过方向）。
+- **不要把「提取到 0 张配图」写回数据库**。我在手工重建某一集时踩过：
+  抓错了 URL（abs 页面而非 PDF）→ 提取到 0 张 → 直接写回 → 那一集 5 张配图全没了。
+  `pipeline.py` 里有 `if figures:` 保护，任何批量重建脚本也必须带上同样的判断。
+- **别用宽泛的 `except: continue` 吞掉异常**。配图渲染那里正是因为这么写，
+  把「get_pixmap 不认识 rotate 参数」这个真实错误藏了整整一轮，
+  表现为「提取到的配图数量为 0」而没有任何报错。
 - **`page.get_text(clip=...)` 返回的是相交的整个文本块，不是严格裁剪的文字**。
   取图注要用 `get_text("words")` 逐词过滤，否则会把图里的坐标轴标签带进来。
 - **`Figure 4` 和 `Fig. 4` 指同一张图**，正文里的交叉引用又常落在行首，
@@ -114,7 +127,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            239 项，改完必须全绿
+backend/tests/            247 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 

@@ -206,7 +206,10 @@ class Pipeline:
                         "cover_height": cover_h,
                     }
                 figures = extract_figures(
-                    pdf_bytes, self.settings.figure_dir, episode_id
+                    pdf_bytes,
+                    self.settings.figure_dir,
+                    episode_id,
+                    auto_upright=self.settings.auto_upright_figures,
                 )
                 if figures:
                     self.db.update_episode(

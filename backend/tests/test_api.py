@@ -726,3 +726,45 @@ class TestVideoPipeline:
         assert episode["status"] == "completed"
         assert episode["video"] is None
         assert client.get(f"/api/episodes/{created['id']}/video").status_code == 404
+
+
+class TestFigureWipeGuard:
+    """提取不到配图时，绝不能把已有的配图清空。
+
+    这不是假想问题：我在手工重新提取某一集的配图时踩过 —— 抓错了 URL
+    （abs 页面而不是 PDF），提取到 0 张，然后直接把 0 张写回了数据库，
+    那一集的 5 张配图当场没了。生产线路径有 `if figures:` 保护，这里把它锁住。
+    """
+
+    def test_pipeline_keeps_figures_when_extraction_returns_none(self, client, monkeypatch):
+        import app.services.pipeline as pipeline_module
+
+        created = create_text_episode(client)
+        wait_for_completion(client, created["id"])
+
+        # 先塞入几张「已有配图」
+        db = client.app.state.db
+        existing = [
+            {
+                "id": "f1",
+                "kind": "figure",
+                "label": "Figure 1",
+                "caption": "c",
+                "page": 1,
+                "path": __file__,
+                "width": 10,
+                "height": 10,
+            }
+        ]
+        db.update_episode(created["id"], figures=existing)
+
+        # 让提取器返回空
+        monkeypatch.setattr(pipeline_module, "extract_figures", lambda *a, **k: [])
+
+        # 再跑一次流水线（重试路径）
+        db.update_episode(created["id"], status="failed", error="x")
+        client.post(f"/api/episodes/{created['id']}/retry")
+        wait_for_completion(client, created["id"])
+
+        kept = db.get_episode(created["id"])["figures"]
+        assert kept, "提取返回空时不该把已有配图清掉"

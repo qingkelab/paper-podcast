@@ -398,3 +398,164 @@ class TestFigureDeduplication:
         assert len(figures) == 1
         assert "Figure 7" in figures[0].caption
         assert "iter." not in figures[0].caption
+
+
+# --------------------------------------------------------------------------
+# 图内文字方向：把整体转了的图摆正
+# --------------------------------------------------------------------------
+
+
+class TestTextDirection:
+    """有些论文的图把轴标签整个转了 90°，图里所有文字方向都是 (0,-1)。
+
+    实测 Attention 那篇的 Figure 3/4/5 就是 108 行文字全部竖直、没有一行横排，
+    按原样截出来在一堆正常图里看着就是歪的。
+    """
+
+    def test_rotation_mapping(self):
+        from app.services.figures import _rotation_for
+
+        assert _rotation_for((1.0, 0.0)) == 0      # 正常横排
+        assert _rotation_for((0.0, -1.0)) == 90    # 从下往上 → 顺时针 90°
+        assert _rotation_for((0.0, 1.0)) == 270    # 从上往下
+        assert _rotation_for((-1.0, 0.0)) == 180   # 从右往左 = 真正倒置
+        assert _rotation_for(None) == 0
+
+    def test_rotate_pixmap_swaps_dimensions(self):
+        """顺时针 90° 必须交换宽高（用 set_rotation 绕行，因为 get_pixmap 没有 rotate 参数）。"""
+        import pymupdf
+
+        from app.services.figures import _rotate_pixmap
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 200, 100), False)
+        assert (_rotate_pixmap(pix, 90).width, _rotate_pixmap(pix, 90).height) == (100, 200)
+        assert (_rotate_pixmap(pix, 180).width, _rotate_pixmap(pix, 180).height) == (200, 100)
+        assert (_rotate_pixmap(pix, 0).width, _rotate_pixmap(pix, 0).height) == (200, 100)
+
+    def test_rotate_pixmap_is_clockwise(self):
+        """方向必须验证过，否则会把图转反。
+
+        做法：左上角放红块、右下角放蓝块，顺时针 90° 后红块应到右上、蓝块到左下。
+        """
+        import pymupdf
+
+        from app.services.figures import _rotate_pixmap
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=200, height=200)
+        page.draw_rect(pymupdf.Rect(10, 10, 50, 50), fill=(1, 0, 0))
+        page.draw_rect(pymupdf.Rect(150, 150, 190, 190), fill=(0, 0, 1))
+        base = page.get_pixmap(clip=page.rect, dpi=72)
+        doc.close()
+
+        rotated = _rotate_pixmap(base, 90)
+        n, W, H = rotated.n, rotated.width, rotated.height
+        s = rotated.samples
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            i = (y * W + x) * n
+            return (s[i], s[i + 1], s[i + 2])
+
+        top_right = pixel(int(W * 0.85), int(H * 0.15))
+        bottom_left = pixel(int(W * 0.15), int(H * 0.85))
+        assert top_right[0] > 140 and top_right[2] < 90, f"红块没到右上角：{top_right}"
+        assert bottom_left[2] > 140 and bottom_left[0] < 90, f"蓝块没到左下角：{bottom_left}"
+
+    @staticmethod
+    def _rotated_text_pdf():
+        """造一页：图形区域内的文字全部竖排（模拟注意力可视化那种图）。"""
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        # 一个明显的「图」边框
+        page.draw_rect(pymupdf.Rect(80, 120, 515, 380), width=1.5)
+        # 竖排文字：rotate=90 让文字方向变成非横排
+        for index in range(8):
+            page.insert_text((110 + index * 22, 360), f"WORD{index}", fontsize=11, rotate=90)
+        page.insert_text((80, 410), "Figure 1: A figure with rotated labels.", fontsize=10)
+        data = doc.tobytes()
+        doc.close()
+        return data
+
+    @staticmethod
+    def _horizontal_text_pdf():
+        """造一页：图内文字正常横排。"""
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.draw_rect(pymupdf.Rect(80, 120, 515, 380), width=1.5)
+        for index in range(8):
+            page.insert_text((110, 160 + index * 20), f"LINE {index} normal text", fontsize=11)
+        page.insert_text((80, 410), "Figure 1: A normal figure.", fontsize=10)
+        data = doc.tobytes()
+        doc.close()
+        return data
+
+    def test_rotates_figure_with_vertical_text(self, tmp_path):
+        """文字竖排的图，宽高应当相对原样输出发生交换。
+
+        注意不能断言「转完是横向」—— 区域本身可能是横的也可能是竖的，
+        转正只是把宽高对调，方向取决于原区域的形状。
+        """
+        import pymupdf
+
+        raw = pymupdf.Pixmap(
+            extract_figures(
+                self._rotated_text_pdf(), tmp_path, "raw", auto_upright=False
+            )[0].path
+        )
+        fixed = pymupdf.Pixmap(
+            extract_figures(self._rotated_text_pdf(), tmp_path, "fixed")[0].path
+        )
+        assert (fixed.width, fixed.height) == (raw.height, raw.width), (
+            f"竖排文字的图应当被旋转（原样 {raw.width}x{raw.height}，"
+            f"实际 {fixed.width}x{fixed.height}）"
+        )
+
+    def test_leaves_horizontal_text_figure_alone(self, tmp_path):
+        import pymupdf
+
+        raw = pymupdf.Pixmap(
+            extract_figures(
+                self._horizontal_text_pdf(), tmp_path, "hraw", auto_upright=False
+            )[0].path
+        )
+        fixed = pymupdf.Pixmap(
+            extract_figures(self._horizontal_text_pdf(), tmp_path, "hfix")[0].path
+        )
+        assert (fixed.width, fixed.height) == (raw.width, raw.height), (
+            "横排文字的图不该被旋转"
+        )
+
+    def test_auto_upright_can_be_disabled(self, tmp_path):
+        """关掉开关就完全按 PDF 原样输出，不做任何旋转。"""
+        import pymupdf
+
+        figures = extract_figures(
+            self._rotated_text_pdf(), tmp_path, "off", auto_upright=False
+        )
+        assert len(figures) == 1
+        off = pymupdf.Pixmap(figures[0].path)
+        on = pymupdf.Pixmap(
+            extract_figures(self._rotated_text_pdf(), tmp_path, "on")[0].path
+        )
+        assert (off.width, off.height) == (on.height, on.width)
+
+    def test_region_without_text_is_left_alone(self, tmp_path):
+        """图里没有文字就无从判断方向，保持原样，不做猜测。"""
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.draw_rect(pymupdf.Rect(80, 120, 515, 380), width=1.5)
+        page.draw_rect(pymupdf.Rect(120, 160, 400, 340), fill=(0.8, 0.85, 0.9))
+        page.insert_text((80, 410), "Figure 1: Pure graphics, no labels.", fontsize=10)
+        data = doc.tobytes()
+        doc.close()
+
+        figures = extract_figures(data, tmp_path, "notext")
+        assert len(figures) == 1
+        pix = pymupdf.Pixmap(figures[0].path)
+        assert pix.width > pix.height, "无文字的图不该被旋转"
