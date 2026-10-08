@@ -1,12 +1,15 @@
 import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
-import type { LevelValue } from '../api'
+import type { EpisodeLanguage, LevelValue } from '../api'
+import { DEFAULT_LANGUAGES, sanitizeLanguages } from '../utils/language'
 
 export interface EpisodePreferences {
   duration_min: number
   level: LevelValue
   voice_a: string
   voice_b: string
+  /** 要生成的语言版本（契约 §1：新建时用 options.languages 指定，至少一个） */
+  languages: EpisodeLanguage[]
 }
 
 const STORAGE_KEY = 'paper-podcast:preferences:v1'
@@ -17,6 +20,7 @@ export const DEFAULT_PREFERENCES: EpisodePreferences = {
   level: 'intro',
   voice_a: 'zh_male_dayixiansheng_v2_saturn_bigtts',
   voice_b: 'zh_female_mizaitongxue_v2_saturn_bigtts',
+  languages: [...DEFAULT_LANGUAGES],
 }
 
 const DURATIONS = [3, 5, 10]
@@ -32,21 +36,24 @@ function sanitize(raw: unknown): EpisodePreferences {
     typeof value.level === 'string' && (LEVELS as string[]).includes(value.level)
       ? (value.level as LevelValue)
       : DEFAULT_PREFERENCES.level
+  // 语言版本至少要留一个，否则首页表单会变成「一个都不选」的非法状态
+  const languages = sanitizeLanguages(value.languages)
   return {
     duration_min: duration,
     level,
     voice_a: typeof value.voice_a === 'string' && value.voice_a ? value.voice_a : DEFAULT_PREFERENCES.voice_a,
     voice_b: typeof value.voice_b === 'string' && value.voice_b ? value.voice_b : DEFAULT_PREFERENCES.voice_b,
+    languages: languages.length ? languages : [...DEFAULT_PREFERENCES.languages],
   }
 }
 
 function load(): EpisodePreferences {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY)
-    if (!raw) return { ...DEFAULT_PREFERENCES }
+    if (!raw) return { ...DEFAULT_PREFERENCES, languages: [...DEFAULT_PREFERENCES.languages] }
     return sanitize(JSON.parse(raw))
   } catch {
-    return { ...DEFAULT_PREFERENCES }
+    return { ...DEFAULT_PREFERENCES, languages: [...DEFAULT_PREFERENCES.languages] }
   }
 }
 

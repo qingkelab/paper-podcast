@@ -895,3 +895,192 @@ class TestManualFigureCorrection:
     def test_delete_unknown_figure_404(self, client):
         episode_id = self._episode_with_figures(client)
         assert client.delete(f"/api/episodes/{episode_id}/figures/nope").status_code == 404
+
+
+@pytest.fixture
+def bilingual_client(tmp_path):
+    """双语模式：每期同时产出中文版和英文版。"""
+    settings = Settings(
+        force_mock=True,
+        enable_video=False,
+        languages="zh,en",
+        default_language="zh",
+        data_dir=tmp_path / "data",
+        database_path=tmp_path / "data" / "test.db",
+    )
+    app = create_app(settings)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+class TestBilingualVersions:
+    """同一集内嵌中英两版，`?lang=` 切换。
+
+    设计要点：顶层字段**镜像主语言**那一版，老前端不改也能用；
+    另一语言只在 `versions[lang]` 里。
+    """
+
+    def _create_en_primary(self, client, **extra):
+        payload = {
+            "source_type": "text",
+            "text": SAMPLE_TEXT,
+            "options": {"duration_min": 3, "level": "intro", **extra},
+        }
+        response = client.post("/api/episodes", json=payload)
+        assert response.status_code == 201, response.text
+        return wait_for_completion(client, response.json()["id"])
+
+    def test_both_languages_are_produced(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        assert episode["status"] == "completed", episode.get("error")
+        assert episode["languages"] == ["zh", "en"]
+        assert set(episode["versions"].keys()) == {"zh", "en"}
+
+    def test_each_version_has_own_script_and_audio(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        zh, en = episode["versions"]["zh"], episode["versions"]["en"]
+
+        assert zh["audio_url"] and en["audio_url"]
+        assert zh["audio_url"] != en["audio_url"]
+        assert zh["language"] == "zh" and en["language"] == "en"
+
+        zh_text = " ".join(s["text"] for s in zh["script"]["segments"])
+        en_text = " ".join(s["text"] for s in en["script"]["segments"])
+        # 英文版必须是真英文，而不是把中文版复制一份
+        assert "Today's paper" in en_text or "the paper" in en_text.lower()
+        assert "今天聊的" in zh_text
+        assert _cjk_ratio(en_text) < 0.1, "英文版里混进了中文"
+
+    def test_top_level_mirrors_primary_language(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        assert episode["language"] == "zh"
+        assert episode["script"] == episode["versions"]["zh"]["script"]
+        assert episode["audio_url"] == episode["versions"]["zh"]["audio_url"]
+        assert episode["options"]["language"] == "zh"
+        assert episode["options"]["languages"] == ["zh", "en"]
+
+    def test_english_primary_is_respected(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client, language="en", languages=["en"])
+        assert episode["language"] == "en"
+        assert episode["script"] == episode["versions"]["en"]["script"]
+        assert "今天聊的" not in " ".join(
+            s["text"] for s in episode["script"]["segments"]
+        )
+
+    def test_lang_query_switches_audio(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        path = f"/api/episodes/{episode['id']}/audio"
+
+        zh = bilingual_client.get(path)
+        en = bilingual_client.get(f"{path}?lang=en")
+        assert zh.status_code == 200 and en.status_code == 200
+        # 两版必须是**两个文件**：Mock TTS 只按段数与字数合成占位音，
+        # 内容层面证明不了「英文版在念英文」，所以这里断言的是路径与时长各自独立。
+        urls = {
+            episode["versions"]["zh"]["audio_url"],
+            episode["versions"]["en"]["audio_url"],
+        }
+        assert len(urls) == 2, urls
+        assert episode["versions"]["zh"]["audio_duration_sec"] is not None
+        assert episode["versions"]["en"]["audio_duration_sec"] is not None
+        assert int(zh.headers["content-length"]) > 0
+
+    def test_lang_query_switches_downloads(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        base = f"/api/episodes/{episode['id']}"
+
+        zh_script = bilingual_client.get(f"{base}/script.txt").text
+        en_script = bilingual_client.get(f"{base}/script.txt?lang=en").text
+        assert "主播A" in zh_script
+        assert "主播A" not in en_script
+        assert "Today's paper" in en_script
+
+        zh_md = bilingual_client.get(f"{base}/analysis.md").text
+        en_md = bilingual_client.get(f"{base}/analysis.md?lang=en").text
+        assert "研究背景" in zh_md
+        assert "研究背景" not in en_md
+
+    def test_english_download_has_language_suffix(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        response = bilingual_client.get(
+            f"/api/episodes/{episode['id']}/script.txt?lang=en"
+        )
+        disposition = response.headers["content-disposition"]
+        assert "-en-" in disposition, disposition
+
+    def test_unknown_language_is_404(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        base = f"/api/episodes/{episode['id']}"
+        assert bilingual_client.get(f"{base}/audio?lang=jp").status_code == 404
+        assert bilingual_client.get(f"{base}/script.txt?lang=jp").status_code == 404
+        assert bilingual_client.get(f"{base}/analysis.md?lang=jp").status_code == 404
+
+    def test_legacy_episode_without_versions_still_works(self, client):
+        """双语之前生成的集没有 versions，顶层就是唯一那一版。"""
+        response = client.post(
+            "/api/episodes",
+            json={
+                "source_type": "text",
+                "text": SAMPLE_TEXT,
+                "options": {"duration_min": 3, "level": "intro"},
+            },
+        )
+        episode = wait_for_completion(client, response.json()["id"])
+        assert episode["languages"] == ["zh"]
+        assert episode["language"] == "zh"
+        # 老数据也要能被 ?lang=zh 命中（前端切换器不必为空数据写特例）
+        assert client.get(
+            f"/api/episodes/{episode['id']}/audio?lang=zh"
+        ).status_code == 200
+        assert client.get(
+            f"/api/episodes/{episode['id']}/audio?lang=en"
+        ).status_code == 404
+
+    def test_server_wide_bilingual_does_not_invent_english_for_single_lang_episode(
+        self, bilingual_client
+    ):
+        """服务端支持中英双语 ≠ 每一集都有英文版。
+
+        这个坑很隐蔽：拿服务端配置的语言列表去判「有没有这一版」，
+        老数据的 `?lang=en` 会**静默返回中文内容**（200 + 主语言），
+        前端以为切成英文了，其实一个字都没变。
+        """
+        # 明确只要中文版
+        episode = self._create_en_primary(bilingual_client, languages=["zh"])
+        assert episode["languages"] == ["zh"]
+        assert episode["options"]["languages"] == ["zh"]
+
+        base = f"/api/episodes/{episode['id']}"
+        assert bilingual_client.get(f"{base}/audio?lang=en").status_code == 404
+        assert bilingual_client.get(f"{base}/video?lang=en").status_code == 404
+        assert bilingual_client.get(f"{base}/script.txt?lang=en").status_code == 404
+        assert bilingual_client.get(f"{base}/analysis.md?lang=en").status_code == 404
+        assert bilingual_client.get(f"{base}/audio?lang=zh").status_code == 200
+
+    def test_planned_languages_visible_while_generating(self, bilingual_client):
+        """任务还在跑时 `options.languages` 已经是要求的两版，`languages` 还没有。"""
+        response = bilingual_client.post(
+            "/api/episodes",
+            json={
+                "source_type": "text",
+                "text": SAMPLE_TEXT,
+                "options": {"duration_min": 3, "languages": ["zh", "en"]},
+            },
+        )
+        created = response.json()
+        assert created["options"]["languages"] == ["zh", "en"]
+        assert created["languages"] == []
+
+    def test_intro_outro_present_in_both_languages(self, bilingual_client):
+        episode = self._create_en_primary(bilingual_client)
+        for lang in ("zh", "en"):
+            segments = episode["versions"][lang]["script"]["segments"]
+            brands = [s.get("brand") for s in segments]
+            assert "intro" in brands and "outro" in brands
+
+
+def _cjk_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return cjk / len(text)

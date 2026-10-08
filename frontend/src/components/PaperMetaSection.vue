@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { Episode } from '../api'
+import type { Episode, PaperMeta } from '../api'
 
 /**
  * 论文元信息（标题 / 作者 / 年份 / 会议 / arXiv / 关键词 / 摘要）。
@@ -9,12 +9,17 @@ import type { Episode } from '../api'
  *   - 有视频解读时，元信息要紧跟在标题下方（视频是最主要的产物，不能被压在后面）；
  *   - 没有视频时，元信息保持在原文画廊之后的位置（行为与改造前完全一致）。
  * 两种形态用的是同一份标记，避免两处各写一遍后走样。
+ *
+ * `paper-meta` 是语言版本的覆盖值（契约 §1：`versions[lang].paper_meta`）：
+ * 中英两版的标题作者通常一致，但契约允许各版本不同，所以由详情页按当前语言传进来。
+ * 不传（或传 null）时退回 `episode.paper_meta`，也就是主语言那一版。
  */
 const props = defineProps<{
   episode: Episode
+  paperMeta?: PaperMeta | null
 }>()
 
-const paper = computed(() => props.episode.paper_meta ?? null)
+const paper = computed(() => props.paperMeta ?? props.episode.paper_meta ?? null)
 
 const arxivUrl = computed(() =>
   paper.value?.arxiv_id ? `https://arxiv.org/abs/${paper.value.arxiv_id}` : null,

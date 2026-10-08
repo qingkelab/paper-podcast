@@ -355,6 +355,70 @@ pre {
   flex: 1;
 }
 
+/* ------------------------------------------------- 详情页标题区右侧动作区 */
+
+/* 语言切换器 + 「播客库」按钮：竖排，窄屏时整体换行也不挤标题 */
+.page__actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/*
+  语言切换器：紧贴标题、一眼能看到，但不抢戏 ——
+  用与 .tabs 同源的 segmented control 样式（深底 + 内嵌圆角块），
+  尺寸压到 btn--sm 一档，颜色沿用琥珀强调色。
+*/
+.lang-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  background: rgba(9, 13, 19, 0.5);
+}
+
+.lang-switch__label {
+  padding: 0 8px 0 10px;
+  font-size: 11.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.lang-switch__btn {
+  padding: 6px 14px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: all 0.18s var(--ease);
+}
+
+.lang-switch__btn:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.lang-switch__btn.is-active {
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  box-shadow: inset 0 0 0 1px rgba(211, 162, 74, 0.32);
+}
+
+@media (max-width: 560px) {
+  .page__actions {
+    align-items: flex-start;
+  }
+}
+
 /* ---------------------------------------------------------------- 卡片 */
 
 .card {

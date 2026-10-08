@@ -4,19 +4,28 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
   IS_MOCK,
   analysisMdUrl,
-  audioUrl,
   deleteFigure,
   downloadUrl,
   errorMessage,
   getEpisode,
   isApiError,
+  // 运行时收窄：后端将来新增语言时不会让页面崩，只会认不出来
+  isEpisodeLanguage,
   // 组件里已经有一个 video 计算属性，这个请求函数换个名字，避免撞名
   rebuildVideo as requestVideoRebuild,
   retryEpisode,
   rotateFigure,
   scriptTxtUrl,
 } from '../api'
-import type { Analysis, Episode, Figure, FigureRotateDirection, VideoInfo } from '../api'
+import type {
+  Analysis,
+  Episode,
+  EpisodeLanguage,
+  EpisodeVersion,
+  Figure,
+  FigureRotateDirection,
+  VideoInfo,
+} from '../api'
 import AudioPlayer from '../components/AudioPlayer.vue'
 import AnalysisView from '../components/AnalysisView.vue'
 import FigureGallery from '../components/FigureGallery.vue'
@@ -25,6 +34,7 @@ import PaperMetaSection from '../components/PaperMetaSection.vue'
 import ScriptView from '../components/ScriptView.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
+import { languageLabel, languageShort, loadEpisodeLanguage, rememberEpisodeLanguage } from '../utils/language'
 import { LEVEL_LABELS, SOURCE_LABELS } from '../utils/stages'
 
 const route = useRoute()
@@ -42,9 +52,116 @@ let audioRetryTimer: number | undefined
 
 const isCompleted = computed(() => episode.value?.status === 'completed')
 const isFailed = computed(() => episode.value?.status === 'failed')
-const audioSrc = computed(() => (episode.value ? audioUrl(episode.value) : null))
 /** 失败原因既可能来自 episode.error，也可能来自网络异常 */
 const failureText = computed(() => episode.value?.error ?? error.value)
+
+// ---------------------------------------------------------------------------
+// 语言版本（契约 §1「双语版本（bilingual）」）
+//
+// 同一集可以有中英两版：配图共用（封面 / 论文原图 / 信息图都在 Episode 顶层，
+// **不随语言切换**，否则切一次语言所有图都要重新拉一遍、画面会闪），
+// 而脚本、解读、论文元信息、音频、视频各语言独立。
+//
+// 顶层字段 mirror 主语言，所以老数据（没有 versions）什么都不用改：下面的
+// activeVersion 恒为 null，全部退回顶层字段，切换器也不出现。
+// ---------------------------------------------------------------------------
+
+/** 本集真的有内容、可以切换的语言版本（顺序 = `languages` 的顺序） */
+function availableLanguagesFor(value: Episode | null): EpisodeLanguage[] {
+  const versions = value?.versions
+  if (!versions) return []
+  const declared = value?.languages?.filter(isEpisodeLanguage) ?? []
+  const ordered = declared.filter((language) => versions[language])
+  // languages 缺失/脏掉的极端情况：按 versions 的 key 补齐，别让已有的版本白白藏着
+  ;(Object.keys(versions) as EpisodeLanguage[]).forEach((language) => {
+    if (versions[language] && !ordered.includes(language)) ordered.push(language)
+  })
+  return ordered
+}
+
+const availableLanguages = computed(() => availableLanguagesFor(episode.value))
+/** 只有一种语言（或老数据完全没有版本）时不显示切换器 —— 没有可切的东西，摆个单选项只会让人犯嘀咕 */
+const showLanguageSwitch = computed(() => availableLanguages.value.length > 1)
+
+/** 当前选中的语言；null = 回落顶层字段（老数据） */
+const activeLanguage = ref<EpisodeLanguage | null>(null)
+
+/** 当前生效的语言版本；没有则 null（一律退回顶层字段） */
+const activeVersion = computed<EpisodeVersion | null>(() => {
+  const language = activeLanguage.value
+  if (!language) return null
+  return episode.value?.versions?.[language] ?? null
+})
+
+const activeLanguageLabel = computed(() =>
+  activeLanguage.value ? languageLabel(activeLanguage.value) : '',
+)
+
+/**
+ * 决定进来该显示哪一版：优先用这一集上次选过的语言（localStorage），
+ * 其次主语言，最后退到第一个可用版本。**必须校验这一集真的有这个版本** ——
+ * 上次看的是英文，这次打开的是只有中文的老数据，不能把页面切成空白。
+ */
+function resolveLanguage(value: Episode | null, preferred?: EpisodeLanguage | null): EpisodeLanguage | null {
+  const available = availableLanguagesFor(value)
+  if (!available.length) return null
+  if (preferred && available.includes(preferred)) return preferred
+  const stored = loadEpisodeLanguage(value?.id ?? '')
+  if (stored && available.includes(stored)) return stored
+  const primary = value?.language
+  if (isEpisodeLanguage(primary) && available.includes(primary)) return primary
+  return available[0] ?? null
+}
+
+/** 切换语言版本 */
+function selectLanguage(language: EpisodeLanguage): void {
+  if (language === activeLanguage.value) return
+  if (!availableLanguages.value.includes(language)) return
+  // 视频/音频整个换了一版：旧播放器的进度、时长、尺寸、失败态都不能留，
+  // 而且 <video> 必须**重新加载**（v-if 里换了 key，等于重建元素）
+  resetVideoState()
+  videoKey.value += 1
+  activeLanguage.value = language
+  rememberEpisodeLanguage(id.value, language)
+}
+
+/**
+ * 取「当前该显示的内容」。
+ *
+ * 规则只有一条，但很关键：**只有当这一集完全没有 versions（老数据）时才回落到顶层字段**。
+ * 顶层字段是主语言的镜像 —— 如果英文版的脚本还没生成就回落过去，页面会在「English」
+ * 状态下显示中文正文，那比留白更糟（用户以为自己看的是英文版）。所以版本存在时，
+ * 字段缺失就让对应区块走它自己的空状态，并由下面 missingVersionParts 明说缺了什么。
+ *
+ * 例外只有 paper_meta：契约说两版的标题作者通常一致（本身就是英文），它是语言中立的，
+ * 缺失时回落到顶层不会造成语言错配。
+ */
+function fromVersion<T>(pick: (version: EpisodeVersion) => T | null, fallback: T | null): T | null {
+  const version = activeVersion.value
+  if (!version) return fallback
+  return pick(version)
+}
+
+const displayScript = computed(() => fromVersion((v) => v.script, episode.value?.script ?? null))
+const displayAnalysis = computed(() => fromVersion((v) => v.analysis, episode.value?.analysis ?? null))
+const displayPaperMeta = computed(
+  () => fromVersion((v) => v.paper_meta, episode.value?.paper_meta ?? null) ?? episode.value?.paper_meta ?? null,
+)
+
+/** 当前语言版本缺了哪些产物（正常不该发生；真缺了要说出来，别让区块静默消失） */
+const missingVersionParts = computed(() => {
+  const version = activeVersion.value
+  if (!version) return []
+  const missing: string[] = []
+  if (!version.script) missing.push('脚本')
+  if (!version.analysis) missing.push('解读')
+  if (!version.audio_url) missing.push('音频')
+  if (!version.video) missing.push('视频')
+  return missing
+})
+
+/** 版本化数据的可读名（用于提示文案） */
+const versionScope = computed(() => (activeVersion.value ? `${activeLanguageLabel.value}版` : '当前版本'))
 
 // ---------------------------------------------------------------------------
 // 封面（hero）：按 cover_width / cover_height 预留宽高比，加载时不会跳布局
@@ -91,7 +208,14 @@ function downloadIllustration(): void {
 const VIDEO_ASPECT = '936 / 1210'
 const VIDEO_NOMINAL_SIZE = '936×1210'
 
-const video = computed<VideoInfo | null>(() => episode.value?.video ?? null)
+const video = computed<VideoInfo | null>(() =>
+  fromVersion((version) => version.video, episode.value?.video ?? null),
+)
+/**
+ * 语言切换时 +1，用作 `<video>` 的 key：元素整个重建，等于强制重新加载新地址。
+ * 只改 src 属性在部分浏览器里会沿用旧的解码状态（尤其是切回来的时候），重建最干净。
+ */
+const videoKey = ref(0)
 /** 音频播放器的公开方法（pause），用于音视频互斥 */
 const audioRef = ref<InstanceType<typeof AudioPlayer> | null>(null)
 const videoEl = ref<HTMLVideoElement | null>(null)
@@ -121,10 +245,36 @@ const videoSizeLabel = computed(() => {
  */
 const audioVisible = computed(() => !video.value || videoFailed.value)
 
+/**
+ * 音频信息：当前语言版本的；没有版本（老数据）时用顶层字段。
+ * 契约里 audio_url 是「可播放的 URL 或 null」，AudioPlayer 内部 watch(src) 会自己重新 load()
+ * —— 切语言时 src 变了，播放器就会重新加载新音源。
+ *
+ * 版本里没有音频时**不回落**到另一种语言的音频（那会变成「标着 English 在放中文」），
+ * 时长/体积也要跟着置空：否则播放器会显示一个属于另一版音频的时长。
+ */
+const audioInfo = computed(() => {
+  const version = activeVersion.value
+  if (!version) {
+    const value = episode.value
+    return { url: value?.audio_url ?? null, duration: value?.audio_duration_sec ?? null, bytes: value?.audio_bytes ?? null }
+  }
+  return { url: version.audio_url, duration: version.audio_duration_sec, bytes: version.audio_bytes }
+})
+const audioSrc = computed(() => audioInfo.value.url)
+const audioDuration = computed(() => (audioInfo.value.url ? audioInfo.value.duration : null))
+const audioBytes = computed(() => (audioInfo.value.url ? audioInfo.value.bytes : null))
+
+/** 下载文件名带上语言标记（多语言时同一集的产物要能分得清） */
+function languageSuffix(): string {
+  if (!showLanguageSwitch.value || !activeLanguage.value) return ''
+  return `-${languageShort(activeLanguage.value)}`
+}
+
 function downloadVideo(): void {
   const url = video.value?.url
   if (!url) return
-  downloadUrl(url, `${safeName()}-视频解读.mp4`)
+  downloadUrl(url, `${safeName()}-视频解读${languageSuffix()}.mp4`)
 }
 
 function onVideoMetadata(): void {
@@ -201,7 +351,8 @@ async function rebuildVideoNow(): Promise<void> {
   rebuildError.value = null
   startRebuildClock()
   try {
-    const updated = await requestVideoRebuild(targetId)
+    // 契约 §2：中英两版的视频是两个独立产物，只重做用户当前在看的那一版
+    const updated = await requestVideoRebuild(targetId, activeLanguage.value ?? undefined)
     // 中途切到了别的单集：这次的结果已经不属于当前页面，丢掉（否则会把上一集的视频写回来）
     if (id.value !== targetId) return
     // 视频内容变了、URL 也变了，播放器必须从头加载：清掉旧的时长/尺寸/失败态
@@ -398,10 +549,16 @@ const ANALYSIS_FIELDS: Array<keyof Analysis> = [
   'future',
 ]
 
-const scriptSegments = computed(() => episode.value?.script?.segments.length ?? 0)
-const scriptWords = computed(() => episode.value?.script?.word_count ?? 0)
+const scriptSegments = computed(() => displayScript.value?.segments.length ?? 0)
+const scriptWords = computed(() => displayScript.value?.word_count ?? 0)
+
+/**
+ * `word_count` 的单位随语言变：中文数字符、英文数词。
+ * 英文版写「427 字」是把词当成了字，会让「目标 3 分钟」看着像严重超时。
+ */
+const scriptUnit = computed(() => (activeLanguage.value === 'en' ? '词' : '字'))
 const analysisCards = computed(() => {
-  const analysis = episode.value?.analysis
+  const analysis = displayAnalysis.value
   if (!analysis) return 0
   return ANALYSIS_FIELDS.filter((key) => {
     const value = analysis[key]
@@ -448,6 +605,9 @@ watch(id, () => {
   }
   toast.value = null
   resetVideoState()
+  // 语言选择是按单集记的，换集后由 load() 里的 resolveLanguage 重新决定
+  activeLanguage.value = null
+  videoKey.value += 1
   episode.value = null
   void load()
 })
@@ -467,6 +627,9 @@ async function load(silent = false): Promise<void> {
   try {
     const value = await getEpisode(id.value)
     episode.value = value
+    // 沿用这一集上次选过的语言（localStorage），但要校验这一集真的有那个版本：
+    // 上次看英文、这次打开的是只有中文的老数据时，必须安静地退回中文，而不是切成空白
+    activeLanguage.value = resolveLanguage(value, activeLanguage.value)
     notFound.value = false
     if (value.status === 'completed') {
       if (!value.audio_url) scheduleAudioRefetch()
@@ -493,22 +656,24 @@ function safeName(): string {
 
 function downloadScript(): void {
   downloadError.value = null
-  const url = scriptTxtUrl(id.value)
+  // 契约 §2：脚本下载按 ?lang= 取对应语言（mock 下是对应语言的 Blob URL）
+  const url = scriptTxtUrl(id.value, activeLanguage.value ?? undefined)
   if (!url) {
     downloadError.value = '脚本还没有生成，暂时无法下载'
     return
   }
-  downloadUrl(url, `${safeName()}-脚本.txt`)
+  downloadUrl(url, `${safeName()}-脚本${languageSuffix()}.txt`)
 }
 
 function downloadAnalysis(): void {
   downloadError.value = null
-  const url = analysisMdUrl(id.value)
+  // 契约 §2：解读下载同样按 ?lang= 取对应语言
+  const url = analysisMdUrl(id.value, activeLanguage.value ?? undefined)
   if (!url) {
     downloadError.value = '结构化解读还没有生成，暂时无法下载'
     return
   }
-  downloadUrl(url, `${safeName()}-解读.md`)
+  downloadUrl(url, `${safeName()}-解读${languageSuffix()}.md`)
 }
 
 /**
@@ -525,7 +690,7 @@ function downloadAudio(): void {
     downloadError.value = '音频还没有生成，暂时无法下载'
     return
   }
-  downloadUrl(url, `${safeName()}-播客音频.mp3`)
+  downloadUrl(url, `${safeName()}-播客音频${languageSuffix()}.mp3`)
 }
 
 async function retry(): Promise<void> {
@@ -640,9 +805,45 @@ onBeforeUnmount(() => {
               </span>
             </div>
           </div>
-          <RouterLink to="/library" class="btn btn--ghost">播客库</RouterLink>
+          <div class="page__actions">
+            <!--
+              语言切换器：只有这一集真的有 2 个以上语言版本时才出现
+              （老数据没有 versions、或只生成了一种语言，都不显示 —— 没有可切的东西）。
+              配图（封面 / 论文原图 / 信息图）两版共用，所以切换时**不动**它们。
+            -->
+            <div
+              v-if="showLanguageSwitch"
+              class="lang-switch"
+              role="group"
+              aria-label="播放语言版本（脚本 / 解读 / 音频 / 视频）"
+            >
+              <span class="lang-switch__label" aria-hidden="true">语言</span>
+              <button
+                v-for="language in availableLanguages"
+                :key="language"
+                type="button"
+                class="lang-switch__btn"
+                :class="{ 'is-active': language === activeLanguage }"
+                :aria-pressed="language === activeLanguage"
+                :title="`切换到${languageLabel(language)}版本（脚本 / 解读 / 音频 / 视频一起换）`"
+                @click="selectLanguage(language)"
+              >
+                {{ languageLabel(language) }}
+              </button>
+            </div>
+            <RouterLink to="/library" class="btn btn--ghost">播客库</RouterLink>
+          </div>
         </div>
       </header>
+
+      <!--
+        当前语言版本缺产物时明说，不让对应区块静默消失：
+        例如英文版的解读还在生成，页面就不该只「少一块」而没有任何解释。
+      -->
+      <p v-if="missingVersionParts.length" class="section__hint" style="margin: 0 0 18px">
+        {{ versionScope }}还缺少：{{ missingVersionParts.join(' / ') }}（可能仍在生成中）。
+        这里不会拿另一种语言的正文顶替，等它就绪后会出现在原位。
+      </p>
 
       <div v-if="failureText" class="alert alert--error" style="margin-bottom: 20px">
         <span class="alert__icon" aria-hidden="true">!</span>
@@ -666,10 +867,14 @@ onBeforeUnmount(() => {
         <span class="alert__icon" aria-hidden="true">◈</span>
         <span class="alert__body">
           <span class="alert__title">离线 Mock 模式</span>
-          本页的解读与脚本来自内置示例数据；音频由 Web Audio API 现场合成的正弦波生成（约 36 秒），
-          封面、论文原图与信息图也全部由 Canvas / 内联 SVG 现场生成，不请求任何网络资源。
-          视频解读由 Canvas + MediaRecorder 现场录制一段 6 秒占位片（浏览器需要真实录制时间，
-          首次进入详情页会稍等一两秒），同样是占位，不是真实产物。
+          本页的解读与脚本来自内置示例数据（中英两版是两套真的不同文本，不是同一份复制两遍）；
+          音频由 Web Audio API 现场合成的正弦波生成（约 36 秒），封面、论文原图与信息图也全部由
+          Canvas / 内联 SVG 现场生成，不请求任何网络资源。视频解读由 Canvas + MediaRecorder 现场录制
+          一段 6 秒占位片（浏览器需要真实录制时间，首次进入详情页会稍等一两秒）。
+          <template v-if="showLanguageSwitch">
+            中英两版的音频与视频都是占位产物：共用同一段声音/画面，但地址各自独立，
+            所以切换语言时播放器会真的换源并重新加载；配图两版共用，切换时不会重新拉图。
+          </template>
         </span>
       </div>
 
@@ -706,6 +911,7 @@ onBeforeUnmount(() => {
         </div>
 
         <p class="video-meta">
+          <span v-if="showLanguageSwitch" class="badge badge--accent">{{ activeLanguageLabel }}版</span>
           <span v-if="IS_MOCK" class="badge badge--neutral">演示模式：视频为占位</span>
           <span class="file-pill__size">
             视频 {{ formatDuration(videoDuration) }} · {{ videoSizeLabel }}<template v-if="video.bytes">
@@ -728,6 +934,7 @@ onBeforeUnmount(() => {
           <h2 class="section__title">视频解读播客</h2>
           <span class="section__hint">
             竖版 {{ videoSizeLabel }} · 画面按脚本逐段切换、与音频轮次对齐 · 字幕按主播分色
+            <template v-if="showLanguageSwitch"> · 当前 {{ activeLanguageLabel }}版</template>
           </span>
         </div>
 
@@ -780,6 +987,7 @@ onBeforeUnmount(() => {
               <video
                 v-if="!videoFailed"
                 ref="videoEl"
+                :key="videoKey"
                 class="vplayer__media"
                 :src="video.url"
                 :poster="coverSrc ?? undefined"
@@ -841,7 +1049,7 @@ onBeforeUnmount(() => {
         这样首屏就是标题 + 下载行 + 视频播放器；元信息卡片 400+ px，放在视频前面会把
         视频顶到首屏之外。无视频形态下走下面那份 `v-if="!video"` 的原位，行为不变。
       -->
-      <PaperMetaSection v-if="video" :episode="episode" />
+      <PaperMetaSection v-if="video" :episode="episode" :paper-meta="displayPaperMeta" />
 
       <!--
         ================= 没有视频的形态：与改造前完全一致 =================
@@ -852,8 +1060,8 @@ onBeforeUnmount(() => {
         <AudioPlayer
           ref="audioRef"
           :src="audioSrc"
-          :fallback-duration="episode.audio_duration_sec"
-          :title="episode.title"
+          :fallback-duration="audioDuration"
+          :title="showLanguageSwitch ? `${episode.title}（${activeLanguageLabel}版）` : episode.title"
           @play="onAudioPlay"
         />
 
@@ -867,9 +1075,8 @@ onBeforeUnmount(() => {
             跳到解读
           </button>
           <span class="spacer" />
-          <span v-if="episode.audio_bytes" class="file-pill__size">
-            音频 {{ formatBytes(episode.audio_bytes) }} · 时长
-            {{ formatDuration(episode.audio_duration_sec) }}
+          <span v-if="audioBytes" class="file-pill__size">
+            音频 {{ formatBytes(audioBytes) }} · 时长 {{ formatDuration(audioDuration) }}
           </span>
         </div>
 
@@ -1003,19 +1210,19 @@ onBeforeUnmount(() => {
       </section>
 
       <!-- 论文元信息：没有视频时的原位（有视频时上面已经渲染过一次） -->
-      <PaperMetaSection v-if="!video" :episode="episode" />
+      <PaperMetaSection v-if="!video" :episode="episode" :paper-meta="displayPaperMeta" />
 
       <!--
         播客脚本：有视频时默认收起（脚本 2000+ px，是页面变长的头号元凶）。
         用原生 <details>：键盘 Enter/Space 可开，天然带展开态语义，摘要行给出段数与字数。
       -->
-      <details v-if="video && episode.script" id="section-script" ref="scriptFold" class="section fold">
+      <details v-if="video && displayScript" id="section-script" ref="scriptFold" class="section fold">
         <summary
           class="fold__summary"
-          :aria-label="`播客脚本（${scriptSegments} 段 · ${scriptWords} 字）：双人对谈，逐段展示，按说话人配色`"
+          :aria-label="`播客脚本（${scriptSegments} 段 · ${scriptWords} ${scriptUnit}）：双人对谈，逐段展示，按说话人配色`"
           @keydown.enter.prevent="onSummaryEnter"
         >
-          <h2 class="section__title">播客脚本（{{ scriptSegments }} 段 · {{ scriptWords }} 字）</h2>
+          <h2 class="section__title">播客脚本（{{ scriptSegments }} 段 · {{ scriptWords }} {{ scriptUnit }}）</h2>
           <span class="section__hint">双人对谈 · 逐段展示，按说话人配色</span>
           <span class="fold__state" aria-hidden="true">
             <span class="fold__state-closed">展开</span>
@@ -1025,7 +1232,8 @@ onBeforeUnmount(() => {
         <div class="fold__body">
           <div class="card card--pad">
             <ScriptView
-              :script="episode.script"
+              :script="displayScript"
+              :language="activeLanguage ?? undefined"
               :voice-a="episode.options.voice_a"
               :voice-b="episode.options.voice_b"
             />
@@ -1040,7 +1248,8 @@ onBeforeUnmount(() => {
         </div>
         <div class="card card--pad">
           <ScriptView
-            :script="episode.script"
+            :script="displayScript"
+            :language="activeLanguage ?? undefined"
             :voice-a="episode.options.voice_a"
             :voice-b="episode.options.voice_b"
           />
@@ -1051,7 +1260,7 @@ onBeforeUnmount(() => {
         结构化解读：有视频时同样默认收起，摘要行给出板块数。
       -->
       <details
-        v-if="video && episode.analysis"
+        v-if="video && displayAnalysis"
         id="section-analysis"
         ref="analysisFold"
         class="section fold"
@@ -1071,7 +1280,7 @@ onBeforeUnmount(() => {
           </span>
         </summary>
         <div class="fold__body">
-          <AnalysisView :analysis="episode.analysis" />
+          <AnalysisView :analysis="displayAnalysis" />
         </div>
       </details>
 
@@ -1082,7 +1291,7 @@ onBeforeUnmount(() => {
             背景 → 创新点 → 方法 → 实验 → 结论 → 不足 → 价值 → 未来
           </span>
         </div>
-        <AnalysisView :analysis="episode.analysis" />
+        <AnalysisView :analysis="displayAnalysis" />
       </section>
 
       <FigureLightbox

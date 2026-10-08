@@ -44,19 +44,46 @@ BRAND_CTA_SUBTITLE = "青稞社区 · 只推我们真正读过的东西"
 LOGO_FILENAME = "qingke-logo.png"
 
 
-def intro_segments() -> list[dict]:
+# --------------------------------------------------------------------------
+# 英文版
+# --------------------------------------------------------------------------
+#
+# 不是直译。中文那几句的设计约束（不喊口号、片头给预期、片尾给去处）
+# 在英文里要重新措辞才成立 —— 直译过来会变成典型的英文播客套话。
+# 比如中文「不吹，也不绕」直译成 "No hype, no beating around the bush"
+# 既啰嗦又像推销；英文里 "No hype." 这种短句就够了。
+
+BRAND_INTRO_EN: list[tuple[str, str]] = [
+    ("A", "This is Qingke Community. We only talk about papers we've actually read."),
+    ("B", "So each episode is one job: explain the paper properly, then say whether it holds up."),
+    ("A", "No hype. Let's get into it."),
+]
+
+BRAND_OUTRO_EN: list[tuple[str, str]] = [
+    ("A", "That's this one wrapped up."),
+    ("B", "If you want the paper itself, or more of what we've read, find us at Qingke Community."),
+    ("A", "Follow Qingke — a new paper every day. See you next time."),
+]
+
+BRAND_CTA_TITLE_EN = "Follow Qingke — a new paper every day"
+BRAND_CTA_SUBTITLE_EN = "Qingke Community · We only recommend what we've actually read"
+
+
+def intro_segments(language: str = "zh") -> list[dict]:
     """片头，转成脚本段格式。"""
+    lines = BRAND_INTRO_EN if language == "en" else BRAND_INTRO
     return [
         {"speaker": speaker, "text": text, "round": index, "brand": "intro"}
-        for index, (speaker, text) in enumerate(BRAND_INTRO)
+        for index, (speaker, text) in enumerate(lines)
     ]
 
 
-def outro_segments() -> list[dict]:
+def outro_segments(language: str = "zh") -> list[dict]:
     """片尾。"""
+    lines = BRAND_OUTRO_EN if language == "en" else BRAND_OUTRO
     return [
         {"speaker": speaker, "text": text, "round": index, "brand": "outro"}
-        for index, (speaker, text) in enumerate(BRAND_OUTRO)
+        for index, (speaker, text) in enumerate(lines)
     ]
 
 
@@ -67,6 +94,26 @@ def logo_path() -> "pathlib.Path":
     return pathlib.Path(__file__).resolve().parent / "assets" / LOGO_FILENAME
 
 
-def brand_char_count() -> int:
-    """片头 + 片尾的总字数，用于把它算进时长预算。"""
-    return sum(len(text) for _, text in BRAND_INTRO + BRAND_OUTRO)
+def cta_text(language: str = "zh") -> tuple[str, str]:
+    """片尾卡上的关注引导（主句, 副句）。"""
+    if language == "en":
+        return BRAND_CTA_TITLE_EN, BRAND_CTA_SUBTITLE_EN
+    return BRAND_CTA_TITLE, BRAND_CTA_SUBTITLE
+
+
+def brand_units(language: str = "zh") -> int:
+    """片头 + 片尾的「语速单位数」，用于算进时长预算。
+
+    中文是字数，英文是词数 —— 两者量纲不同，所以按语言分别统计：
+    英文按空格切词，中文按字符数（标点也算，和语速换算口径一致）。
+    """
+    lines = (BRAND_INTRO_EN, BRAND_OUTRO_EN) if language == "en" else (BRAND_INTRO, BRAND_OUTRO)
+    text = " ".join(t for group in lines for _, t in group)
+    if language == "en":
+        return len(text.split())
+    return len(text)
+
+
+def brand_char_count(language: str = "zh") -> int:
+    """兼容旧调用名。"""
+    return brand_units(language)

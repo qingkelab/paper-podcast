@@ -13,6 +13,7 @@ from typing import Any
 
 from ..config import Settings
 from ..db import Database
+from .. import voices as voice_catalog
 from . import prompts
 from .ingest import (
     IngestError,
@@ -26,8 +27,8 @@ from .ingest import (
 from .. import branding
 from .figures import extract_figures, render_first_page
 from .illustration import generate_illustration
-from .llm import LLMClient, LLMError, build_script_payload
-from .podcast_tts import PodcastTTSClient, PodcastTTSError, probe_duration
+from .llm import LLMClient, LLMError, build_script_payload, split_long_segments
+from .podcast_tts import PodcastTTSClient, PodcastTTSError, RoundTiming, probe_duration
 from .video import VideoError, compose_video, ffmpeg_available
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,42 @@ STAGES = {
     "synthesizing": ("synthesizing", 75, "正在合成播客音频"),
     "completed": ("completed", 100, "已完成"),
 }
+
+# 阶段文案里的语言后缀。写「正在深度解读（英文）」比只改百分比有用：
+# 双语模式下这一集要跑两遍，不写清楚会让人以为卡住了。
+LANGUAGE_SUFFIX = {"zh": "", "en": "（英文）"}
+
+
+class LanguageNotFound(ValueError):
+    """请求了一个这一集并没有产出的语言版本（接口层映射成 404）。"""
+
+
+def audio_filename(episode_id: str, language: str, primary: str) -> str:
+    """音频文件名。主语言不带后缀，保证老链接和旧文件继续有效。"""
+    return f"{episode_id}.mp3" if language == primary else f"{episode_id}.{language}.mp3"
+
+
+def video_filename(episode_id: str, language: str, primary: str) -> str:
+    return f"{episode_id}.mp4" if language == primary else f"{episode_id}.{language}.mp4"
+
+
+def language_plan(options: dict[str, Any], settings: Settings) -> tuple[str, list[str]]:
+    """这一集要产出哪些语言，以及哪一个是主语言。
+
+    主语言固定排在最前面 —— 它是顶层字段镜像的那一版，也决定标题与封面。
+    """
+    primary = str(options.get("language") or settings.default_language or "zh").lower()
+    if primary not in ("zh", "en"):
+        primary = "zh"
+
+    raw = options.get("languages") or settings.language_list
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",")]
+    ordered: list[str] = []
+    for lang in [primary, *[str(x).lower() for x in raw if x]]:
+        if lang in ("zh", "en") and lang not in ordered:
+            ordered.append(lang)
+    return primary, ordered or [primary]
 
 
 class Pipeline:
@@ -56,6 +93,71 @@ class Pipeline:
         self.db.update_episode(
             episode_id, status=status, progress=progress, stage_label=label, **extra
         )
+
+    def _db_stage(
+        self, episode_id: str, stage: str, progress: int, label: str, **extra: Any
+    ) -> None:
+        """指定进度与文案的阶段更新。
+
+        双语模式下同一阶段要跑两遍，进度得按语言切片，
+        而且要能在文案里标出「这是哪一版」。
+        """
+        status = STAGES[stage][0]
+        self.db.update_episode(
+            episode_id, status=status, progress=progress, stage_label=label, **extra
+        )
+
+    def _voices_for(
+        self, language: str, options: dict[str, Any], primary: str
+    ) -> tuple[str, str]:
+        """这一版的两位主播音色。
+
+        用户只在前端选过一次音色（主语言那一档），英文版必须换成英文音色 ——
+        拿中文音色念英文虽然也能出声，但口音很明显。
+        """
+        default_a, default_b = voice_catalog.default_voices(language, self.settings)
+        if language == primary:
+            return (
+                voice_catalog.normalize_voice(
+                    options.get("voice_a") or None, default_a
+                ),
+                voice_catalog.normalize_voice(
+                    options.get("voice_b") or None, default_b
+                ),
+            )
+        return default_a, default_b
+
+    @staticmethod
+    def _mirror_fields(
+        language: str,
+        primary: str,
+        version: dict[str, Any],
+    ) -> dict[str, Any]:
+        """非主语言版本不进顶层字段。
+
+        顶层的 `analysis`/`script`/`audio_url`/`video` 是**主语言那一版**的镜像，
+        老前端不改也能正常显示；另一语言只在 `versions[lang]` 里。
+        """
+        if language != primary:
+            return {}
+        fields: dict[str, Any] = {
+            "paper_meta": version.get("paper_meta"),
+            "analysis": version.get("analysis"),
+            "script": version.get("script"),
+            "illustration": version.get("illustration"),
+        }
+        if version.get("audio_path"):
+            fields["audio_path"] = version["audio_path"]
+            fields["audio_duration_sec"] = version.get("audio_duration_sec")
+            fields["audio_bytes"] = version.get("audio_bytes")
+            fields["timings"] = version.get("timings") or []
+            # task_id / finished_round 是断点续传用的，主语言那一版记在顶层
+            fields["podcast_task_id"] = version.get("podcast_task_id")
+            fields["finished_round"] = version.get("finished_round")
+        if version.get("video_path"):
+            fields["video_path"] = version["video_path"]
+            fields["video"] = version.get("video")
+        return fields
 
     def _fail(self, episode_id: str, message: str) -> None:
         logger.error("任务 %s 失败：%s", episode_id, message)
@@ -76,6 +178,9 @@ class Pipeline:
         audio_duration: float,
         title: str,
         analysis: dict[str, Any],
+        language: str = "zh",
+        output_path: Path | None = None,
+        illustration_png: str | None = None,
     ) -> dict[str, Any]:
         """合成视频解读播客。
 
@@ -97,7 +202,8 @@ class Pipeline:
             return {}
 
         record = self.db.get_episode(episode_id) or {}
-        illustration = record.get("illustration") or {}
+        if illustration_png is None:
+            illustration_png = (record.get("illustration") or {}).get("png_path")
 
         try:
             result = await asyncio.to_thread(
@@ -108,9 +214,10 @@ class Pipeline:
                 audio_duration=audio_duration,
                 cover_path=record.get("cover_path"),
                 figures=record.get("figures") or [],
-                illustration_png=illustration.get("png_path"),
-                work_dir=self.settings.video_work_dir / episode_id,
-                output_path=self.settings.video_dir / f"{episode_id}.mp4",
+                illustration_png=illustration_png,
+                work_dir=self.settings.video_work_dir / episode_id / language,
+                output_path=output_path
+                or (self.settings.video_dir / f"{episode_id}.mp4"),
                 title=title,
                 llm=self.llm,
                 analysis=analysis,
@@ -124,7 +231,8 @@ class Pipeline:
             return {}
 
         logger.info(
-            "视频已生成：%d 帧 / %.1f 秒 / %.1f MB（配图分配：%s）",
+            "视频已生成（%s）：%d 帧 / %.1f 秒 / %.1f MB（配图分配：%s）",
+            language,
             result.scene_count,
             result.duration_sec,
             result.bytes_written / 1024 / 1024,
@@ -138,7 +246,67 @@ class Pipeline:
             },
         }
 
-    async def rebuild_video(self, episode_id: str) -> dict[str, Any]:
+    # ---------- 语言版本 ----------
+
+    def _version_records(self, record: dict[str, Any]) -> dict[str, Any]:
+        return dict(record.get("versions") or {})
+
+    def available_languages(self, record: dict[str, Any]) -> list[str]:
+        """这一集**实际有**哪些语言版本。
+
+        不能拿服务端配置的语言列表来判：那会让「服务端支持中英双语」
+        被误当成「每一集都有英文版」，于是老数据上 `?lang=en` 会**静默返回中文内容**
+        （200 + 主语言），前端以为切成功了，其实什么都没变。
+        """
+        versions = self._version_records(record)
+        if versions:
+            return list(versions.keys())
+        # 有产物但没有 versions = 双语之前生成的集，只有主语言那一版
+        if record.get("script") or record.get("audio_path"):
+            return [language_plan(record.get("options") or {}, self.settings)[0]]
+        # 还在生成中的新任务：按创建时请求的语言回答，
+        # 这样 `?lang=en` 得到的是「还没有音频」而不是「没有这个语言版本」
+        return language_plan(record.get("options") or {}, self.settings)[1]
+
+    def resolve_version(
+        self, record: dict[str, Any], language: str | None
+    ) -> tuple[str, dict[str, Any]]:
+        """把 `?lang=` 解析成 (语言, 该版本记录)。
+
+        缺省取主语言。**老数据没有 versions**（双语之前生成的集），
+        这时把顶层字段当成主语言的那一版 —— 不必迁移就能继续用。
+        """
+        options = record.get("options") or {}
+        primary, _ = language_plan(options, self.settings)
+        versions = self._version_records(record)
+        available = self.available_languages(record)
+
+        if language:
+            lang = language.strip().lower()
+            if lang not in available:
+                raise LanguageNotFound(f"这一集没有 {lang} 版本")
+        else:
+            lang = primary if primary in available else (available[0] if available else primary)
+
+        if lang in versions:
+            return lang, versions[lang]
+
+        # 兼容路径：双语之前生成的集，顶层就是唯一那一版
+        return lang, {
+            "language": lang,
+            "paper_meta": record.get("paper_meta"),
+            "analysis": record.get("analysis"),
+            "script": record.get("script"),
+            "illustration": record.get("illustration"),
+            "audio_path": record.get("audio_path"),
+            "audio_duration_sec": record.get("audio_duration_sec"),
+            "audio_bytes": record.get("audio_bytes"),
+            "timings": record.get("timings") or [],
+            "video_path": record.get("video_path"),
+            "video": record.get("video"),
+        }
+
+    async def rebuild_video(self, episode_id: str, language: str | None = None) -> dict[str, Any]:
         """用现有素材重新合成视频（配图被人工校正后用）。
 
         关键点：**复用上次的画面分配，不再问模型**。因为
@@ -146,24 +314,28 @@ class Pipeline:
         2) 主题图会被重新生成一遍（4 次模型调用 + 几十秒），纯属浪费
 
         音频、脚本、解读都不动 —— 只重新渲染幻灯片并编码。
+        双语集要指定 `language`，否则只重合成主语言那一版。
         """
         record = self.db.get_episode(episode_id)
         if not record:
             raise VideoError("播客不存在")
 
-        stored = record.get("video") or {}
-        timings_raw = record.get("timings") or []
-        script = record.get("script") or {}
+        options = record.get("options") or {}
+        primary, _ = language_plan(options, self.settings)
+        lang, version = self.resolve_version(record, language)
+
+        stored = version.get("video") or {}
+        timings_raw = version.get("timings") or []
+        script = version.get("script") or {}
         segments = script.get("segments") or []
 
         if not timings_raw or not segments:
             raise VideoError("缺少脚本或时间轴，无法重新合成")
-        if not record.get("audio_path") or not Path(record["audio_path"]).exists():
+        audio_path = version.get("audio_path")
+        if not audio_path or not Path(audio_path).exists():
             raise VideoError("音频已丢失，无法重新合成")
         if not ffmpeg_available():
             raise VideoError("系统未安装 ffmpeg，无法合成视频")
-
-        from .podcast_tts import RoundTiming
 
         timings = [
             RoundTiming(
@@ -175,34 +347,45 @@ class Pipeline:
             for i, t in enumerate(timings_raw)
         ]
 
+        output_path = self.settings.video_dir / video_filename(episode_id, lang, primary)
         result = await asyncio.to_thread(
             compose_video,
             segments=segments,
             timings=timings,
-            audio_path=Path(record["audio_path"]),
-            audio_duration=float(record.get("audio_duration_sec") or 0.0),
+            audio_path=Path(audio_path),
+            audio_duration=float(version.get("audio_duration_sec") or 0.0),
             cover_path=record.get("cover_path"),
             figures=record.get("figures") or [],
-            illustration_png=(record.get("illustration") or {}).get("png_path"),
-            work_dir=self.settings.video_work_dir / episode_id,
-            output_path=self.settings.video_dir / f"{episode_id}.mp4",
+            illustration_png=(version.get("illustration") or {}).get("png_path")
+            or (record.get("illustration") or {}).get("png_path"),
+            work_dir=self.settings.video_work_dir / episode_id / lang,
+            output_path=output_path,
             title=record.get("title") or "论文解读",
             llm=None,
-            analysis=record.get("analysis") or {},
+            analysis=version.get("analysis") or {},
             preset_scenes=stored.get("scenes") or None,
             preset_assets=stored.get("assets") or None,
         )
 
-        fields = {
-            "video_path": str(result.video_path),
-            "video": {
-                **result.to_dict(),
-                "url": f"/api/episodes/{episode_id}/video",
-            },
-        }
+        video = {**result.to_dict(), "url": f"/api/episodes/{episode_id}/video"}
+        fields: dict[str, Any] = {"video": video}
+
+        # 回写：双语集写进对应语言那一版；主语言同时镜像到顶层字段
+        if self._version_records(record) or lang != primary:
+            versions = self._version_records(record)
+            entry = dict(versions.get(lang) or {})
+            entry["language"] = lang
+            entry["video_path"] = str(result.video_path)
+            entry["video"] = video
+            versions[lang] = entry
+            fields["versions"] = versions
+        if lang == primary or not self._version_records(record):
+            fields["video_path"] = str(result.video_path)
+
         self.db.update_episode(episode_id, **fields)
         logger.info(
-            "视频已重新合成：%d 帧 / %.1f 秒（复用画面分配：%s）",
+            "视频已重新合成（%s）：%d 帧 / %.1f 秒（复用画面分配：%s）",
+            lang,
             result.scene_count,
             result.duration_sec,
             result.assignment,
@@ -256,24 +439,24 @@ class Pipeline:
         options = episode.get("options") or {}
         duration_min = int(options.get("duration_min") or 5)
         level = str(options.get("level") or "intro")
-        voice_a = options.get("voice_a") or self.settings.default_voice_a
-        voice_b = options.get("voice_b") or self.settings.default_voice_b
         speech_rate = int(self.settings.podcast_speech_rate or 0)
+        primary, languages = language_plan(options, self.settings)
 
-        # 正片之外的固定开销：服务端音乐（默认关）+ 社区品牌话术。
-        # 要从时长预算里扣掉，否则正文写满之后整期就超时了。
-        brand_chars = (
-            branding.brand_char_count() if self.settings.enable_brand_intro_outro else 0
-        )
-        padding_sec = prompts.compute_padding_sec(
-            head_music=self.settings.podcast_head_music,
-            tail_music=self.settings.podcast_tail_music,
-            brand_chars=brand_chars,
-            speech_rate=speech_rate,
-        )
+        # 每个语言版本分到一段进度区间。双语时不能都从 35 开始 ——
+        # 那会让进度条倒着走（中文跑完 75，英文又回 35），看起来像卡死重来。
+        slab = (99 - 15) / max(len(languages), 1)
+
+        def _slab(index: int) -> tuple[int, int, int, int]:
+            start = 15 + index * slab
+            return (
+                int(start),
+                int(start + slab * 0.20),
+                int(start + slab * 0.40),
+                int(start + slab),
+            )
 
         try:
-            # ---- 1. 解析 ----
+            # ---- 1. 解析（跨语言共用：同一份 PDF，封面与配图只提一次）----
             self._set_stage(episode_id, "parsing")
             paper_text, pdf_bytes = self.resolve_paper(episode)
 
@@ -306,122 +489,211 @@ class Pipeline:
             if not title_hint or title_hint == "处理中":
                 title_hint = guess_title(paper_text, fallback=title_hint or "未命名论文")
 
-            # ---- 2. 解读 ----
-            self._set_stage(episode_id, "analyzing", title=title_hint or "未命名论文")
-            paper_meta, analysis = self.llm.analyze_paper(paper_text, title_hint=title_hint)
+            versions: dict[str, Any] = {}
+            title = title_hint
+            last_audio_path: Path | None = None
 
-            # 用户显式指定的标题优先；否则采用模型从正文里认出的正式标题
-            title_locked = bool(options.get("title_locked"))
-            if paper_meta.get("title") and not title_locked:
-                title_hint = paper_meta["title"]
-            if not paper_meta.get("arxiv_id"):
-                paper_meta["arxiv_id"] = guess_arxiv_id(episode.get("source_ref") or "")
+            # ---- 2~5. 逐语言：解读 → 脚本 → 音频 → 视频 ----
+            for position, language in enumerate(languages):
+                analyze_at, script_at, synth_at, slab_end = _slab(position)
+                suffix = LANGUAGE_SUFFIX.get(language, f"（{language}）")
+                first = position == 0
 
-            self.db.update_episode(
-                episode_id,
-                title=title_hint or "未命名论文",
-                paper_meta=paper_meta,
-                analysis=analysis,
-            )
-
-            # 生成信息图。text 来源没有 PDF，就用它当封面。
-            illustration = generate_illustration(
-                self.llm,
-                analysis,
-                paper_meta,
-                self.settings.illustration_dir,
-                episode_id,
-            )
-            update_fields: dict[str, Any] = {
-                "illustration": illustration.to_dict()
-            }
-            if not cover_fields and illustration.png_path:
-                update_fields["cover_path"] = illustration.png_path
-                update_fields["cover_width"] = illustration.width
-                update_fields["cover_height"] = illustration.height
-            self.db.update_episode(episode_id, **update_fields)
-
-            # ---- 3. 脚本 ----
-            self._set_stage(episode_id, "scripting")
-            script = self.llm.generate_script(
-                analysis,
-                paper_meta,
-                duration_min=duration_min,
-                level=level,
-                speech_rate=speech_rate,
-                padding_sec=padding_sec,
-            )
-
-            # 注入社区品牌片头/片尾。
-            # 放在长度修复**之后**：它们是固定开销，不该被模型扩写或精简碰到；
-            # 注入后再重算字数与时长，让 UI 上显示的是整期（含片头片尾）的预估。
-            if self.settings.enable_brand_intro_outro:
-                body = script["segments"]
-                merged = [
-                    {k: v for k, v in seg.items() if k != "round"}
-                    for seg in branding.intro_segments() + body + branding.outro_segments()
-                ]
-                script = build_script_payload(
-                    merged,
-                    speech_rate=speech_rate,
-                    padding_sec=prompts.compute_padding_sec(
-                        head_music=self.settings.podcast_head_music,
-                        tail_music=self.settings.podcast_tail_music,
-                        speech_rate=speech_rate,
-                    ),
-                )
-                logger.info(
-                    "已注入品牌片头片尾：正片 %d 段 → 整期 %d 段",
-                    len(body),
-                    len(script["segments"]),
-                )
-
-            self.db.update_episode(episode_id, script=script)
-
-            # ---- 4. 合成 ----
-            self._set_stage(episode_id, "synthesizing")
-            audio_path = self.settings.audio_dir / f"{episode_id}.mp3"
-
-            def on_round(index: int, speaker: str) -> None:
-                total = max(len(script["segments"]), 1)
-                # 合成阶段占 75 → 99 的进度区间
-                progress = 75 + int(24 * (index + 1) / total)
-                self.db.update_episode(
+                # ---- 解读 ----
+                self._db_stage(
                     episode_id,
-                    progress=min(progress, 99),
-                    stage_label=f"正在合成播客音频（第 {index + 1}/{total} 段）",
+                    "analyzing",
+                    analyze_at,
+                    f"正在深度解读{suffix}",
+                    **({"title": title_hint or "未命名论文"} if first else {}),
+                )
+                paper_meta, analysis = self.llm.analyze_paper(
+                    paper_text, title_hint=title_hint, language=language
                 )
 
-            result = await self.tts.synthesize(
-                segments=script["segments"],
-                voice_a=voice_a,
-                voice_b=voice_b,
-                output_path=audio_path,
-                on_round=on_round,
-                speech_rate=speech_rate,
-            )
+                # 用户显式指定的标题优先；否则采用模型从正文里认出的正式标题。
+                # 标题只认**主语言**那一版：它是这一集的对外名字。
+                if first:
+                    title_locked = bool(options.get("title_locked"))
+                    if paper_meta.get("title") and not title_locked:
+                        title_hint = paper_meta["title"]
+                    title = title_hint or "未命名论文"
+                else:
+                    # 非主语言版本沿用主语言的标题，避免列表/分享链接出现两个名字
+                    paper_meta = {**paper_meta, "title": title_hint or paper_meta.get("title")}
+                if not paper_meta.get("arxiv_id"):
+                    paper_meta["arxiv_id"] = guess_arxiv_id(episode.get("source_ref") or "")
 
-            # 先把音频和逐段时序落库——即使视频合成失败，音频也已经可用了
-            self.db.update_episode(
-                episode_id,
-                audio_path=str(result.audio_path),
-                audio_duration_sec=result.duration_sec,
-                audio_bytes=result.bytes_written,
-                podcast_task_id=result.task_id,
-                finished_round=result.finished_round,
-                timings=[t.to_dict() for t in result.timings],
-            )
+                # ---- 信息图（跟随语言）----
+                illustration = generate_illustration(
+                    self.llm,
+                    analysis,
+                    paper_meta,
+                    self.settings.illustration_dir,
+                    episode_id if first else f"{episode_id}.{language}",
+                    language=language,
+                )
 
-            # ---- 5. 视频 ----
-            video_fields = await self._compose_video_safely(
-                episode_id,
-                segments=script["segments"],
-                timings=result.timings,
-                audio_path=result.audio_path,
-                audio_duration=result.duration_sec or 0.0,
-                title=title_hint or "论文解读",
-                analysis=analysis,
-            )
+                version: dict[str, Any] = {
+                    "language": language,
+                    "paper_meta": paper_meta,
+                    "analysis": analysis,
+                    "illustration": illustration.to_dict(),
+                }
+
+                # text 来源没有 PDF 首页可当封面，就用**主语言**那张信息图兜底。
+                # 封面是跨语言共用的，不能让英文版的信息图把中文版的封面顶掉。
+                if first and not cover_fields and illustration.png_path:
+                    cover_fields = {
+                        "cover_path": illustration.png_path,
+                        "cover_width": illustration.width,
+                        "cover_height": illustration.height,
+                    }
+                    self.db.update_episode(episode_id, **cover_fields)
+
+                # ---- 脚本 ----
+                self._db_stage(episode_id, "scripting", script_at, f"正在生成播客脚本{suffix}")
+                brand_chars = (
+                    branding.brand_char_count(language)
+                    if self.settings.enable_brand_intro_outro
+                    else 0
+                )
+                padding_sec = prompts.compute_padding_sec(
+                    head_music=self.settings.podcast_head_music,
+                    tail_music=self.settings.podcast_tail_music,
+                    brand_chars=brand_chars,
+                    speech_rate=speech_rate,
+                    language=language,
+                )
+                script = self.llm.generate_script(
+                    analysis,
+                    paper_meta,
+                    duration_min=duration_min,
+                    level=level,
+                    speech_rate=speech_rate,
+                    padding_sec=padding_sec,
+                    language=language,
+                )
+
+                # 单轮超长的发言要切开 —— TTS 接口对单个 round 的字符数有硬上限，
+                # 越界会直接报 40000010 并让整条流水线失败重跑（代价很大）。
+                # 英文尤其容易撞线：一段 50 个词就有 300 字符上下。
+                body = split_long_segments(script["segments"])
+                if len(body) != len(script["segments"]):
+                    logger.info(
+                        "单轮超长发言已切分%s：%d 段 → %d 段",
+                        suffix,
+                        len(script["segments"]),
+                        len(body),
+                    )
+
+                # 注入社区品牌片头/片尾。
+                # 放在长度修复**之后**：它们是固定开销，不该被模型扩写或精简碰到；
+                # 注入后再重算字数与时长，让 UI 上显示的是整期（含片头片尾）的预估。
+                if self.settings.enable_brand_intro_outro:
+                    merged = [
+                        {k: v for k, v in seg.items() if k != "round"}
+                        for seg in branding.intro_segments(language)
+                        + body
+                        + branding.outro_segments(language)
+                    ]
+                    script = build_script_payload(
+                        merged,
+                        speech_rate=speech_rate,
+                        padding_sec=prompts.compute_padding_sec(
+                            head_music=self.settings.podcast_head_music,
+                            tail_music=self.settings.podcast_tail_music,
+                            speech_rate=speech_rate,
+                            language=language,
+                        ),
+                        language=language,
+                    )
+                    logger.info(
+                        "已注入品牌片头片尾%s：正片 %d 段 → 整期 %d 段",
+                        suffix,
+                        len(body),
+                        len(script["segments"]),
+                    )
+                elif len(body) != len(script["segments"]):
+                    # 没开品牌话术，但切过分：也要重建一遍让 round / 字数 / 时长跟上
+                    script = build_script_payload(
+                        [{k: v for k, v in seg.items() if k != "round"} for seg in body],
+                        speech_rate=speech_rate,
+                        padding_sec=padding_sec,
+                        language=language,
+                    )
+
+                version["script"] = script
+
+                # ---- 音频 ----
+                self._db_stage(episode_id, "synthesizing", synth_at, f"正在合成播客音频{suffix}")
+                voice_a, voice_b = self._voices_for(language, options, primary)
+                audio_path = self.settings.audio_dir / audio_filename(
+                    episode_id, language, primary
+                )
+
+                def on_round(index: int, speaker: str, _s=script, _l=language, _e=slab_end) -> None:
+                    total = max(len(_s["segments"]), 1)
+                    progress = synth_at + int((_e - synth_at) * (index + 1) / total)
+                    self.db.update_episode(
+                        episode_id,
+                        progress=min(progress, 99),
+                        stage_label=(
+                            f"正在合成播客音频{suffix}（第 {index + 1}/{total} 段）"
+                        ),
+                    )
+
+                result = await self.tts.synthesize(
+                    segments=script["segments"],
+                    voice_a=voice_a,
+                    voice_b=voice_b,
+                    output_path=audio_path,
+                    on_round=on_round,
+                    speech_rate=speech_rate,
+                )
+                last_audio_path = result.audio_path
+
+                version.update(
+                    {
+                        "audio_path": str(result.audio_path),
+                        "audio_duration_sec": result.duration_sec,
+                        "audio_bytes": result.bytes_written,
+                        "podcast_task_id": result.task_id,
+                        "finished_round": result.finished_round,
+                        "timings": [t.to_dict() for t in result.timings],
+                    }
+                )
+                versions[language] = version
+
+                # 每一版单独落库：主语言那一版同时镜像到顶层字段，
+                # 这样「音频已经好了」在双语模式下也是第一时间可见的。
+                mirror = self._mirror_fields(language, primary, version)
+                self.db.update_episode(episode_id, versions=versions, **mirror)
+
+                # ---- 视频 ----
+                video_fields = await self._compose_video_safely(
+                    episode_id,
+                    segments=script["segments"],
+                    timings=result.timings,
+                    audio_path=result.audio_path,
+                    audio_duration=result.duration_sec or 0.0,
+                    title=title,
+                    analysis=analysis,
+                    language=language,
+                    output_path=self.settings.video_dir
+                    / video_filename(episode_id, language, primary),
+                    illustration_png=illustration.png_path,
+                )
+                if video_fields:
+                    version.update(
+                        {
+                            "video_path": video_fields.get("video_path"),
+                            "video": video_fields.get("video"),
+                        }
+                    )
+                    versions[language] = version
+                    mirror = self._mirror_fields(language, primary, version)
+                    self.db.update_episode(episode_id, versions=versions, **mirror)
 
             # ---- 6. 完成 ----
             self.db.update_episode(
@@ -430,9 +702,8 @@ class Pipeline:
                 progress=100,
                 stage_label="已完成",
                 error=None,
-                **video_fields,
             )
-            logger.info("任务 %s 完成：%s", episode_id, result.audio_path)
+            logger.info("任务 %s 完成：%s（语言：%s）", episode_id, last_audio_path, languages)
             return True
 
         except (IngestError, LLMError, PodcastTTSError) as exc:
@@ -449,15 +720,26 @@ class Pipeline:
 # --------------------------------------------------------------------------
 
 
-def render_script_text(episode: dict[str, Any]) -> str:
+def render_script_text(episode: dict[str, Any], language: str = "zh") -> str:
     script = episode.get("script") or {}
     segments = script.get("segments") or []
     if not segments:
-        return "（暂无脚本）"
+        return "（暂无脚本）" if language == "zh" else "(no script yet)"
 
-    lines = [f"《{episode.get('title') or '未命名论文'}》", "双人播客脚本", "=" * 40, ""]
+    labels = ("Host A", "Host B") if language == "en" else ("主播A", "主播B")
+    if language == "en":
+        head = [
+            f"《{episode.get('title') or 'Untitled paper'}》",
+            "Two-host podcast script",
+            "=" * 40,
+            "",
+        ]
+    else:
+        head = [f"《{episode.get('title') or '未命名论文'}》", "双人播客脚本", "=" * 40, ""]
+
+    lines = list(head)
     for segment in segments:
-        speaker = "主播A" if segment.get("speaker") == "A" else "主播B"
+        speaker = labels[0] if segment.get("speaker") == "A" else labels[1]
         lines.append(f"【{speaker}】{segment.get('text', '')}")
         lines.append("")
     return "\n".join(lines)
@@ -479,40 +761,78 @@ def _markdown_section(heading: str, body: Any) -> list[str]:
     return [f"## {heading}", "", str(body), ""]
 
 
-def render_analysis_markdown(episode: dict[str, Any]) -> str:
+# 解读文档的标题/字段名。英文版导出的文档要是英文的 ——
+# 一份全中文标题配英文正文的 Markdown 很别扭。
+_DOC_LABELS = {
+    "zh": {
+        "authors": "作者",
+        "published": "发表",
+        "keywords": "关键词",
+        "abstract": "摘要",
+        "sections": (
+            ("研究背景", "background"),
+            ("核心创新点", "innovations"),
+            ("研究方法", "method"),
+            ("实验结果", "experiments"),
+            ("核心结论", "conclusion"),
+            ("存在不足", "limitations"),
+            ("行业应用价值", "value"),
+            ("未来研究方向", "future"),
+        ),
+        "untitled": "未命名论文",
+        "footer": "*播客脚本 {count} 字，预计时长约 {minutes:.1f} 分钟*",
+        "unit": "字",
+    },
+    "en": {
+        "authors": "Authors",
+        "published": "Published",
+        "keywords": "Keywords",
+        "abstract": "Abstract",
+        "sections": (
+            ("Background", "background"),
+            ("Key contributions", "innovations"),
+            ("Method", "method"),
+            ("Experiments", "experiments"),
+            ("Conclusion", "conclusion"),
+            ("Limitations", "limitations"),
+            ("Why it matters", "value"),
+            ("Open questions", "future"),
+        ),
+        "untitled": "Untitled paper",
+        "footer": "*Script: {count} words, estimated runtime ~{minutes:.1f} min*",
+        "unit": "words",
+    },
+}
+
+
+def render_analysis_markdown(episode: dict[str, Any], language: str = "zh") -> str:
+    labels = _DOC_LABELS.get(language, _DOC_LABELS["zh"])
     meta = episode.get("paper_meta") or {}
     analysis = episode.get("analysis") or {}
-    title = episode.get("title") or meta.get("title") or "未命名论文"
+    title = episode.get("title") or meta.get("title") or labels["untitled"]
 
     out: list[str] = [f"# {title}", ""]
 
     facts: list[str] = []
     if meta.get("authors"):
-        facts.append(f"**作者**：{', '.join(meta['authors'])}")
+        facts.append(f"**{labels['authors']}**：{', '.join(meta['authors'])}")
     if meta.get("venue") or meta.get("year"):
-        facts.append(f"**发表**：{meta.get('venue') or ''} {meta.get('year') or ''}".strip())
+        facts.append(
+            f"**{labels['published']}**：{meta.get('venue') or ''} {meta.get('year') or ''}".strip()
+        )
     if meta.get("arxiv_id"):
         facts.append(f"**arXiv**：[{meta['arxiv_id']}](https://arxiv.org/abs/{meta['arxiv_id']})")
     if meta.get("keywords"):
-        facts.append(f"**关键词**：{', '.join(meta['keywords'])}")
+        facts.append(f"**{labels['keywords']}**：{', '.join(meta['keywords'])}")
     if facts:
         out.extend(facts)
         out.append("")
 
     if meta.get("abstract"):
-        out.extend(["## 摘要", "", meta["abstract"], ""])
+        out.extend([f"## {labels['abstract']}", "", meta["abstract"], ""])
 
-    for heading, body in (
-        ("研究背景", analysis.get("background")),
-        ("核心创新点", analysis.get("innovations")),
-        ("研究方法", analysis.get("method")),
-        ("实验结果", analysis.get("experiments")),
-        ("核心结论", analysis.get("conclusion")),
-        ("存在不足", analysis.get("limitations")),
-        ("行业应用价值", analysis.get("value")),
-        ("未来研究方向", analysis.get("future")),
-    ):
-        out.extend(_markdown_section(heading, body))
+    for heading, key in labels["sections"]:
+        out.extend(_markdown_section(heading, analysis.get(key)))
 
     script = episode.get("script") or {}
     if script.get("segments"):
@@ -520,7 +840,9 @@ def render_analysis_markdown(episode: dict[str, Any]) -> str:
         out += [
             "---",
             "",
-            f"*播客脚本 {script.get('word_count', 0)} 字，预计时长约 {minutes:.1f} 分钟*",
+            labels["footer"].format(
+                count=script.get("word_count", 0), minutes=minutes
+            ),
             "",
         ]
 

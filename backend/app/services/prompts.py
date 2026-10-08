@@ -48,17 +48,105 @@ LEVEL_GUIDE: dict[str, str] = {
     ),
 }
 
+# 英文版的难度档说明（英文输出配英文说明，见 _build_script_messages_en）
+LEVEL_GUIDE_EN: dict[str, str] = {
+    "intro": (
+        "For a smart listener outside the field. No unexplained jargon; explain every "
+        "core mechanism with an everyday analogy; describe any formula in plain words "
+        "instead of symbols. The goal: a non-specialist can follow it and repeat back "
+        "what the paper actually did."
+    ),
+    "advanced": (
+        "For a graduate student in the same field. Standard terminology is fine, but "
+        "gloss each term the first time it appears; discuss technical trade-offs "
+        "without rebuilding the basics from scratch."
+    ),
+    "expert": (
+        "For researchers working in this direction. Go straight into implementation "
+        "detail, differences from contemporaneous work, and the rigour of the "
+        "experimental setup; point at questionable assumptions, baselines or metrics. "
+        "Do not spend time on background."
+    ),
+}
 
-def effective_rate(speech_rate: int = 0) -> float:
-    """把语速档位换算成实际语速（字/分钟）。
 
-    服务端的 speech_rate 是百分比：-50 = 0.5x，100 = 2.0x。
-    字数预算必须跟着它联动，否则调慢语速后实际时长会超出目标。
+# 语言标识
+LANGUAGES = ("zh", "en")
+
+LANGUAGE_LABEL = {"zh": "简体中文", "en": "English"}
+
+# 英文播客的语速。中文按「字/分钟」算，英文按「词/分钟」算 ——
+# 两者量纲不同，不能用同一个常量。
+#
+# 这个数字是**实测反推**的，不是「英文播客常识」：真实跑完一期 3 分钟英文播客，
+# 正文 496 词对应 211.0 秒语音（总时长 238.2 秒减去 27.2 秒品牌片头片尾），
+# 得 141 词/分钟。早先按 150 估，估出来的时长比实际短 6%。
+WORDS_PER_MINUTE_EN = 141
+
+# 豆包播客 TTS 对**单个 round 的文本长度**有硬上限。实测越界会被直接拒绝：
+#   40000010 "PodcastTTS invalid param, errMsg: nlp_texts round text length
+#             309 is greater than max char length 300"
+# 注意它数的是**字符**，不是词、也不是字：
+#   中文一段 120 字 ≈ 120 字符，几乎撞不到上限；
+#   英文一段 50 个词就有 300 字符上下 —— 同样的「一段话」在英文里字符数多 5 倍。
+# 所以双语上线后英文脚本第一个撞线。取 280 留出余量。
+MAX_ROUND_CHARS = 280
+
+# 各语言的「AI 腔」负面清单。中文那套（综上所述/值得注意的是）
+# 在英文输出里毫无意义，必须换成英文的对应物。
+AI_CLICHES = {
+    "zh": ["首先", "其次", "综上所述", "值得注意的是", "让我们深入探讨", "不难发现", "总而言之"],
+    "en": [
+        "In conclusion",
+        "It's worth noting",
+        "It is worth noting",
+        "Let's dive in",
+        "Let's dive into",
+        "delve into",
+        "Furthermore",
+        "Moreover",
+        "Additionally",
+        "In today's rapidly evolving",
+        "game-changer",
+        "unlock the potential",
+        "In summary",
+    ],
+}
+
+
+def effective_rate(speech_rate: int = 0, language: str = "zh") -> float:
+    """把语速档位换算成实际语速。
+
+    中文是字/分钟，英文是词/分钟 —— 两者量纲不同，不能用同一个常量。
     """
-    return CHARS_PER_MINUTE * (1.0 + speech_rate / 100.0)
+    base = WORDS_PER_MINUTE_EN if language == "en" else CHARS_PER_MINUTE
+    return base * (1.0 + speech_rate / 100.0)
 
 
-def brand_padding_sec(brand_chars: int, speech_rate: int = 0) -> float:
+def output_language_rule(language: str) -> str:
+    """给模型的输出语言要求，并附上该语言的套话负面清单。
+
+    英文版这条规则也必须用英文写：整个 prompt 里夹杂中文指令，
+    模型偶尔会跟着中文指令的语感走（实测把「120 字」当成 120 个词）。
+    """
+    if language == "en":
+        cliches = ", ".join(f'"{c}"' for c in AI_CLICHES["en"])
+        return (
+            "\n\n【Output language】Write everything in **English**.\n"
+            "Keep technical terms in their original English form; do not translate them.\n"
+            f"These podcast clichés are banned: {cliches}."
+        )
+    cliches = "、".join(f"「{c}」" for c in AI_CLICHES["zh"])
+    return (
+        "\n\n【输出语言】全部输出**简体中文**。\n"
+        f"禁止出现这些套话：{cliches}。"
+    )
+
+
+
+
+
+def brand_padding_sec(brand_chars: int, speech_rate: int = 0, language: str = "zh") -> float:
     """品牌片头/片尾话术占用的时长。
 
     它们和音乐一样是**固定开销**：每期都有、不随正文字数变化。
@@ -66,11 +154,16 @@ def brand_padding_sec(brand_chars: int, speech_rate: int = 0) -> float:
     """
     if brand_chars <= 0:
         return 0.0
-    return brand_chars / effective_rate(speech_rate) * 60
+    return brand_chars / effective_rate(speech_rate, language) * 60
 
 
 def compute_padding_sec(
-    *, head_music: bool, tail_music: bool, brand_chars: int = 0, speech_rate: int = 0
+    *,
+    head_music: bool,
+    tail_music: bool,
+    brand_chars: int = 0,
+    speech_rate: int = 0,
+    language: str = "zh",
 ) -> float:
     """正片之外的所有固定开销（音乐 + 品牌话术）。"""
     total = 0.0
@@ -81,23 +174,27 @@ def compute_padding_sec(
             if (head_music and tail_music)
             else (0.41 if head_music else 0.59)
         )
-    total += brand_padding_sec(brand_chars, speech_rate)
+    total += brand_padding_sec(brand_chars, speech_rate, language)
     return total
 
 
-def target_chars(duration_min: int, speech_rate: int = 0, padding_sec: float = 0.0) -> int:
+def target_chars(
+    duration_min: int, speech_rate: int = 0, padding_sec: float = 0.0, language: str = "zh"
+) -> int:
     """把目标时长换算成正文字数。
 
     要扣掉正片之外的固定开销（音乐、品牌话术），
     否则估出来的字数偏多、实际时长会超目标。
     """
     speech_seconds = max(duration_min * 60 - padding_sec, 30.0)
-    return int(speech_seconds / 60 * effective_rate(speech_rate))
+    return int(speech_seconds / 60 * effective_rate(speech_rate, language))
 
 
-def estimate_duration_sec(chars: int, speech_rate: int = 0, padding_sec: float = 0.0) -> int:
-    """字数 → 预期音频总时长（含音乐与品牌话术）。"""
-    return round(chars / effective_rate(speech_rate) * 60 + padding_sec)
+def estimate_duration_sec(
+    chars: int, speech_rate: int = 0, padding_sec: float = 0.0, language: str = "zh"
+) -> int:
+    """字数/词数 → 预期音频总时长（含音乐与品牌话术）。"""
+    return round(chars / effective_rate(speech_rate, language) * 60 + padding_sec)
 
 
 # --------------------------------------------------------------------------
@@ -117,7 +214,7 @@ ANALYSIS_SYSTEM = """你是资深学术播客制作人，长期为科研听众�
 - 创新点要指出「相对于什么」。孤立地说「提出了X」没有意义，要说「相比A方法，X改进了B」。
 - 不足要从科研视角挑刺：假设是否过强、基线是否公平、评估指标是否片面、\
 实验规模是否足以支撑结论、是否有未讨论的失败场景。
-- 所有文本字段使用简体中文，学术但通顺，不用 Markdown 语法（不要 **加粗**、# 标题）。
+- 所有文本字段使用要求的输出语言（见下），学术但通顺，不用 Markdown 语法（不要 **加粗**、# 标题）。
 
 严格输出 JSON，不要输出任何 JSON 之外的解释文字。格式：
 
@@ -156,16 +253,19 @@ ANALYSIS_SYSTEM = """你是资深学术播客制作人，长期为科研听众�
 }
 
 字数要求：innovations / limitations / future 各 3-5 条；其余字段按上述句数。
-如果论文信息不足以支撑某个字段，该字段填「论文未涉及」或空数组。"""
+如果论文信息不足以支撑某个字段，该字段填「论文未涉及」（英文版填 "Not covered in the paper."）
+或空数组。"""
 
 
-def build_analysis_messages(paper_text: str, *, title_hint: str = "") -> list[dict[str, str]]:
+def build_analysis_messages(
+    paper_text: str, *, title_hint: str = "", language: str = "zh"
+) -> list[dict[str, str]]:
     user_parts = []
     if title_hint:
         user_parts.append(f"（预解析标题，仅供参考，以正文为准：{title_hint}）")
     user_parts.append("以下是论文正文（已去除参考文献与致谢）：\n\n" + paper_text)
     return [
-        {"role": "system", "content": ANALYSIS_SYSTEM},
+        {"role": "system", "content": ANALYSIS_SYSTEM + output_language_rule(language)},
         {"role": "user", "content": "\n".join(user_parts)},
     ]
 
@@ -214,11 +314,72 @@ B不是捧哏，B要真的会问出听众心里的疑问，偶尔可以说「这
 }
 
 - speaker 只能是 "A" 或 "B"。
-- 每个 segment 是**一次连续发言**，长度 30-120 字。不要把一个意思拆成好几个短\
-segment，也不要写超过 150 字的长段落（真人不会一口气说那么长）。
+- 每个 segment 是**一次连续发言**，长度 30-120 字，且**绝不能超过 260 个字符**\
+（语音合成接口会对单轮超长的发言直接报错，而且真人也不会一口气说那么长）。\
+不要把一个意思拆成好几个短 segment，也不要把好几轮并成一大段。
 - A 和 B 大体交替，但允许 A 连续说两段（展开一个复杂点），也允许 B 连续追问。
-- 不要输出 round 字段，后端会自行编号。
-- 全部使用简体中文。"""
+- 不要输出 round 字段，后端会自行编号。"""
+
+# 英文版的格式段。英文不能用「30-120 字」这种说法：模型会把「字」理解成「词」，
+# 于是一段写出 50 个词、300 多字符，直接超过 TTS 的单轮上限。
+SCRIPT_SYSTEM_EN = """You are a scriptwriter for a top-tier podcast that turns research papers into
+two-host conversations. Your script must sound like two real people talking, not two
+people reading a paper out loud.
+
+【Roles】
+- Host A (the explainer): knows the paper. Explains clearly, relaxed and enthusiastic,
+  reaches for analogies unprompted.
+- Host B (the listener's voice): asks, pushes back, demands examples, steers back when
+  a thread drifts. B is not a hype man — B asks what the listener is actually wondering,
+  and may say "I don't follow" or "wait, doesn't that contradict what you just said?"
+
+【Required】
+1. Spoken language. Sentences must be sayable out loud. Short sentences. Fragments and
+   discourse markers are fine.
+2. B's questions must be specific. Never "can you elaborate?" — ask
+   "does that still hold with only a handful of examples?"
+3. After A answers, B reacts like a person: paraphrase to confirm, add something, or
+   raise a counterexample. Don't start every turn with "I see, so...".
+4. Include at least one "hard part explained": A makes a core mechanism clear with an
+   everyday analogy.
+5. Include at least one "challenge and response": B genuinely challenges a limitation
+   from the analysis, A admits the scope and explains what it means.
+6. Don't open by reading the title. Open with a line that creates curiosity. Don't end
+   with a slogan — say what the paper means for us and land it naturally.
+
+【Banned】
+- Enumeration transitions: "first / second / finally"
+- "In conclusion", "It's worth noting", "Let's dive in", "delve into", "game-changer"
+- Third-person academic distancing ("the paper states", "the authors point out") —
+  say "they", "this paper"
+- Any Markdown, bracketed asides, or parenthetical translations
+- Reading formulas aloud. Turn formulas into plain language
+- Summarising every topic. Real conversation doesn't summarise
+
+【Format】
+Output strict JSON, nothing outside the JSON:
+
+{
+  "segments": [
+    {"speaker": "A", "text": "opening line"},
+    {"speaker": "B", "text": "second turn"},
+    {"speaker": "A", "text": "third turn"}
+  ]
+}
+
+- speaker is only "A" or "B".
+- Each segment is ONE continuous turn. **HARD LIMIT: at most 280 characters per
+  segment** — the speech engine rejects any single turn longer than that. Aim for
+  15-45 words per turn; if a thought is longer, split it across two segments.
+  Never merge several turns into one long paragraph.
+- A and B mostly alternate, but A may take two turns in a row (unpacking a complex
+  point) and B may ask two questions in a row.
+- Do not output a round field; the backend numbers them."""
+
+
+def script_system(language: str) -> str:
+    """这一版的 system prompt。英文不能用中文那套格式约束（字/词的陷阱）。"""
+    return SCRIPT_SYSTEM_EN if language == "en" else SCRIPT_SYSTEM
 
 
 def build_script_messages(
@@ -229,9 +390,20 @@ def build_script_messages(
     level: str,
     speech_rate: int = 0,
     padding_sec: float = 0.0,
+    language: str = "zh",
 ) -> list[dict[str, str]]:
-    chars = target_chars(duration_min, speech_rate, padding_sec)
-    rate = effective_rate(speech_rate)
+    if language == "en":
+        return _build_script_messages_en(
+            analysis,
+            paper_meta,
+            duration_min=duration_min,
+            level=level,
+            speech_rate=speech_rate,
+            padding_sec=padding_sec,
+        )
+
+    chars = target_chars(duration_min, speech_rate, padding_sec, language)
+    rate = effective_rate(speech_rate, language)
     level_text = LEVEL_GUIDE.get(level, LEVEL_GUIDE["intro"])
     meta = paper_meta or {}
 
@@ -273,7 +445,72 @@ def build_script_messages(
 逐条念一遍——要挑最有信息量的部分展开，其余一笔带过或干脆不提。"""
 
     return [
-        {"role": "system", "content": SCRIPT_SYSTEM},
+        {"role": "system", "content": script_system(language) + output_language_rule(language)},
+        {"role": "user", "content": body},
+    ]
+
+
+def _build_script_messages_en(
+    analysis: dict[str, Any],
+    paper_meta: dict[str, Any] | None,
+    *,
+    duration_min: int,
+    level: str,
+    speech_rate: int,
+    padding_sec: float,
+) -> list[dict[str, str]]:
+    """英文版的 user brief。
+
+    必须写成英文，而且**长度单位要说 "words"**：中文版那句「正文总字数控制在
+    X-Y 字之间」在英文输出里会被模型当成词的个数，实测英文脚本因此比目标长 30%
+    （目标 382 词、实际写了 496 词，成片 238 秒 vs 目标 180 秒）。
+    """
+    words = target_chars(duration_min, speech_rate, padding_sec, "en")
+    rate = effective_rate(speech_rate, "en")
+    level_text = LEVEL_GUIDE_EN.get(level, LEVEL_GUIDE_EN["intro"])
+    meta = paper_meta or {}
+
+    brief = [
+        f"【Target length】{duration_min} minutes. These voices measured at about "
+        f"{rate:.0f} words per minute, and roughly {int(padding_sec)} seconds are taken "
+        f"by the fixed intro/outro, so the BODY must total "
+        f"{int(words * 0.92)}-{int(words * 1.05)} words. This is a hard limit — "
+        f"anything longer gets cut.",
+        f"【Depth】{level_text}",
+        f"【Paper title】{meta.get('title') or 'unknown'}",
+    ]
+    if meta.get("venue") or meta.get("year"):
+        brief.append(f"【Published】{meta.get('venue') or ''} {meta.get('year') or ''}".strip())
+
+    body = f"""Write a {duration_min}-minute two-host podcast script based on the paper analysis below.
+
+{chr(10).join(brief)}
+
+【Analysis】
+Background: {analysis.get('background', '')}
+
+Key contributions:
+{_bullets(analysis.get('innovations'))}
+
+Method: {analysis.get('method', '')}
+
+Experiments: {analysis.get('experiments', '')}
+
+Conclusion: {analysis.get('conclusion', '')}
+
+Limitations:
+{_bullets(analysis.get('limitations'))}
+
+Why it matters: {analysis.get('value', '')}
+
+Open questions:
+{_bullets(analysis.get('future'))}
+
+Output the JSON described above. Remember: this is a {duration_min}-minute episode, so do not
+walk through the analysis point by point — expand the most informative parts and drop the rest."""  # noqa: E501
+
+    return [
+        {"role": "system", "content": script_system("en") + output_language_rule("en")},
         {"role": "user", "content": body},
     ]
 
@@ -338,6 +575,7 @@ def build_expand_messages(
     *,
     current_chars: int,
     target: int,
+    language: str = "zh",
 ) -> list[dict[str, str]]:
     script_text = "\n".join(
         f"主播{'A' if seg.get('speaker') == 'A' else 'B'}：{seg.get('text', '')}"
@@ -352,7 +590,7 @@ def build_expand_messages(
 
 请输出扩写后的完整脚本 JSON（是完整替换，不是只输出新增部分）。"""
     return [
-        {"role": "system", "content": EXPAND_SYSTEM},
+        {"role": "system", "content": EXPAND_SYSTEM + output_language_rule(language)},
         {"role": "user", "content": user},
     ]
 
@@ -390,6 +628,7 @@ def build_trim_messages(
     *,
     current_chars: int,
     target: int,
+    language: str = "zh",
 ) -> list[dict[str, str]]:
     script_text = "\n".join(
         f"主播{'A' if seg.get('speaker') == 'A' else 'B'}：{seg.get('text', '')}"
@@ -406,6 +645,6 @@ def build_trim_messages(
 
 请输出精简后的完整脚本 JSON（是完整替换，不是只输出要删的部分）。"""
     return [
-        {"role": "system", "content": TRIM_SYSTEM},
+        {"role": "system", "content": TRIM_SYSTEM + output_language_rule(language)},
         {"role": "user", "content": user},
     ]

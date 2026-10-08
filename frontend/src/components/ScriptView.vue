@@ -8,10 +8,19 @@ const props = defineProps<{
   script: Script | null
   voiceA?: string | null
   voiceB?: string | null
+  /**
+   * 这一版脚本的语言。`word_count` 是「时长预算的单位数」：
+   * 中文数字符、英文数词，所以单位文案必须跟着换 ——
+   * 英文版显示「427 字」是错的（那是 427 个词）。
+   */
+  language?: 'zh' | 'en'
 }>()
 
 const meta = useMetaStore()
 const filter = ref<'all' | 'A' | 'B'>('all')
+
+/** 字数单位。界面本身是中文的，所以英文版也用「词」而不是 words。 */
+const unit = computed(() => (props.language === 'en' ? '词' : '字'))
 
 /** 从 options 里把音色 id 换成短名字，例如「大义先生」 */
 function shortVoiceName(id: string | null | undefined, fallback: string): string {
@@ -85,7 +94,7 @@ function speakerName(speaker: string): string {
 
       <div v-if="stats" class="episode-card__meta">
         <span>{{ stats.segments }} 段</span>
-        <span>约 {{ stats.wordCount }} 字</span>
+        <span>约 {{ stats.wordCount }} {{ unit }}</span>
         <span>预估 {{ stats.est }}</span>
       </div>
     </div>

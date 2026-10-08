@@ -2,10 +2,11 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { IS_MOCK, createEpisodeFromFile, createEpisodeFromText, createEpisodeFromUrl, errorMessage } from '../api'
-import type { Episode, EpisodeOptionsInput, LevelValue } from '../api'
+import type { Episode, EpisodeLanguage, EpisodeOptionsInput, LevelValue } from '../api'
 import { useMetaStore } from '../stores/meta'
 import { usePreferencesStore } from '../stores/preferences'
 import { formatBytes } from '../utils/format'
+import { LANGUAGE_OPTIONS, languagesText } from '../utils/language'
 import { LEVEL_LABELS } from '../utils/stages'
 
 type TabKey = 'pdf' | 'url' | 'text'
@@ -42,6 +43,44 @@ const level = ref<LevelValue>(prefs.preferences.level)
 const voiceA = ref<string>(prefs.preferences.voice_a)
 const voiceB = ref<string>(prefs.preferences.voice_b)
 
+/**
+ * 要生成哪些语言版本（契约 §1：新建时用 `options.languages` 指定，多选、至少一个）。
+ *
+ * 至少留一个：一个都不选时提交会变成「生成一集没有任何语言的播客」，
+ * 所以最后一个被选中的语言点不掉（按钮会给出说明，而不是静默无效）。
+ */
+const languages = ref<EpisodeLanguage[]>([...prefs.preferences.languages])
+
+const languagesHint = computed(() => {
+  if (languages.value.length > 1) {
+    return `将生成 ${languagesText(languages.value)} 两版：脚本、解读、音频、视频各自独立，配图共用一份`
+  }
+  return `只生成${languagesText(languages.value)}一版（详情页不会出现语言切换器）`
+})
+
+function toggleLanguage(language: EpisodeLanguage): void {
+  if (languages.value.includes(language)) {
+    if (languages.value.length === 1) return // 至少留一个
+    setLanguages(languages.value.filter((item) => item !== language))
+    return
+  }
+  // 保持契约里的顺序（中文在前、英文在后），而不是按点击先后
+  setLanguages(
+    LANGUAGE_OPTIONS.map((option) => option.value).filter(
+      (value) => value === language || languages.value.includes(value),
+    ),
+  )
+}
+
+/**
+ * 语言选择同时写回偏好（localStorage）：下次打开首页就是上次选的那几种语言。
+ * 时长 / 难度 / 音色仍然只在设置页保存 —— 那是原有行为，这次不动。
+ */
+function setLanguages(next: EpisodeLanguage[]): void {
+  languages.value = next
+  prefs.update({ languages: next })
+}
+
 const durations = computed(() => meta.options.durations)
 const levels = computed(() => meta.options.levels)
 
@@ -53,6 +92,7 @@ const recommendedPartner = computed(() => {
 
 const canSubmit = computed(() => {
   if (submitting.value) return false
+  if (!languages.value.length) return false // 至少选一个语言版本
   if (active.value === 'pdf') return Boolean(file.value)
   if (active.value === 'url') return url.value.trim().length > 0
   return text.value.trim().length >= 20
@@ -70,6 +110,8 @@ function options(): EpisodeOptionsInput {
     level: level.value,
     voice_a: voiceA.value,
     voice_b: voiceB.value,
+    // 契约 §1：新建时用 options.languages 指定要哪些版本
+    languages: [...languages.value],
   }
 }
 
@@ -297,6 +339,32 @@ onMounted(() => {
 
         <hr class="divider" />
 
+        <!-- 语言版本：多选、至少一个（契约 §1「新建时用 options.languages 指定要哪些版本」） -->
+        <div class="field">
+          <span class="field__label">语言版本（至少选一个）</span>
+          <div class="chips" role="group" aria-label="要生成的语言版本">
+            <button
+              v-for="option in LANGUAGE_OPTIONS"
+              :key="option.value"
+              type="button"
+              class="chip"
+              :class="{ 'is-active': languages.includes(option.value) }"
+              :aria-pressed="languages.includes(option.value)"
+              :title="
+                languages.length === 1 && languages.includes(option.value)
+                  ? '至少保留一个语言版本'
+                  : option.label
+              "
+              @click="toggleLanguage(option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
+          <span class="field__hint">{{ languagesHint }}</span>
+        </div>
+
+        <hr class="divider" />
+
         <div class="form-grid">
           <div class="field">
             <label class="field__label" for="voice-a">主播A（主讲）</label>
@@ -343,7 +411,7 @@ onMounted(() => {
 
     <div class="row row--between" style="margin-top: 26px">
       <p class="section__hint" style="margin: 0">
-        当前参数：{{ duration }} 分钟 · {{ LEVEL_LABELS[level] }} ·
+        当前参数：{{ duration }} 分钟 · {{ LEVEL_LABELS[level] }} · {{ languagesText(languages) }} ·
         {{ meta.options.voices.find((voice) => voice.id === voiceA)?.label ?? voiceA }} +
         {{ meta.options.voices.find((voice) => voice.id === voiceB)?.label ?? voiceB }}
       </p>

@@ -5,6 +5,11 @@ import { buildArtwork } from './mockArt'
 import type { MockArtwork } from './mockArt'
 import { MOCK_PAPERS } from './mockPapers'
 import type { MockPaper, MockScriptSegment } from './mockPapers'
+import { englishContentFor } from './mockPapersEn'
+import {
+  DEFAULT_LANGUAGES,
+  sanitizeLanguages,
+} from '../utils/language'
 import type {
   Analysis,
   ApiAdapter,
@@ -12,10 +17,12 @@ import type {
   CreateTextInput,
   CreateUrlInput,
   Episode,
+  EpisodeLanguage,
   EpisodeOptions,
   EpisodeOptionsInput,
   EpisodeStatus,
   EpisodeSummary,
+  EpisodeVersion,
   FigureRotateDirection,
   HealthPayload,
   ListEpisodesParams,
@@ -27,6 +34,7 @@ import type {
   SourceType,
   VideoInfo,
 } from './types'
+import { isEpisodeLanguage } from './types'
 import { STAGES } from '../utils/stages'
 import { countWords } from '../utils/format'
 
@@ -36,6 +44,12 @@ import { countWords } from '../utils/format'
  * - POST /api/episodes 之后在内存里推进状态机（每阶段约 700ms）；
  * - 音频用 Web Audio API 现场合成的 WAV Blob URL 代替；
  * - 内置 3 篇真实论文（Attention Is All You Need / ResNet / LoRA）+ 1 个通用模板。
+ *
+ * 双语（契约 §1「双语版本（bilingual）」）：同一集的 `versions.zh` 与 `versions.en`
+ * 各有**真的两套**脚本与解读（英文版素材在 `mockPapersEn.ts`，不是同一份文本换个 key），
+ * 配图则两版共用（都在顶层，见 mockArt.ts）。音频/视频是同一个 Blob 的两个独立 URL ——
+ * 反正 Mock 里它们只是占位（正弦波 / Canvas 录制），但 URL 必须能区分，
+ * 否则「切语言换地址」这件事在演示里根本看不出来。
  *
  * 把 URL 或文本里带上 "fail" 字样，可以让任务在「深度解读」阶段模拟失败，
  * 用来演示失败态与「重新生成」流程（点重试后即可正常完成）。
@@ -140,15 +154,23 @@ const objectUrls = new Map<string, Set<string>>()
 const failOnce = new Set<string>()
 
 /**
- * 现场录制的演示视频。录制是真实时间的，所以全站只录一次、所有单集共用同一个 Blob URL。
- * 注意：**不能**登记进 objectUrls（那是按单集回收的）——否则删掉某一集时会把
- * 其他集正在用的 URL 一起 revoke 掉，视频就成了破播放器。
+ * 现场录制的演示视频。录制是真实时间的，所以全站只录一次、所有单集共用同一份 Blob。
+ *
+ * 双语：中英两版**共用这一份录制结果**（Mock 里画面是 Canvas 现画的占位场景，
+ * 没有「按语言重新渲染画面」这回事），但每语言各持一个独立 URL —— 契约里
+ * `versions[lang].video.url` 是不同地址，切语言就该换地址。
+ *
+ * 注意：这些 URL **不能**登记进 objectUrls（那是按单集回收的）——否则删掉某一集时
+ * 会把其他集正在用的 URL 一起 revoke 掉，视频就成了破播放器。
  */
 let sharedVideo: VideoInfo | null = null
 let sharedVideoUrl: string | null = null
 /** 录制出来的原始 Blob：重新合成时用它造一个新的 Blob URL（内容一样，URL 必须变） */
 let sharedVideoBlob: Blob | null = null
 let videoJob: Promise<VideoInfo | null> | null = null
+
+/** 每个语言一个 URL（内容同一份 Blob） */
+const sharedVideoUrls = new Map<EpisodeLanguage, string>()
 
 let loaded = false
 
@@ -254,19 +276,44 @@ interface ContentPlan {
   segments: MockScriptSegment[]
 }
 
-function planContent(paper: MockPaper, title: string): ContentPlan {
+/** 论文元信息：契约 §1 里两版**通常一致**（标题作者本身就是英文），所以两种语言共用同一个对象 */
+function metaFor(paper: MockPaper, title: string): PaperMeta {
+  return { ...paper.meta, title: title || paper.meta.title }
+}
+
+function cloneAnalysis(analysis: MockPaper['analysis']): Analysis {
   return {
-    meta: { ...paper.meta, title: title || paper.meta.title },
-    analysis: {
-      background: paper.analysis.background,
-      innovations: [...paper.analysis.innovations],
-      method: paper.analysis.method,
-      experiments: paper.analysis.experiments,
-      conclusion: paper.analysis.conclusion,
-      limitations: [...paper.analysis.limitations],
-      value: paper.analysis.value,
-      future: [...paper.analysis.future],
-    },
+    background: analysis.background,
+    innovations: [...analysis.innovations],
+    method: analysis.method,
+    experiments: analysis.experiments,
+    conclusion: analysis.conclusion,
+    limitations: [...analysis.limitations],
+    value: analysis.value,
+    future: [...analysis.future],
+  }
+}
+
+/**
+ * 某个语言版本的正文素材：中文来自 `mockPapers.ts`，英文来自 `mockPapersEn.ts`。
+ *
+ * 元信息（契约 §1 的 `paper_meta`）两版**共用标题 / 作者 / 年份 / 会议 / arXiv 编号**
+ * —— 那些本来就是论文自己的英文信息；但摘要与关键词是分语言的：
+ * 中文版给中文摘要，英文版给英文摘要，否则「English 版」里会摆着一段中文。
+ */
+function planContent(paper: MockPaper, title: string, language: EpisodeLanguage): ContentPlan {
+  const base = metaFor(paper, title)
+  if (language === 'en') {
+    const english = englishContentFor(paper)
+    return {
+      meta: { ...base, abstract: english.meta.abstract, keywords: [...english.meta.keywords] },
+      analysis: cloneAnalysis(english.analysis),
+      segments: english.script.map((segment) => ({ ...segment })),
+    }
+  }
+  return {
+    meta: base,
+    analysis: cloneAnalysis(paper.analysis),
     segments: paper.script.map((segment) => ({ ...segment })),
   }
 }
@@ -293,6 +340,61 @@ function normalizeOptions(options?: EpisodeOptionsInput): EpisodeOptions {
   }
 }
 
+/** 新建时要求的语言版本（契约 §1：`options.languages` 默认 `["zh"]`；一个都没有时同样退回默认） */
+function requestedLanguages(options?: EpisodeOptionsInput): EpisodeLanguage[] {
+  const list = sanitizeLanguages(options?.languages)
+  return list.length ? list : [...DEFAULT_LANGUAGES]
+}
+
+/** 组装一个语言版本（音频/视频是异步产物，先留空，由 ensureAudio / ensureVideo 填） */
+function buildVersion(
+  language: EpisodeLanguage,
+  plan: ContentPlan,
+  options: EpisodeOptions,
+): EpisodeVersion {
+  return {
+    language,
+    script: buildScript(plan, options),
+    analysis: plan.analysis,
+    paper_meta: plan.meta,
+    audio_url: null,
+    audio_duration_sec: null,
+    audio_bytes: null,
+    video: null,
+  }
+}
+
+/** 主语言（契约 §1：顶层字段 mirror 的那一版） */
+function primaryLanguage(episode: Episode): EpisodeLanguage {
+  if (isEpisodeLanguage(episode.language)) return episode.language
+  const first = episode.languages?.[0]
+  if (isEpisodeLanguage(first)) return first
+  return DEFAULT_LANGUAGES[0] ?? 'zh'
+}
+
+/**
+ * 本集**真的有内容**的语言版本，顺序 = `languages` 的顺序（契约：生成顺序）。
+ *
+ * 只认 `versions` 里存在的语言：`languages` 说有的语言但 `versions` 里没有，
+ * 切过去只会看到主语言的内容，那种「假切换」不如不提供。
+ */
+function episodeLanguages(episode: Episode): EpisodeLanguage[] {
+  const versions = episode.versions
+  if (!versions) return []
+  const ordered = sanitizeLanguages(episode.languages).filter((language) => versions[language])
+  // languages 缺失/脏掉的极端情况：按 versions 的 key 补齐，别让版本白白藏着
+  ;(Object.keys(versions) as EpisodeLanguage[]).forEach((language) => {
+    if (versions[language] && !ordered.includes(language)) ordered.push(language)
+  })
+  return ordered
+}
+
+/** 取某个语言版本；`lang` 缺失或这一集没有该版本时返回 null（调用方退回顶层字段） */
+function versionFor(episode: Episode, lang?: EpisodeLanguage | null): EpisodeVersion | null {
+  if (!lang || !episode.versions) return null
+  return episode.versions[lang] ?? null
+}
+
 function createEpisodeRecord(input: {
   title: string
   sourceType: SourceType
@@ -305,14 +407,25 @@ function createEpisodeRecord(input: {
 }): Episode {
   const options = normalizeOptions(input.options)
   const paper = input.paper ?? genericPaper()
-  const plan = planContent(paper, input.title)
   const created =
     input.createdAt ?? new Date(Date.now() - (input.createdDaysAgo ?? 0) * 86400000).toISOString()
   const id = makeId()
+  const title = input.title || metaFor(paper, input.title).title || '未命名论文'
+
+  // 只生成被要求的语言版本（没要求英文就不做英文素材，跟真实后端一致）
+  const languages = requestedLanguages(input.options)
+  const versions: Partial<Record<EpisodeLanguage, EpisodeVersion>> = {}
+  languages.forEach((language) => {
+    versions[language] = buildVersion(language, planContent(paper, title, language), options)
+  })
+
+  const primary = languages[0] ?? DEFAULT_LANGUAGES[0] ?? 'zh'
+  const primaryVersion = versions[primary] ?? buildVersion(primary, planContent(paper, title, primary), options)
+  versions[primary] = primaryVersion
 
   const episode: Episode = {
     id,
-    title: input.title || plan.meta.title || '未命名论文',
+    title,
     source_type: input.sourceType,
     source_ref: input.sourceRef,
     status: 'queued',
@@ -320,11 +433,15 @@ function createEpisodeRecord(input: {
     progress: 0,
     error: null,
     options,
-    paper_meta: plan.meta,
-    analysis: plan.analysis,
-    script: buildScript(plan, options),
+    // 顶层字段镜像主语言那一版（契约 §1）：老代码只读顶层也照样显示主语言
+    paper_meta: primaryVersion.paper_meta,
+    analysis: primaryVersion.analysis,
+    script: primaryVersion.script,
+    language: primary,
+    languages,
+    versions,
     // 配图（契约 §1 的新字段）：全部现场生成，见 mockArt.ts
-    ...buildArtworkFor(id, input.sourceType, plan.meta),
+    ...buildArtworkFor(id, input.sourceType, primaryVersion.paper_meta ?? metaFor(paper, title)),
     // 视频解读（契约 §1 的 video 字段）：等单集完成时现场录制，见 ensureVideo
     video: null,
     audio_url: null,
@@ -442,6 +559,18 @@ function ensureAudio(episode: Episode): Promise<void> {
   return job
 }
 
+/**
+ * 顶层音频字段镜像主语言那一版（契约 §1）。
+ * 只在主语言的版本确实有音频时才覆盖，避免把已经填好的顶层值抹成 null。
+ */
+function mirrorPrimaryAudio(episode: Episode): void {
+  const version = versionFor(episode, primaryLanguage(episode))
+  if (!version) return
+  episode.audio_url = version.audio_url
+  episode.audio_duration_sec = version.audio_duration_sec
+  episode.audio_bytes = version.audio_bytes
+}
+
 async function renderAudioFor(episode: Episode): Promise<void> {
   try {
     const speakers = (episode.script?.segments ?? []).map((segment) => segment.speaker)
@@ -451,13 +580,28 @@ async function renderAudioFor(episode: Episode): Promise<void> {
     })
     const current = findEpisode(episode.id)
     if (!current) return
-    if (current.audio_url) URL.revokeObjectURL(current.audio_url)
-    const url = URL.createObjectURL(blob)
-    current.audio_url = url
-    current.audio_duration_sec = durationSec
-    current.audio_bytes = blob.size
+    // 中英两版共用同一份 Blob（省一次实时合成 —— Mock 里本来就只是一段正弦波），
+    // 但**URL 必须各自独立**：契约里 versions[lang].audio_url 是两个不同的资源地址，
+    // 共用同一个 URL 的话「切语言换音源」这件事在演示里根本看不出来。
+    const targets = episodeLanguages(current)
+    targets.forEach((language) => {
+      const version = versionFor(current, language)
+      if (!version) return
+      if (version.audio_url) URL.revokeObjectURL(version.audio_url)
+      version.audio_url = trackObjectUrl(current.id, URL.createObjectURL(blob))
+      version.audio_duration_sec = durationSec
+      version.audio_bytes = blob.size
+    })
+    if (targets.length) {
+      mirrorPrimaryAudio(current)
+    } else {
+      // 老数据（没有 versions）：只有顶层字段可写
+      if (current.audio_url) URL.revokeObjectURL(current.audio_url)
+      current.audio_url = trackObjectUrl(current.id, URL.createObjectURL(blob))
+      current.audio_duration_sec = durationSec
+      current.audio_bytes = blob.size
+    }
     current.updated_at = nowIso()
-    trackObjectUrl(current.id, url)
     persist()
   } catch (error) {
     console.warn('[mock] 音频合成失败，播放器将不可用', error)
@@ -486,11 +630,11 @@ async function renderSharedVideo(): Promise<VideoInfo | null> {
       console.warn('[mock] 当前浏览器不支持现场录制演示视频，视频区将不显示')
       return null
     }
-    const url = URL.createObjectURL(result.blob)
-    sharedVideoUrl = url
+    revokeSharedVideoUrls()
     sharedVideoBlob = result.blob
+    sharedVideoUrl = URL.createObjectURL(result.blob)
     sharedVideo = {
-      url,
+      url: sharedVideoUrl,
       duration_sec: result.durationSec,
       scene_count: result.sceneCount,
       bytes: result.blob.size,
@@ -504,6 +648,32 @@ async function renderSharedVideo(): Promise<VideoInfo | null> {
   }
 }
 
+function revokeSharedVideoUrls(): void {
+  sharedVideoUrls.forEach((url) => URL.revokeObjectURL(url))
+  sharedVideoUrls.clear()
+  if (sharedVideoUrl) {
+    URL.revokeObjectURL(sharedVideoUrl)
+    sharedVideoUrl = null
+  }
+}
+
+/**
+ * 某个语言版本的视频地址：内容共用同一份 Blob，URL 按语言各一个。
+ *
+ * 返回的对象每次都是新的（避免多集之间共用同一个可变对象：某一集被标成
+ * `stale=true` 时不能连带把别的集一起标脏）。
+ */
+function videoInfoFor(language: EpisodeLanguage): VideoInfo | null {
+  if (!sharedVideo) return null
+  let url = sharedVideoUrls.get(language)
+  if (!url) {
+    if (!sharedVideoBlob) return { ...sharedVideo }
+    url = URL.createObjectURL(sharedVideoBlob)
+    sharedVideoUrls.set(language, url)
+  }
+  return { ...sharedVideo, url }
+}
+
 /** 取共享的演示视频（并发调用共用同一个渲染任务） */
 function ensureSharedVideo(): Promise<VideoInfo | null> {
   if (sharedVideo) return Promise.resolve(sharedVideo)
@@ -515,25 +685,52 @@ function ensureSharedVideo(): Promise<VideoInfo | null> {
   return videoJob
 }
 
-/** 完成态的单集才有视频；录制中的任务给 null（与真实后端的时序一致） */
+/**
+ * 完成态的单集才有视频；录制中的任务给 null（与真实后端的时序一致）。
+ *
+ * 每个语言版本各填一份（URL 不同），顶层字段镜像主语言那一版。
+ */
 async function ensureVideo(episode: Episode): Promise<void> {
   if (episode.status !== 'completed') return
-  const info = await ensureSharedVideo()
+  const languages = episodeLanguages(episode)
+  const missing = languages.filter((language) => !versionFor(episode, language)?.video)
+  // 老数据（没有 versions）只有顶层字段可写；version 化的数据缺哪个语言就补哪个
+  if (!missing.length && episode.video) return
+
+  await ensureSharedVideo()
   const current = findEpisode(episode.id)
-  // 已经有视频就别覆盖：那一份可能是「配图改过、画面已过时」的副本（stale=true），
-  // 覆盖回共享的 fresh 版本会让提示条凭空消失。刷新页面后 video 本来就是 null，
-  // 走不到这条分支，所以「刷新即重置」的行为不变。
-  if (info && current && !current.video) current.video = info
+  if (!current) return
+
+  episodeLanguages(current).forEach((language) => {
+    const version = versionFor(current, language)
+    if (!version || version.video) return
+    const info = videoInfoFor(language)
+    if (info) version.video = info
+  })
+
+  // 顶层镜像主语言。**已经有视频就别覆盖**：那一份可能是「配图改过、画面已过时」的副本
+  // （stale=true），覆盖回 fresh 版本会让提示条凭空消失。
+  if (!current.video) {
+    const info = videoInfoFor(primaryLanguage(current))
+    if (info) current.video = info
+  }
 }
 
 /**
  * 配图被人工校正过 → 视频里的画面就跟不上了（真实后端同样会置 video.stale=true）。
  *
  * 必须**换成新对象**：所有单集共用同一个 sharedVideo，原地改 stale 会把别的单集一起标脏。
+ * 有语言版本时每个版本各标一份（每个版本的 video 本来就是独立对象），
+ * 顶层字段（= 主语言那一版）同样标上。
  */
 function markVideoStale(episode: Episode): void {
-  if (!episode.video) return
-  episode.video = { ...episode.video, stale: true }
+  if (episode.versions) {
+    episodeLanguages(episode).forEach((language) => {
+      const version = versionFor(episode, language)
+      if (version?.video) version.video = { ...version.video, stale: true }
+    })
+  }
+  if (episode.video) episode.video = { ...episode.video, stale: true }
 }
 
 /** 把 Blob URL 的内容取回来（重新合成时用它造一个新 URL；失败返回 null，降级为沿用旧 URL） */
@@ -550,25 +747,37 @@ async function blobFromUrl(url: string): Promise<Blob | null> {
 }
 
 /**
- * 用现有素材重新合成视频（契约 §2：POST /video/rebuild）。
+ * 用现有素材重新合成视频（契约 §2：POST /video/rebuild?lang=xx）。
  *
  * Mock 里没有真实的「把配图烘焙进 MP4」这一步（画面是 Canvas 画的占位场景），
- * 所以不重录，只复刻契约语义：等待 → 视频 URL 换新（内容/URL 一起变，缓存失效）
- * → video.stale 归位 false。没有视频时抛 409，与真实后端一致。
+ * 所以不重录，只复刻契约语义：等待 → 该语言版本的视频 URL 换新（内容/URL 一起变，缓存失效）
+ * → video.stale 归位 false。没有视频时抛 409，语言版本不存在时抛 404，与真实后端一致。
  */
-export async function rebuildVideo(id: string): Promise<Episode> {
+export async function rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<Episode> {
   ensureLoaded()
   await delay(60)
   const episode = requireEpisode(id)
-  if (!episode.video) throw new ApiError('这一集还没有视频，无法重新合成', 409)
+
+  // 契约 §2：`lang` 传了不存在的语言 → 404。省略时重新合成主语言那一版。
+  if (lang && !versionFor(episode, lang)) {
+    throw new ApiError(`这一集没有 ${lang} 语言版本，无法重新合成`, 404)
+  }
+  const target = lang ?? primaryLanguage(episode)
+  const version = versionFor(episode, target)
+  const currentVideo = version ? version.video : episode.video
+  if (!currentVideo) throw new ApiError('这一集还没有视频，无法重新合成', 409)
 
   await delay(MOCK_VIDEO_REBUILD_MS)
 
-  const blob = sharedVideoBlob ?? (await blobFromUrl(episode.video.url))
+  const blob = sharedVideoBlob ?? (await blobFromUrl(currentVideo.url))
   // 拿不到内容（浏览器不支持 fetch blob: 之类）时沿用旧 URL：stale 仍然归位，
   // 只是「URL 变了」这条没兑现 —— 演示里看不到差别，但不该因此报错
-  const url = blob ? trackObjectUrl(id, URL.createObjectURL(blob)) : episode.video.url
-  episode.video = { ...episode.video, url, stale: false }
+  const url = blob ? trackObjectUrl(id, URL.createObjectURL(blob)) : currentVideo.url
+  const next: VideoInfo = { ...currentVideo, url, stale: false }
+  if (version) version.video = next
+  else episode.video = next
+  // 顶层字段始终镜像主语言那一版（重新合成的正是主语言时，两边要同步）
+  if (target === primaryLanguage(episode)) episode.video = { ...next }
   episode.updated_at = nowIso()
   persist()
   return copyEpisode(episode)
@@ -577,6 +786,27 @@ export async function rebuildVideo(id: string): Promise<Episode> {
 // ---------------------------------------------------------------------------
 // 持久化（只存元数据；音频与配图都在每次加载时重新现场生成，避免顶爆 localStorage 配额）
 // ---------------------------------------------------------------------------
+
+/**
+ * 落盘前把「现场生成物」清掉：音频与视频都是 Blob URL，存进去刷新后就是失效地址。
+ * 配图同样是现场生成的（Canvas / SVG），所以连 cover / figures / illustration 一起置空。
+ * 语言版本里的 script / analysis / paper_meta 是**要留**的（那是真正的内容）。
+ */
+function stripVersionsForStorage(versions: Episode['versions']): Episode['versions'] {
+  if (!versions) return null
+  const result: Partial<Record<EpisodeLanguage, EpisodeVersion>> = {}
+  Object.entries(versions).forEach(([key, version]) => {
+    if (!version || !isEpisodeLanguage(key)) return
+    result[key] = {
+      ...version,
+      audio_url: null,
+      audio_duration_sec: null,
+      audio_bytes: null,
+      video: null,
+    }
+  })
+  return Object.keys(result).length ? result : null
+}
 
 function persist(): void {
   try {
@@ -595,6 +825,7 @@ function persist(): void {
         illustration: null,
         // 视频是 MediaRecorder 现场录的 Blob URL，同样不落盘（存进去刷新后就是失效 URL）
         video: null,
+        versions: stripVersionsForStorage(episode.versions),
       })),
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
@@ -603,12 +834,49 @@ function persist(): void {
   }
 }
 
+/** 把落盘的语言版本恢复成完整结构（音频/视频等现场生成物留空，加载后按需重算） */
+function normalizeStoredVersions(raw: unknown): Episode['versions'] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const result: Partial<Record<EpisodeLanguage, EpisodeVersion>> = {}
+  Object.entries(raw as Record<string, unknown>).forEach(([key, value]) => {
+    if (!isEpisodeLanguage(key) || !value || typeof value !== 'object') return
+    const version = value as Partial<EpisodeVersion>
+    result[key] = {
+      language: key,
+      script: version.script ?? null,
+      analysis: version.analysis ?? null,
+      paper_meta: version.paper_meta ?? null,
+      audio_url: null,
+      audio_duration_sec: null,
+      audio_bytes: null,
+      video: null,
+    }
+  })
+  return Object.keys(result).length ? result : null
+}
+
 function normalizeStored(raw: unknown): Episode | null {
   if (!raw || typeof raw !== 'object') return null
   const value = raw as Partial<Episode>
   if (typeof value.id !== 'string' || !value.id) return null
   if (typeof value.title !== 'string') return null
   const sourceType = (value.source_type ?? 'text') as SourceType
+  const versions = normalizeStoredVersions(value.versions)
+  /**
+   * 双语功能上线前存下的记录没有 versions / languages：这时如实保留「没有语言版本」，
+   * 详情页会走降级路径（只有顶层字段、不显示切换器）——和真实后端的老数据完全一致。
+   */
+  const storedLanguages = sanitizeLanguages(value.languages)
+  const languages = storedLanguages.length
+    ? storedLanguages
+    : versions
+      ? (Object.keys(versions) as EpisodeLanguage[])
+      : [...DEFAULT_LANGUAGES]
+  const language = isEpisodeLanguage(value.language)
+    ? value.language
+    : versions
+      ? languages[0]
+      : undefined
   const meta = value.paper_meta ?? null
   return {
     id: value.id,
@@ -623,6 +891,9 @@ function normalizeStored(raw: unknown): Episode | null {
     paper_meta: meta,
     analysis: value.analysis ?? null,
     script: value.script ?? null,
+    language: language ?? undefined,
+    languages,
+    versions,
     // 配图重新现场生成（seed 用 id，所以和刷新前是同一张图）
     ...buildArtworkFor(value.id, sourceType, meta ?? { title: value.title } as PaperMeta),
     // 视频同样是现场生成物，加载后按需重录（这里先置 null，见 ensureLoaded / ensureVideo）
@@ -636,6 +907,11 @@ function normalizeStored(raw: unknown): Episode | null {
 }
 
 function seed(): void {
+  /**
+   * 内置示例刻意覆盖两种形态：
+   *   - 前两篇是**双语**（`languages: ['zh','en']`）→ 详情页会出现语言切换器；
+   *   - 第三篇只有中文（`languages: ['zh']`）→ 不显示切换器，用来演示「只有一种语言」的降级。
+   */
   const seeds: Array<{
     index: number
     sourceType: SourceType
@@ -647,21 +923,21 @@ function seed(): void {
       index: 0,
       sourceType: 'pdf',
       sourceRef: 'attention-is-all-you-need.pdf',
-      options: { duration_min: 5, level: 'intro' },
+      options: { duration_min: 5, level: 'intro', languages: ['zh', 'en'] },
       hoursAgo: 74,
     },
     {
       index: 1,
       sourceType: 'url',
       sourceRef: 'https://arxiv.org/abs/1512.03385',
-      options: { duration_min: 10, level: 'advanced' },
+      options: { duration_min: 10, level: 'advanced', languages: ['zh', 'en'] },
       hoursAgo: 20,
     },
     {
       index: 2,
       sourceType: 'text',
       sourceRef: null,
-      options: { duration_min: 3, level: 'expert' },
+      options: { duration_min: 3, level: 'expert', languages: ['zh'] },
       hoursAgo: 0.4,
     },
   ]
@@ -731,17 +1007,35 @@ function ensureLoaded(): void {
 // 导出物：文本 / Markdown（mock 下用 Blob URL 代替后端下载地址）
 // ---------------------------------------------------------------------------
 
-function buildScriptText(episode: Episode): string {
-  const segments = episode.script?.segments ?? []
+/**
+ * 取某语言的下载内容：`lang` 指向的版本存在就用它，否则退回顶层字段（= 主语言）。
+ * 与契约 §2「`?lang=` 省略时取主语言」的行为一致。
+ */
+function downloadContentFor(
+  episode: Episode,
+  lang?: EpisodeLanguage,
+): { meta: PaperMeta | null; script: Script | null; analysis: Analysis | null } {
+  const version = versionFor(episode, lang)
+  return {
+    meta: version?.paper_meta ?? episode.paper_meta,
+    script: version?.script ?? episode.script,
+    analysis: version?.analysis ?? episode.analysis,
+  }
+}
+
+function buildScriptText(episode: Episode, meta: PaperMeta | null, script: Script | null): string {
+  const segments = script?.segments ?? []
   // 与真实后端 /script.txt 的输出格式保持一致：标题 + 分隔线 + 空行分隔的逐段脚本
-  const header = [`《${episode.paper_meta?.title ?? episode.title}》`, '双人播客脚本', '='.repeat(40), '']
+  const header = [`《${meta?.title ?? episode.title}》`, '双人播客脚本', '='.repeat(40), '']
   const body = segments.map((segment) => `【主播${segment.speaker}】${segment.text}`)
   return [...header, ...body.flatMap((line) => [line, ''])].join('\n').trimEnd()
 }
 
-function buildAnalysisMarkdown(episode: Episode): string {
-  const meta = episode.paper_meta
-  const analysis = episode.analysis
+function buildAnalysisMarkdown(
+  episode: Episode,
+  meta: PaperMeta | null,
+  analysis: Analysis | null,
+): string {
   const lines: string[] = []
 
   lines.push(`# ${meta?.title ?? episode.title}`, '')
@@ -817,7 +1111,7 @@ export async function createEpisodeFromFile(input: CreateFileInput): Promise<Epi
   })
   runPipeline(episode)
   persist()
-  return { ...episode }
+  return copyEpisode(episode)
 }
 
 export async function createEpisodeFromUrl(input: CreateUrlInput): Promise<Episode> {
@@ -847,7 +1141,7 @@ export async function createEpisodeFromUrl(input: CreateUrlInput): Promise<Episo
   })
   runPipeline(episode)
   persist()
-  return { ...episode }
+  return copyEpisode(episode)
 }
 
 export async function createEpisodeFromText(input: CreateTextInput): Promise<Episode> {
@@ -865,12 +1159,14 @@ export async function createEpisodeFromText(input: CreateTextInput): Promise<Epi
   })
   runPipeline(episode)
   persist()
-  return { ...episode }
+  return copyEpisode(episode)
 }
 
 /**
  * 契约 §1：列表项省略 analysis / script（置 null）、figures（置 []）、illustration / video（置 null），
  * 但保留 cover_url 一族，因为列表卡片要显示封面缩略图。
+ * `versions` 同样不进列表（它内部装的就是 script / analysis / video 这些大字段）；
+ * `language` / `languages` 保留，列表上要显示语言角标时用得到。
  * 这里显式挑字段而不是「spread 再删」，这样一旦 Episode 新增字段，类型检查会提醒我们同步。
  */
 function toSummary(episode: Episode): EpisodeSummary {
@@ -891,6 +1187,8 @@ function toSummary(episode: Episode): EpisodeSummary {
     audio_url: episode.audio_url,
     audio_duration_sec: episode.audio_duration_sec,
     audio_bytes: episode.audio_bytes,
+    language: episode.language ?? null,
+    languages: episode.languages ?? null,
     created_at: episode.created_at,
     updated_at: episode.updated_at,
   }
@@ -923,7 +1221,7 @@ export async function getEpisode(id: string): Promise<Episode> {
   }
   // 与真实后端一致：详情接口才带 video（列表接口不带）
   await ensureVideo(episode)
-  return { ...episode }
+  return copyEpisode(episode)
 }
 
 export async function deleteEpisode(id: string): Promise<void> {
@@ -954,7 +1252,7 @@ export async function retryEpisode(id: string): Promise<Episode> {
   episode.updated_at = nowIso()
   persist()
   runPipeline(episode)
-  return { ...episode }
+  return copyEpisode(episode)
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,7 +1305,7 @@ function rotateDataUrl(url: string, direction: FigureRotateDirection): Promise<s
 }
 
 /**
- * 复制一份 Episode，避免调用方拿到的 figures / video 与内存态共用同一个对象。
+ * 复制一份 Episode，避免调用方拿到的 figures / video / versions 与内存态共用同一个对象。
  * video 尤其重要：它是全站共用的共享对象，直接漏出去会让外部误改到别的单集。
  */
 function copyEpisode(episode: Episode): Episode {
@@ -1015,6 +1313,22 @@ function copyEpisode(episode: Episode): Episode {
     ...episode,
     figures: episode.figures.map((figure) => ({ ...figure })),
     video: episode.video ? { ...episode.video } : null,
+    versions: episode.versions
+      ? Object.fromEntries(
+          Object.entries(episode.versions).map(([language, version]) => [
+            language,
+            version
+              ? {
+                  ...version,
+                  video: version.video ? { ...version.video } : null,
+                  script: version.script
+                    ? { ...version.script, segments: version.script.segments.map((s) => ({ ...s })) }
+                    : null,
+                }
+              : version,
+          ]),
+        )
+      : episode.versions,
   }
 }
 
@@ -1057,18 +1371,25 @@ export async function deleteFigure(id: string, figureId: string): Promise<Episod
   return copyEpisode(episode)
 }
 
-export function scriptTxtUrl(id: string): string {
+export function scriptTxtUrl(id: string, lang?: EpisodeLanguage): string {
   ensureLoaded()
   const episode = findEpisode(id)
-  if (!episode?.script) return ''
-  return trackObjectUrl(id, textBlobUrl(buildScriptText(episode), 'text/plain;charset=utf-8'))
+  if (!episode) return ''
+  const { meta, script } = downloadContentFor(episode, lang)
+  if (!script) return ''
+  return trackObjectUrl(id, textBlobUrl(buildScriptText(episode, meta, script), 'text/plain;charset=utf-8'))
 }
 
-export function analysisMdUrl(id: string): string {
+export function analysisMdUrl(id: string, lang?: EpisodeLanguage): string {
   ensureLoaded()
   const episode = findEpisode(id)
-  if (!episode?.analysis) return ''
-  return trackObjectUrl(id, textBlobUrl(buildAnalysisMarkdown(episode), 'text/markdown;charset=utf-8'))
+  if (!episode) return ''
+  const { meta, analysis } = downloadContentFor(episode, lang)
+  if (!analysis) return ''
+  return trackObjectUrl(
+    id,
+    textBlobUrl(buildAnalysisMarkdown(episode, meta, analysis), 'text/markdown;charset=utf-8'),
+  )
 }
 
 /** 仅供调试：清空 mock 数据（localStorage + 内存） */
@@ -1080,10 +1401,8 @@ export function resetMockStore(): void {
   videoJob = null
   sharedVideo = null
   sharedVideoBlob = null
-  if (sharedVideoUrl) {
-    URL.revokeObjectURL(sharedVideoUrl)
-    sharedVideoUrl = null
-  }
+  // 每种语言各一个共享 URL，一起回收（见 videoInfoFor）
+  revokeSharedVideoUrls()
   failOnce.clear()
   objectUrls.forEach((set) => set.forEach((url) => URL.revokeObjectURL(url)))
   objectUrls.clear()

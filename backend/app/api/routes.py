@@ -21,12 +21,18 @@ from ..models import (
     EpisodeListItem,
     EpisodeOptions,
     HealthResponse,
+    OptionItem,
     OptionsResponse,
 )
 from ..services.figures import PdfAssetsError, rotate_image_file
 from ..services.video import VideoError, is_video_stale
 from ..services.ingest import IngestError, fetch_url_text, guess_title
-from ..services.pipeline import render_analysis_markdown, render_script_text
+from ..services.pipeline import (
+    LanguageNotFound,
+    render_analysis_markdown,
+    render_script_text,
+)
+from .. import voices as voice_catalog
 from ..voices import DURATIONS, LEVELS, VOICES, normalize_voice
 from ..worker import TaskQueue
 
@@ -60,7 +66,11 @@ def _queue(request: Request) -> TaskQueue:
 # --------------------------------------------------------------------------
 
 
-def _video_provenance_unknown(stored_video: dict[str, Any], record: dict[str, Any]) -> bool:
+def _video_provenance_unknown(
+    stored_video: dict[str, Any],
+    record: dict[str, Any],
+    version: dict[str, Any] | None = None,
+) -> bool:
     """视频没有留下素材版本记录时，保守地认为它可能过时。
 
     这类是「加版本追踪之前」生成的旧视频。无法证明它跟当前配图一致，
@@ -69,10 +79,13 @@ def _video_provenance_unknown(stored_video: dict[str, Any], record: dict[str, An
     """
     if stored_video.get("asset_versions"):
         return False
+    version = version or {}
     has_assets = bool(
         record.get("cover_path")
         or record.get("figures")
-        or (record.get("illustration") or {}).get("png_path")
+        or (version.get("illustration") or record.get("illustration") or {}).get(
+            "png_path"
+        )
     )
     return has_assets
 
@@ -93,11 +106,139 @@ def _asset_version(path: Any) -> str:
     return f"{int(stat.st_mtime)}-{stat.st_size}"
 
 
+def _version_payload(
+    record: dict[str, Any],
+    episode_id: str,
+    version: dict[str, Any],
+    *,
+    include_large: bool = True,
+) -> dict[str, Any]:
+    """把一个语言版本渲染成响应里的 `versions[lang]`。
+
+    音频/视频的 URL 不带 `?lang=`，而是**每个语言各自一条** ——
+    带 query 的 URL 在 `<audio src>` 和缓存里都容易被搞混，
+    分开的路径也更利于 CDN 和浏览器缓存。
+    """
+    audio_path = version.get("audio_path")
+    audio_url = None
+    if audio_path and Path(audio_path).exists():
+        query = _lang_query(record, version)
+        audio_url = (
+            f"/api/episodes/{episode_id}/audio{query}"
+            f"{'&' if query else '?'}v={_asset_version(audio_path)}"
+        )
+
+    video = None
+    video_path = version.get("video_path")
+    if include_large and video_path and Path(video_path).exists():
+        stored_video = version.get("video") or {}
+        query = _lang_query(record, version)
+        video = {
+            "url": (
+                f"/api/episodes/{episode_id}/video{query}"
+                f"{'&' if query else '?'}v={_asset_version(video_path)}"
+            ),
+            "duration_sec": stored_video.get("duration_sec"),
+            "scene_count": stored_video.get("scene_count"),
+            "bytes": stored_video.get("bytes"),
+            "stale": is_video_stale(stored_video)
+            or _video_provenance_unknown(stored_video, record, version),
+        }
+
+    illustration = None
+    stored = version.get("illustration") if include_large else None
+    if stored and stored.get("png_path") and Path(stored["png_path"]).exists():
+        query = _lang_query(record, version)
+        illustration = {
+            "png_url": (
+                f"/api/episodes/{episode_id}/illustration.png{query}"
+                f"{'&' if query else '?'}v={_asset_version(stored['png_path'])}"
+            ),
+            "svg_url": (
+                f"/api/episodes/{episode_id}/illustration.svg{query}"
+                f"{'&' if query else '?'}v={_asset_version(stored.get('svg_path'))}"
+            ),
+            "width": int(stored.get("width") or 0),
+            "height": int(stored.get("height") or 0),
+            "source": stored.get("source") or "fallback",
+        }
+
+    return {
+        "language": version.get("language") or _primary_language(record),
+        "paper_meta": version.get("paper_meta"),
+        "analysis": version.get("analysis") if include_large else None,
+        "script": version.get("script") if include_large else None,
+        "illustration": illustration,
+        "audio_url": audio_url,
+        "audio_duration_sec": version.get("audio_duration_sec"),
+        "audio_bytes": version.get("audio_bytes"),
+        "video": video,
+    }
+
+
+def _primary_language(record: dict[str, Any]) -> str:
+    options = record.get("options") or {}
+    lang = str(options.get("language") or "").lower()
+    return lang if lang in ("zh", "en") else "zh"
+
+
+def _lang_query(record: dict[str, Any], version: dict[str, Any]) -> str:
+    """非主语言的资源 URL 要带上 `?lang=`。主语言不带，保持 URL 稳定。"""
+    lang = version.get("language")
+    if not lang or lang == _primary_language(record):
+        return ""
+    return f"?lang={lang}"
+
+
+def _planned_languages(record: dict[str, Any]) -> list[str]:
+    """创建这一集时**要求**产出哪些语言。
+
+    要和 `Episode.languages`（实际已产出哪些）区分开：
+    双语任务还在跑的时候，前者已经是 `["zh","en"]`，后者可能只有 `["zh"]`。
+    它是请求记录的一部分，所以直接读 options 里存下的值。
+    """
+    options = record.get("options") or {}
+    raw = options.get("languages")
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",")]
+    ordered: list[str] = []
+    for item in [options.get("language"), *[str(x).lower() for x in (raw or []) if x]]:
+        if item in ("zh", "en") and item not in ordered:
+            ordered.append(item)
+    return ordered
+
+
+def _all_versions(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """这一集的全部语言版本。
+
+    双语之前生成的集没有 `versions`，这里把顶层字段当成主语言那一版 ——
+    前端因此只需要处理一种形状，不必为老数据写特例。
+    """
+    stored = record.get("versions") or {}
+    if stored:
+        return stored
+    if not (record.get("script") or record.get("audio_path")):
+        return {}
+    primary = _primary_language(record)
+    return {
+        primary: {
+            "language": primary,
+            "paper_meta": record.get("paper_meta"),
+            "analysis": record.get("analysis"),
+            "script": record.get("script"),
+            "illustration": record.get("illustration"),
+            "audio_path": record.get("audio_path"),
+            "audio_duration_sec": record.get("audio_duration_sec"),
+            "audio_bytes": record.get("audio_bytes"),
+            "timings": record.get("timings") or [],
+            "video_path": record.get("video_path"),
+            "video": record.get("video"),
+        }
+    }
+
+
 def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[str, Any]:
     episode_id = record["id"]
-    audio_url = None
-    if record.get("audio_path") and Path(record["audio_path"]).exists():
-        audio_url = f"/api/episodes/{episode_id}/audio"
 
     cover_url = None
     cover_path = record.get("cover_path")
@@ -127,40 +268,20 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
             }
         )
 
-    # 列表接口不带 video（列表里不播视频，省流量）
-    video = None
-    video_path = record.get("video_path") if include_large else None
-    if video_path and Path(video_path).exists():
-        stored_video = record.get("video") or {}
-        video = {
-            "url": f"/api/episodes/{episode_id}/video?v={_asset_version(video_path)}",
-            "duration_sec": stored_video.get("duration_sec"),
-            "scene_count": stored_video.get("scene_count"),
-            "bytes": stored_video.get("bytes"),
-            "stale": is_video_stale(stored_video) or _video_provenance_unknown(
-                stored_video, record
-            ),
-        }
-
-    illustration = None
-    stored = record.get("illustration") if include_large else None
-    if stored and stored.get("png_path") and Path(stored["png_path"]).exists():
-        illustration = {
-            "png_url": (
-                f"/api/episodes/{episode_id}/illustration.png"
-                f"?v={_asset_version(stored['png_path'])}"
-            ),
-            "svg_url": (
-                f"/api/episodes/{episode_id}/illustration.svg"
-                f"?v={_asset_version(stored.get('svg_path'))}"
-            ),
-            "width": int(stored.get("width") or 0),
-            "height": int(stored.get("height") or 0),
-            "source": stored.get("source") or "fallback",
-        }
+    primary = _primary_language(record)
+    stored_versions = _all_versions(record)
+    versions = {
+        lang: _version_payload(record, episode_id, version, include_large=include_large)
+        for lang, version in stored_versions.items()
+    }
+    languages = list(versions.keys())
+    # 顶层字段镜像主语言那一版。老前端不改也能用；新前端切语言时读 versions。
+    surface = versions.get(primary) or (
+        next(iter(versions.values())) if versions else {}
+    )
 
     options = record.get("options") or {}
-    data = {
+    return {
         "id": record["id"],
         "title": record["title"],
         "source_type": record["source_type"],
@@ -174,27 +295,29 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
             level=options.get("level") or "intro",
             voice_a=options.get("voice_a") or "",
             voice_b=options.get("voice_b") or "",
+            language=primary,
+            # options.languages = 创建时要求的版本；languages = 已经产出的版本。
+            # 双语任务跑到一半时两者会不一样，这是有意的。
+            languages=_planned_languages(record) or languages,
         ).model_dump(),
-        "paper_meta": record.get("paper_meta"),
-        "analysis": record.get("analysis") if include_large else None,
-        "script": record.get("script") if include_large else None,
+        "language": primary,
+        "languages": languages,
+        "versions": versions,
+        "paper_meta": surface.get("paper_meta") or record.get("paper_meta"),
+        "analysis": surface.get("analysis") if include_large else None,
+        "script": surface.get("script") if include_large else None,
         "cover_url": cover_url,
         "cover_width": record.get("cover_width"),
         "cover_height": record.get("cover_height"),
         "figures": figures,
-        "illustration": illustration,
-        "video": video,
-        "audio_url": (
-            f"{audio_url}?v={_asset_version(record.get('audio_path'))}"
-            if audio_url
-            else None
-        ),
-        "audio_duration_sec": record.get("audio_duration_sec"),
-        "audio_bytes": record.get("audio_bytes"),
+        "illustration": surface.get("illustration"),
+        "video": surface.get("video"),
+        "audio_url": surface.get("audio_url"),
+        "audio_duration_sec": surface.get("audio_duration_sec"),
+        "audio_bytes": surface.get("audio_bytes"),
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
     }
-    return data
 
 
 def _require_episode(request: Request, episode_id: str) -> dict[str, Any]:
@@ -202,6 +325,23 @@ def _require_episode(request: Request, episode_id: str) -> dict[str, Any]:
     if not record:
         raise HTTPException(status_code=404, detail="播客不存在")
     return record
+
+
+def _resolve_version(
+    request: Request, record: dict[str, Any], lang: str | None
+) -> tuple[str, dict[str, Any]]:
+    """把 `?lang=` 解析成 (语言, 版本记录)；这一集没有该语言时 404。"""
+    try:
+        return _queue(request).pipeline.resolve_version(record, lang)
+    except LanguageNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _download_filename(record: dict[str, Any], language: str, suffix: str) -> str:
+    """下载文件名。非主语言的产物加语言后缀，避免两份存成一个名字。"""
+    base = _safe_filename(record["title"])
+    tag = "" if language == _primary_language(record) else f"-{language}"
+    return f"{base}{tag}{suffix}"
 
 
 # --------------------------------------------------------------------------
@@ -221,7 +361,15 @@ async def health(request: Request) -> HealthResponse:
 
 @router.get("/options", response_model=OptionsResponse)
 async def options() -> OptionsResponse:
-    return OptionsResponse(durations=DURATIONS, levels=LEVELS, voices=VOICES)
+    return OptionsResponse(
+        durations=DURATIONS,
+        levels=LEVELS,
+        voices=VOICES,
+        languages=[
+            OptionItem(value=code, label=label)
+            for code, label in voice_catalog.LANGUAGE_LABELS.items()
+        ],
+    )
 
 
 # --------------------------------------------------------------------------
@@ -381,6 +529,20 @@ def _parse_options(source: Any, settings: Settings) -> dict[str, Any]:
     if level not in ("intro", "advanced", "expert"):
         level = "intro"
 
+    # 语言：主语言 + 实际产出哪些版本。都只接受目录里的值，
+    # 避免前端传个 "jp" 把整条流水线带进未知分支。
+    language = str(raw("language", settings.default_language)).lower()
+    if language not in ("zh", "en"):
+        language = settings.default_language if settings.default_language in ("zh", "en") else "zh"
+
+    requested = raw("languages", settings.language_list)
+    if isinstance(requested, str):
+        requested = [x.strip() for x in requested.split(",")]
+    languages: list[str] = []
+    for item in [language, *[str(x).lower() for x in (requested or []) if x]]:
+        if item in ("zh", "en") and item not in languages:
+            languages.append(item)
+
     return {
         "duration_min": duration,
         "level": level,
@@ -390,6 +552,8 @@ def _parse_options(source: Any, settings: Settings) -> dict[str, Any]:
         "voice_b": normalize_voice(
             _as_str(raw("voice_b")), settings.default_voice_b
         ),
+        "language": language,
+        "languages": languages or [language],
     }
 
 
@@ -556,9 +720,10 @@ def _ranged_response(request: Request, path: Path, media_type: str) -> Response:
 
 
 @router.get("/episodes/{episode_id}/audio")
-async def get_audio(request: Request, episode_id: str):
+async def get_audio(request: Request, episode_id: str, lang: str | None = Query(None)):
     record = _require_episode(request, episode_id)
-    audio_path = record.get("audio_path")
+    _, version = _resolve_version(request, record, lang)
+    audio_path = version.get("audio_path")
     if not audio_path or not Path(audio_path).exists():
         raise HTTPException(status_code=404, detail="这一集还没有音频")
 
@@ -568,21 +733,29 @@ async def get_audio(request: Request, episode_id: str):
 
 
 @router.post("/episodes/{episode_id}/video/rebuild", response_model=Episode)
-async def rebuild_video(request: Request, episode_id: str):
+async def rebuild_video(
+    request: Request, episode_id: str, lang: str | None = Query(None)
+):
     """用现有素材重新合成视频（配图人工校正后用）。
 
     音频、脚本、解读都不动，只重新渲染画面并编码。**复用上次的画面分配**，
     不再调用模型 —— 否则「我只转了一张图，怎么画面全变了」。
 
+    双语集要用 `?lang=` 指定重合成哪一版；不带则重合成主语言那一版。
+
     重新合成是重活（渲染 + 编码，约 20 秒），所以同步等待而不是丢进队列：
     调用方（前端）要明确知道什么时候能看到新视频。
     """
     record = _require_episode(request, episode_id)
-    if not record.get("video_path"):
+    # 先校验语言：未知语言应当是 404，而不是走到「还没有视频」的 409
+    _resolve_version(request, record, lang)
+    if not record.get("video_path") and not (record.get("versions") or {}):
         raise HTTPException(status_code=409, detail="这一集还没有视频，无法重新合成")
 
     try:
-        await _queue(request).pipeline.rebuild_video(episode_id)
+        await _queue(request).pipeline.rebuild_video(episode_id, lang)
+    except LanguageNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except VideoError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -592,14 +765,15 @@ async def rebuild_video(request: Request, episode_id: str):
 
 
 @router.get("/episodes/{episode_id}/video")
-async def get_video(request: Request, episode_id: str):
+async def get_video(request: Request, episode_id: str, lang: str | None = Query(None)):
     """视频解读播客（MP4）。
 
     同样支持 Range：视频拖动进度条比音频更依赖它，而且播放器通常先发一个
     小 range 探测 moov box。
     """
     record = _require_episode(request, episode_id)
-    video_path = record.get("video_path")
+    _, version = _resolve_version(request, record, lang)
+    video_path = version.get("video_path")
     if not video_path or not Path(video_path).exists():
         raise HTTPException(status_code=404, detail="这一集还没有视频")
 
@@ -607,10 +781,11 @@ async def get_video(request: Request, episode_id: str):
 
 
 @router.get("/episodes/{episode_id}/script.txt")
-async def get_script(request: Request, episode_id: str):
+async def get_script(request: Request, episode_id: str, lang: str | None = Query(None)):
     record = _require_episode(request, episode_id)
-    content = render_script_text(record)
-    filename = f"{_safe_filename(record['title'])}-脚本.txt"
+    language, version = _resolve_version(request, record, lang)
+    content = render_script_text({**record, **version}, language)
+    filename = _download_filename(record, language, "-脚本.txt")
     return Response(
         content=content,
         media_type="text/plain; charset=utf-8",
@@ -621,10 +796,11 @@ async def get_script(request: Request, episode_id: str):
 
 
 @router.get("/episodes/{episode_id}/analysis.md")
-async def get_analysis(request: Request, episode_id: str):
+async def get_analysis(request: Request, episode_id: str, lang: str | None = Query(None)):
     record = _require_episode(request, episode_id)
-    content = render_analysis_markdown(record)
-    filename = f"{_safe_filename(record['title'])}-解读.md"
+    language, version = _resolve_version(request, record, lang)
+    content = render_analysis_markdown({**record, **version}, language)
+    filename = _download_filename(record, language, "-解读.md")
     return Response(
         content=content,
         media_type="text/markdown; charset=utf-8",
@@ -732,17 +908,22 @@ async def delete_figure(request: Request, episode_id: str, figure_id: str):
 
 
 @router.get("/episodes/{episode_id}/illustration.png")
-async def get_illustration_png(request: Request, episode_id: str):
+async def get_illustration_png(
+    request: Request, episode_id: str, lang: str | None = Query(None)
+):
     """生成的信息图（栅格版），用于列表缩略图等场景。"""
     record = _require_episode(request, episode_id)
-    stored = record.get("illustration") or {}
+    _, version = _resolve_version(request, record, lang)
+    stored = version.get("illustration") or {}
     if not stored.get("png_path"):
         raise HTTPException(status_code=404, detail="这一集还没有生成配图")
     return _png_response(Path(stored["png_path"]))
 
 
 @router.get("/episodes/{episode_id}/illustration.svg")
-async def get_illustration_svg(request: Request, episode_id: str):
+async def get_illustration_svg(
+    request: Request, episode_id: str, lang: str | None = Query(None)
+):
     """生成的信息图（原始 SVG）。
 
     直出 SVG 是为了让里面的 SMIL 动画能播放——截图成 PNG 就变死图了。
@@ -750,7 +931,8 @@ async def get_illustration_svg(request: Request, episode_id: str):
     这里再补一层 CSP 兜底。前端务必用 <img>/<object> 引用，不要内联进 HTML。
     """
     record = _require_episode(request, episode_id)
-    stored = record.get("illustration") or {}
+    _, version = _resolve_version(request, record, lang)
+    stored = version.get("illustration") or {}
     svg_path = stored.get("svg_path")
     if not svg_path or not Path(svg_path).exists():
         raise HTTPException(status_code=404, detail="这一集还没有生成配图")

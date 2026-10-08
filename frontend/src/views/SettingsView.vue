@@ -2,8 +2,10 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import { IS_MOCK } from '../api'
+import type { EpisodeLanguage } from '../api'
 import { useMetaStore } from '../stores/meta'
 import { DEFAULT_PREFERENCES, usePreferencesStore } from '../stores/preferences'
+import { LANGUAGE_OPTIONS, languagesText } from '../utils/language'
 import { LEVEL_LABELS } from '../utils/stages'
 
 const meta = useMetaStore()
@@ -23,10 +25,23 @@ const savedText = computed(() =>
 const previewText = computed(() => {
   const voiceA = meta.options.voices.find((voice) => voice.id === form.value.voice_a)
   const voiceB = meta.options.voices.find((voice) => voice.id === form.value.voice_b)
-  return `${form.value.duration_min} 分钟 · ${LEVEL_LABELS[form.value.level]} · ${
-    voiceA?.label ?? form.value.voice_a
-  } + ${voiceB?.label ?? form.value.voice_b}`
+  return `${form.value.duration_min} 分钟 · ${LEVEL_LABELS[form.value.level]} · ${languagesText(
+    form.value.languages,
+  )} · ${voiceA?.label ?? form.value.voice_a} + ${voiceB?.label ?? form.value.voice_b}`
 })
+
+/** 语言版本：多选、至少一个（与首页表单同一套规则，契约 §1） */
+function toggleLanguage(language: EpisodeLanguage): void {
+  const current = form.value.languages
+  if (current.includes(language)) {
+    if (current.length === 1) return // 至少留一个
+    form.value.languages = current.filter((item) => item !== language)
+    return
+  }
+  form.value.languages = LANGUAGE_OPTIONS.map((option) => option.value).filter(
+    (value) => value === language || current.includes(value),
+  )
+}
 
 function save(): void {
   prefs.update({ ...form.value })
@@ -73,7 +88,8 @@ onMounted(() => {
       <p class="eyebrow">Settings · 设置</p>
       <h1 class="page-title">默认偏好与运行状态</h1>
       <p class="page-subtitle">
-        这里保存的时长 / 难度 / 音色会作为首页导入表单的默认值，保存在浏览器 localStorage 里，不会上传到后端。
+        这里保存的时长 / 难度 / 语言版本 / 音色会作为首页导入表单的默认值，保存在浏览器
+        localStorage 里，不会上传到后端。
       </p>
     </header>
 
@@ -116,6 +132,33 @@ onMounted(() => {
               </button>
             </div>
           </div>
+        </div>
+
+        <hr class="divider" />
+
+        <div class="field">
+          <span class="field__label">语言版本（至少选一个）</span>
+          <div class="chips" role="group" aria-label="默认要生成的语言版本">
+            <button
+              v-for="option in LANGUAGE_OPTIONS"
+              :key="option.value"
+              type="button"
+              class="chip"
+              :class="{ 'is-active': form.languages.includes(option.value) }"
+              :aria-pressed="form.languages.includes(option.value)"
+              :title="
+                form.languages.length === 1 && form.languages.includes(option.value)
+                  ? '至少保留一个语言版本'
+                  : option.label
+              "
+              @click="toggleLanguage(option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
+          <span class="field__hint">
+            中英两版共用同一份配图，脚本、解读、音频、视频各自独立。只选一个语言时，详情页不会出现切换器。
+          </span>
         </div>
 
         <hr class="divider" />

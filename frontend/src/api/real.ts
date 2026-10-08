@@ -1,10 +1,12 @@
 import { ApiError } from './error'
+import { sanitizeLanguages } from '../utils/language'
 import type {
   ApiAdapter,
   CreateFileInput,
   CreateTextInput,
   CreateUrlInput,
   Episode,
+  EpisodeLanguage,
   EpisodeOptionsInput,
   FigureRotateDirection,
   HealthPayload,
@@ -52,7 +54,16 @@ function normalizeOptions(options?: EpisodeOptionsInput): Required<EpisodeOption
     level: options?.level ?? 'intro',
     voice_a: options?.voice_a ?? 'zh_male_dayixiansheng_v2_saturn_bigtts',
     voice_b: options?.voice_b ?? 'zh_female_mizaitongxue_v2_saturn_bigtts',
+    // 契约 §1：默认只生成主语言；空数组也退回默认，免得后端收到「一个语言都不要」
+    languages: sanitizeLanguages(options?.languages).length
+      ? sanitizeLanguages(options?.languages)
+      : ['zh'],
   }
+}
+
+/** 契约 §2：资源接口用 `?lang=` 取对应语言，省略时取主语言 */
+function langQuery(lang?: EpisodeLanguage): string {
+  return lang ? `?lang=${encodeURIComponent(lang)}` : ''
 }
 
 export const mode = 'real' as const
@@ -66,39 +77,42 @@ export function getOptions(): Promise<OptionsPayload> {
 }
 
 export function createEpisodeFromFile(input: CreateFileInput): Promise<Episode> {
-  const { duration_min, level, voice_a, voice_b } = normalizeOptions(input.options)
+  const { duration_min, level, voice_a, voice_b, languages } = normalizeOptions(input.options)
   const form = new FormData()
   form.append('file', input.file)
   form.append('duration_min', String(duration_min))
   form.append('level', level)
   form.append('voice_a', voice_a)
   form.append('voice_b', voice_b)
+  // 契约 §2：multipart 的 languages 是**逗号分隔字符串**（如 zh,en），不是数组
+  form.append('languages', languages.join(','))
   // 不要手动设置 Content-Type，交给浏览器带上 multipart boundary
   return request<Episode>('/episodes', { method: 'POST', body: form })
 }
 
 export function createEpisodeFromUrl(input: CreateUrlInput): Promise<Episode> {
-  const { duration_min, level, voice_a, voice_b } = normalizeOptions(input.options)
+  const { duration_min, level, voice_a, voice_b, languages } = normalizeOptions(input.options)
   return request<Episode>('/episodes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       source_type: 'url',
       url: input.url,
-      options: { duration_min, level, voice_a, voice_b },
+      // 契约 §2：JSON 形态的 languages 是数组
+      options: { duration_min, level, voice_a, voice_b, languages },
     }),
   })
 }
 
 export function createEpisodeFromText(input: CreateTextInput): Promise<Episode> {
-  const { duration_min, level, voice_a, voice_b } = normalizeOptions(input.options)
+  const { duration_min, level, voice_a, voice_b, languages } = normalizeOptions(input.options)
   return request<Episode>('/episodes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       source_type: 'text',
       text: input.text,
-      options: { duration_min, level, voice_a, voice_b },
+      options: { duration_min, level, voice_a, voice_b, languages },
     }),
   })
 }
@@ -160,16 +174,19 @@ export function deleteFigure(id: string, figureId: string): Promise<Episode> {
  * 返回更新后的完整 Episode：`video.url` 上带着新的 `?v=` 版本号（内容变了，缓存自动失效），
  * `video.stale` 归位为 false。没有视频时后端返回 409，由 ApiError 带到界面上。
  */
-export function rebuildVideo(id: string): Promise<Episode> {
-  return request<Episode>(`/episodes/${encodeURIComponent(id)}/video/rebuild`, { method: 'POST' })
+export function rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<Episode> {
+  return request<Episode>(
+    `/episodes/${encodeURIComponent(id)}/video/rebuild${langQuery(lang)}`,
+    { method: 'POST' },
+  )
 }
 
-export function scriptTxtUrl(id: string): string {
-  return `${BASE}/episodes/${encodeURIComponent(id)}/script.txt`
+export function scriptTxtUrl(id: string, lang?: EpisodeLanguage): string {
+  return `${BASE}/episodes/${encodeURIComponent(id)}/script.txt${langQuery(lang)}`
 }
 
-export function analysisMdUrl(id: string): string {
-  return `${BASE}/episodes/${encodeURIComponent(id)}/analysis.md`
+export function analysisMdUrl(id: string, lang?: EpisodeLanguage): string {
+  return `${BASE}/episodes/${encodeURIComponent(id)}/analysis.md${langQuery(lang)}`
 }
 
 const adapter: ApiAdapter = {

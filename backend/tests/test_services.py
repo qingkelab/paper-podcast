@@ -399,3 +399,256 @@ class TestArxivUrlRewrite:
         """正文前半段合法地提到 references 时不能被误砍。"""
         text = "References to prior work are common.\n" + "正文内容。" * 60
         assert "References to prior work" in clean_text(text)
+
+
+class TestBilingualUnits:
+    """双语的「单位换算」与语言规划。这些是最容易搞错、又最难从现象上看出来的地方。"""
+
+    def test_english_word_count_is_words_not_chars(self):
+        """`word_count` 是时长预算的单位数：中文数字符，英文数词。
+
+        曾经按字符数统一统计，结果英文时长被高估 4~5 倍
+        （2081 字符当成 2081 词 → 13.9 分钟，实际约 2.4 分钟）。
+        """
+        text = "one two three four five"
+        zh = build_script_payload([{"speaker": "A", "text": text}], language="zh")
+        en = build_script_payload([{"speaker": "A", "text": text}], language="en")
+        assert zh["word_count"] == len(text)
+        assert en["word_count"] == 5
+
+    def test_english_estimate_uses_word_rate(self):
+        """150 词应该正好估出 150/WORDS_PER_MINUTE_EN 分钟。
+
+        断言的是「跟着常量走」，不是某个魔数 —— 这样以后重新实测语速时
+        只需要改常量，不用再改一遍测试。
+        """
+        words = 150
+        text = " ".join(["word"] * words)
+        payload = build_script_payload([{"speaker": "A", "text": text}], language="en")
+        expected = words / prompts.WORDS_PER_MINUTE_EN * 60
+        assert payload["est_duration_sec"] == pytest.approx(expected, abs=1)
+        assert payload["word_count"] == words
+
+    def test_chinese_estimate_unchanged(self):
+        payload = build_script_payload([{"speaker": "A", "text": "字" * 350}])
+        assert payload["est_duration_sec"] == pytest.approx(60, abs=2)
+
+    def test_target_chars_differs_by_language(self):
+        zh = prompts.target_chars(5, 0, 0.0, "zh")
+        en = prompts.target_chars(5, 0, 0.0, "en")
+        assert zh == 1750
+        # 英文按词算：5 分钟 × WORDS_PER_MINUTE_EN
+        assert en == int(5 * prompts.WORDS_PER_MINUTE_EN)
+        # 同一篇论文的英文稿「单位数」必然远少于中文 —— 1 个英文词要念好几倍时长
+        assert en < zh / 2
+
+    def test_brand_padding_is_per_language(self):
+        from app import branding
+
+        zh = branding.brand_char_count("zh")
+        en = branding.brand_char_count("en")
+        assert zh > 0 and en > 0
+        # 英文话术按词算，量级必然比中文按字算小得多
+        assert en < zh
+
+    def test_brand_copy_is_really_english(self):
+        from app import branding
+
+        intro = " ".join(seg["text"] for seg in branding.intro_segments("en"))
+        outro = " ".join(seg["text"] for seg in branding.outro_segments("en"))
+        title, _ = branding.cta_text("en")
+        for text in (intro, outro, title):
+            cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+            assert cjk == 0, f"英文品牌话术里混进了中文：{text}"
+
+
+class TestLanguagePlan:
+    """语言规划：哪些版本要产出、谁是主语言。"""
+
+    def _settings(self, **kwargs):
+        from app.config import Settings
+
+        return Settings(force_mock=True, **kwargs)
+
+    def test_primary_comes_first(self):
+        from app.services.pipeline import language_plan
+
+        primary, languages = language_plan(
+            {"language": "en", "languages": ["zh", "en"]}, self._settings()
+        )
+        assert primary == "en"
+        assert languages == ["en", "zh"]
+
+    def test_defaults_come_from_settings(self):
+        from app.services.pipeline import language_plan
+
+        primary, languages = language_plan({}, self._settings(languages="zh,en"))
+        assert (primary, languages) == ("zh", ["zh", "en"])
+
+    def test_unknown_language_values_are_dropped(self):
+        from app.services.pipeline import language_plan
+
+        primary, languages = language_plan(
+            {"language": "jp", "languages": ["en", "jp"]}, self._settings()
+        )
+        assert primary == "zh"
+        assert languages == ["zh", "en"]
+
+    def test_single_language_default(self):
+        from app.services.pipeline import language_plan
+
+        assert language_plan({}, self._settings()) == ("zh", ["zh"])
+
+    def test_audio_filename_keeps_primary_unsuffixed(self):
+        """主语言的音频文件名不能变 —— 改了会让已经生成好的集全部失效。"""
+        from app.services.pipeline import audio_filename, video_filename
+
+        assert audio_filename("abc123", "zh", "zh") == "abc123.mp3"
+        assert audio_filename("abc123", "en", "zh") == "abc123.en.mp3"
+        assert video_filename("abc123", "zh", "zh") == "abc123.mp4"
+        assert video_filename("abc123", "en", "zh") == "abc123.en.mp4"
+
+
+class TestMockScriptLanguage:
+    def test_english_mock_is_not_a_copy(self):
+        meta, analysis = mock_analysis("attention transformer", language="en")
+        script = mock_script(
+            analysis, meta, duration_min=5, level="intro", language="en"
+        )
+        text = " ".join(s["text"] for s in script["segments"])
+        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        assert cjk / len(text) < 0.05
+        assert script["word_count"] < prompts.target_chars(5, 0, 0.0, "en") * 1.5
+
+    def test_chinese_mock_still_chinese(self):
+        meta, analysis = mock_analysis("attention transformer", language="zh")
+        script = mock_script(analysis, meta, duration_min=5, level="intro", language="zh")
+        text = " ".join(s["text"] for s in script["segments"])
+        assert "今天聊的" in text
+
+
+class TestSplitLongSegments:
+    """TTS 单轮字符上限的兜底切分。
+
+    双语上线前这里没被发现：豆包的播客接口对**单个 round 的文本长度**有硬上限
+    （实测 >300 字符直接拒绝，错误码 40000010）。中文一段 120 字 ≈ 120 字符撞不到，
+    英文一段 50 词就有 300 字符 —— 所以这个坑是英文版上线时才炸出来的，
+    而且炸在 TTS 阶段，触发 worker 整条流水线重跑（重新解读 + 重新生成配图）。
+    """
+
+    def test_short_segments_untouched(self):
+        from app.services.llm import split_long_segments
+
+        segments = [{"speaker": "A", "text": "短句。"}, {"speaker": "B", "text": "也短。"}]
+        out = split_long_segments(segments, max_chars=280)
+        assert [s["text"] for s in out] == ["短句。", "也短。"]
+
+    def test_reproduces_the_real_english_failure(self):
+        """真实失败样本：一段 309 字符的英文发言。"""
+        from app.services.llm import split_long_segments
+
+        text = (
+            "Right, and that is the part people usually miss: the adapter is not "
+            "learning a new task, it is learning a correction on top of weights that "
+            "already encode most of what you need, which is why it converges fast "
+            "even though the trainable parameter count is three orders of magnitude "
+            "smaller than what full fine-tuning would touch."
+        )
+        assert len(text) > 300, len(text)
+
+        out = split_long_segments([{"speaker": "A", "text": text}], max_chars=280)
+        assert len(out) >= 2
+        assert all(len(s["text"]) <= 280 for s in out)
+        assert all(s["speaker"] == "A" for s in out)
+        # 切分不能丢字（只允许因为 strip 少掉空白）
+        assert "".join(s["text"] for s in out).replace(" ", "") == text.replace(" ", "")
+
+    def test_prefers_sentence_boundary(self):
+        from app.services.llm import split_long_segments
+
+        text = ("A" * 100) + "。" + ("B" * 100) + "。" + ("C" * 100) + "。"
+        out = split_long_segments([{"speaker": "B", "text": text}], max_chars=150)
+        assert all(len(s["text"]) <= 150 for s in out)
+        assert out[0]["text"].endswith("。"), out[0]["text"]
+        assert out[1]["text"].endswith("。"), out[1]["text"]
+
+    def test_no_break_token_falls_back_to_hard_cut(self):
+        from app.services.llm import split_long_segments
+
+        out = split_long_segments(
+            [{"speaker": "A", "text": "字" * 700}], max_chars=280
+        )
+        assert len(out) == 3
+        assert all(len(s["text"]) <= 280 for s in out)
+
+    def test_brand_marker_survives_split(self):
+        from app.services.llm import split_long_segments
+
+        out = split_long_segments(
+            [{"speaker": "A", "text": "啊" * 600, "brand": "outro"}], max_chars=280
+        )
+        assert all(s.get("brand") == "outro" for s in out), "片尾标记丢了，视频会不认品牌卡"
+
+    def test_limit_is_what_the_api_actually_enforces(self):
+        """280 是给接口的 300 留的余量，不是随手定的数。"""
+        assert prompts.MAX_ROUND_CHARS < 300
+
+    def test_zh_and_en_prompts_both_state_the_limit(self):
+        zh = prompts.script_system("zh")
+        en = prompts.script_system("en")
+        assert "260" in zh
+        assert "280" in en
+        # 英文那段必须是英文写的，否则模型会按中文的「字」理解词数
+        assert "characters per" in en
+
+
+class TestEnglishPromptIsWrittenInEnglish:
+    """英文版的 user brief 必须是英文、且长度单位说 "words"。
+
+    中文那句「正文总字数控制在 X-Y 字之间」在英文输出里会被模型当成词数，
+    实测英文脚本因此比目标长 30%（目标 382 词、实际 496 词，成片 238 秒 vs 180 秒）。
+    """
+
+    _ANALYSIS = {
+        "background": "bg",
+        "innovations": ["a", "b"],
+        "method": "m",
+        "experiments": "e",
+        "conclusion": "c",
+        "limitations": ["l"],
+        "value": "v",
+        "future": ["f"],
+    }
+
+    def test_brief_is_english_and_counts_words(self):
+        messages = prompts.build_script_messages(
+            self._ANALYSIS, {"title": "T"}, duration_min=5, level="intro", language="en"
+        )
+        body = messages[-1]["content"]
+        assert "words" in body
+        assert "Target length" in body
+        cjk = sum(1 for ch in body if "\u4e00" <= ch <= "\u9fff")
+        # 允许出现被引用的论文标题里的中文，但整体不能是中文 brief
+        assert cjk < 20, f"英文 brief 里混了大量中文：{body[:200]}"
+
+    def test_english_system_prompt_has_no_chinese_instructions(self):
+        system = prompts.build_script_messages(
+            self._ANALYSIS, {"title": "T"}, duration_min=5, level="intro", language="en"
+        )[0]["content"]
+        assert "HARD LIMIT" in system
+        cjk = sum(1 for ch in system if "\u4e00" <= ch <= "\u9fff")
+        assert cjk == 0, "英文版的 system prompt 里还有中文要求"
+
+    def test_chinese_brief_unchanged(self):
+        body = prompts.build_script_messages(
+            self._ANALYSIS, {"title": "T"}, duration_min=5, level="intro", language="zh"
+        )[-1]["content"]
+        assert "正文总字数控制在" in body
+        assert "【解读稿】" in body
+
+    def test_word_budget_scales_with_measured_rate(self):
+        body = prompts.build_script_messages(
+            self._ANALYSIS, {"title": "T"}, duration_min=10, level="intro", language="en"
+        )[-1]["content"]
+        words = prompts.target_chars(10, 0, 0.0, "en")
+        assert f"{int(words * 0.92)}-{int(words * 1.05)} words" in body

@@ -25,7 +25,9 @@
     "duration_min": 5,                  // 3 | 5 | 10
     "level": "intro",                   // "intro" | "advanced" | "expert"
     "voice_a": "zh_male_dayixiansheng_v2_saturn_bigtts",
-    "voice_b": "zh_female_mizaitongxue_v2_saturn_bigtts"
+    "voice_b": "zh_female_mizaitongxue_v2_saturn_bigtts",
+    "language": "zh",                   // 主语言
+    "languages": ["zh"]                 // 这一集实际产出的语言版本
   },
   "paper_meta": {                       // 全部字段可为 null
     "title": "...", "authors": ["..."], "abstract": "...",
@@ -74,8 +76,66 @@
 }
 ```
 
+### 双语版本（bilingual）
+
+每集可以有多个**语言版本**。**封面和论文原图是跨语言共用的**（都来自同一份 PDF，
+换个语言不会换图），但**脚本、解读、音频、视频、信息图各自独立** ——
+信息图要单独出一版是因为图上写着字，英文版配一张中文标注的图会很割裂。
+
+```jsonc
+{
+  // 顶层字段保持**向后兼容**：镜像主语言（primary）那一版的值。
+  // 老前端不改也能正常显示主语言。
+  "language": "zh",              // 主语言
+  "languages": ["zh", "en"],     // 本集已有的语言版本，按顺序
+  "versions": {                  // 按语言索引；没有的版本不出现
+    "zh": {
+      "language": "zh",
+      "script": { "segments": [...], "word_count": 1146, "est_duration_sec": 190 },
+      "analysis": { /* 同 §1 的 Analysis，该语言版本 */ },
+      "paper_meta": { /* 同 §1；标题作者本身多为英文，两版通常一致 */ },
+      "illustration": { /* 同 §1；png_url / svg_url 都带该语言的 ?lang= */ },
+      "audio_url": "/api/episodes/xxx/audio?v=1712345678-2304806",
+      "audio_duration_sec": 191.69,
+      "audio_bytes": 2304806,
+      "video": { "url": "/api/episodes/xxx/video?v=...", "duration_sec": 191.69,
+                 "scene_count": 21, "bytes": 4700000, "stale": false }
+    },
+    "en": {
+      "language": "en",
+      "...": "结构同上，但 audio_url / video.url / illustration 的 URL 带 ?lang=en"
+    }
+  }
+}
+```
+
+`languages` 的顺序 = 生成顺序（主语言一定排第一）。
+
+**主语言的资源 URL 不带 `?lang=`**，只有其他语言才带 —— 这样已经发布出去的
+主语言链接保持稳定，缓存也不会因为加参数而整体失效。
+
+**资源接口按 `?lang=` 取对应语言**，省略时取主语言：
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/episodes/{id}/audio?lang=en` | 该语言的音频 |
+| `GET /api/episodes/{id}/video?lang=en` | 该语言的视频 |
+| `POST /api/episodes/{id}/video/rebuild?lang=en` | 重新合成该语言的视频 |
+| `GET /api/episodes/{id}/script.txt?lang=en` | 该语言的脚本下载（含语言后缀的文件名） |
+| `GET /api/episodes/{id}/analysis.md?lang=en` | 该语言的解读下载 |
+| `GET /api/episodes/{id}/illustration.png?lang=en` | 该语言的信息图（`illustration.svg` 同理） |
+
+`lang` 传了这一集没有的语言 → `404`；`lang` 取值只接受 `zh` / `en`。
+
+**老数据的兼容**：双语之前生成的集在库里没有 `versions`，
+接口会**把顶层字段当成主语言那一版**回填成 `versions["zh"]`。
+所以前端只需要处理一种形状，不必为历史数据写特例。
+
+**新建时用 `options.languages` 指定要哪些版本**（见下）。
+
 列表接口返回的 Episode **省略** `analysis`、`script`、`figures`、`illustration`、`video`
-（分别置为 `null` / `[]`），详情接口才返回。但 **`cover_url` 在列表里保留**，
+（分别置为 `null` / `[]`），且 `versions` 里也只保留语言与音频信息。
+详情接口才返回完整内容。但 **`cover_url` 在列表里保留**，
 因为列表卡片要显示封面缩略图。
 
 ### 状态机
@@ -83,12 +143,16 @@
 | status | progress | stage_label（示例） | 含义 |
 |---|---|---|---|
 | `queued` | 0 | 排队中 | 已入库，等待 worker |
-| `parsing` | 10 | 正在解析论文 | PDF/链接/文本 → 干净文本 |
-| `analyzing` | 35 | 正在深度解读 | 调 LLM 出结构化解读 |
-| `scripting` | 55 | 正在生成播客脚本 | 调 LLM 出双人对谈脚本 |
-| `synthesizing` | 75 | 正在合成播客音频 | 调豆包播客 TTS |
+| `parsing` | 10 | 正在解析论文 | PDF/链接/文本 → 干净文本、封面、配图 |
+| `analyzing` | 15~99 | 正在深度解读（英文） | 调 LLM 出结构化解读 |
+| `scripting` | 15~99 | 正在生成播客脚本（英文） | 调 LLM 出双人对谈脚本 |
+| `synthesizing` | 15~99 | 正在合成播客音频（英文） | 调豆包播客 TTS |
 | `completed` | 100 | 已完成 | 全部产物就绪 |
 | `failed` | 保持失败时进度 | 失败 | `error` 字段有值 |
+
+单语言时进度大致还是 35 / 55 / 75；**双语时两个阶段各自占一段区间**
+（15→99 平均切开），这样进度条不会「中文跑完 75、英文又回 35」地倒退。
+`stage_label` 会标出当前是哪一版。
 
 ---
 
@@ -119,9 +183,14 @@
               { "value": "expert", "label": "专业" } ],
   "voices": [ { "id": "zh_male_dayixiansheng_v2_saturn_bigtts",
                 "label": "大义先生（男声·学术沉稳）",
-                "gender": "male", "pair": "mizai-dayi" } ]
+                "gender": "male", "pair": "mizai-dayi", "language": "zh" } ],
+  "languages": [ { "value": "zh", "label": "中文" },
+                 { "value": "en", "label": "English" } ]
 }
 ```
+
+`languages` 是**服务端支持**的语言（用于新建时选择要产出哪些版本）；
+`voices[].language` 决定该音色属于哪一种版本，前端按当前语言过滤音色列表。
 
 ### `POST /api/episodes`
 
@@ -138,6 +207,8 @@
 | `level` | str | 否 | 默认 `intro` |
 | `voice_a` | str | 否 | 默认见 §5 |
 | `voice_b` | str | 否 | 默认见 §5 |
+| `language` | str | 否 | 主语言，`zh` 或 `en`。默认取服务端 `DEFAULT_LANGUAGE` |
+| `languages` | str | 否 | 逗号分隔，如 `zh,en`。默认取服务端 `LANGUAGES`（默认只有 `zh`） |
 
 **B. `application/json`**（链接 / 纯文本）
 
@@ -146,7 +217,11 @@
   "source_type": "url",           // "url" | "text"
   "url": "https://arxiv.org/abs/1706.03762",   // source_type=url 时必填
   "text": "……",                    // source_type=text 时必填
-  "options": { "duration_min": 5, "level": "intro" }
+  "options": {
+    "duration_min": 5, "level": "intro",
+    "language": "zh",                  // 可选，主语言
+    "languages": ["zh", "en"]          // 可选，要产出哪些版本
+  }
 }
 ```
 

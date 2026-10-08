@@ -116,6 +116,43 @@ export interface VideoInfo {
   stale?: boolean
 }
 
+/**
+ * 语言版本标识（契约 §1「双语版本（bilingual）」）。
+ *
+ * `versions` 的 key 就是这两个值，`languages` 里列出的也是它们；
+ * 契约目前只定义 `zh` / `en`，所以这里收成字面量联合 —— 视图层拿到后端数据后
+ * 一律用 `isEpisodeLanguage()` 收窄，不认识的取值会被当成「没有这个版本」。
+ */
+export type EpisodeLanguage = 'zh' | 'en'
+
+/** 运行时收窄：后端将来新增语言时不会让页面崩，只会认不出来 */
+export function isEpisodeLanguage(value: unknown): value is EpisodeLanguage {
+  return value === 'zh' || value === 'en'
+}
+
+/**
+ * 单个语言版本（契约 §1「双语版本」）。
+ *
+ * 为什么会有它：同一集可以同时有中文和英文两版，讲的是同一篇论文，
+ * **配图共用**（封面 / 论文原图 / 信息图都在 Episode 顶层，不在这里），
+ * 但脚本、解读、音频、视频各语言独立 —— 图不用重做，声音必须分语言。
+ */
+export interface EpisodeVersion {
+  language: EpisodeLanguage
+  /** 该语言的脚本 */
+  script: Script | null
+  /** 该语言的结构化解读 */
+  analysis: Analysis | null
+  /** 该语言的论文元信息（标题作者本身多为英文，两版通常一致） */
+  paper_meta: PaperMeta | null
+  /** 该语言的音频（契约 §2：GET /episodes/{id}/audio?lang=xx） */
+  audio_url: string | null
+  audio_duration_sec: number | null
+  audio_bytes: number | null
+  /** 该语言的视频解读，无则 null */
+  video: VideoInfo | null
+}
+
 export interface Episode {
   id: string
   title: string
@@ -144,16 +181,35 @@ export interface Episode {
   audio_bytes: number | null
   created_at: string
   updated_at: string
+
+  // --- 双语版本（契约 §1「双语版本（bilingual）」） --------------------------
+  //
+  // 上面的**顶层字段 mirror 主语言那一版**（`language` 指的那一版），所以老代码
+  // 只读顶层字段照样能跑。新代码应当优先读 `versions`。
+  //
+  // 这三个字段都标成可选：老数据（双语功能上线前生成的单集）没有它们，
+  // 老后端也不会返回。缺失时一律退回顶层字段，并且**不显示语言切换器**。
+
+  /** 主语言；缺省时按 `languages[0]` 推断 */
+  language?: EpisodeLanguage | null
+  /** 本集已有的语言版本，顺序 = 生成顺序（先默认语言，后其他） */
+  languages?: EpisodeLanguage[] | null
+  /** 按语言索引；没有的版本不出现（所以是 Partial） */
+  versions?: Partial<Record<EpisodeLanguage, EpisodeVersion>> | null
 }
 
 /**
  * 列表接口返回的 Episode（契约 §1）：
  * 省略 analysis / script（置为 null）、figures（置为 []）、illustration / video（置为 null）。
  * 但 cover_url / cover_width / cover_height 在列表里保留，列表卡片要显示封面缩略图。
+ *
+ * `versions` 同样不放进列表项：它内部装的就是 script / analysis / video 这些大字段，
+ * 带上它就等于列表接口白白拖着多份正文。`language` / `languages` 保留（只有一个字符串数组，
+ * 列表上要显示「中文 / English」这类角标时用得到）。
  */
 export type EpisodeSummary = Omit<
   Episode,
-  'analysis' | 'script' | 'figures' | 'illustration' | 'video'
+  'analysis' | 'script' | 'figures' | 'illustration' | 'video' | 'versions'
 >
 
 export interface ListEpisodesParams {
@@ -206,6 +262,12 @@ export interface EpisodeOptionsInput {
   level?: LevelValue
   voice_a?: string
   voice_b?: string
+  /**
+   * 要生成哪些语言版本（契约 §1「新建时用 options.languages 指定要哪些版本」）。
+   * 省略时后端按 `["zh"]` 处理。multipart 上传提交的是逗号分隔字符串（`zh,en`），
+   * 由 real.ts 负责转换，调用方一律传数组。
+   */
+  languages?: EpisodeLanguage[]
 }
 
 export interface CreateFileInput {
@@ -249,16 +311,19 @@ export interface ApiAdapter {
   /** 删掉一张不需要的配图（只从这一集移除，不删源 PDF）。返回更新后的完整 Episode。 */
   deleteFigure(id: string, figureId: string): Promise<Episode>
   /**
-   * 用现有素材**重新合成视频**（契约 §2：POST /video/rebuild）。
+   * 用现有素材**重新合成视频**（契约 §2：POST /video/rebuild?lang=xx）。
    *
    * 为什么需要它：视频是把配图烘焙进 MP4 的，人工校正配图后已生成的视频里还是旧画面。
    * 它复用上次的画面分配、不调用模型，所以只要十几秒（实测约 11 秒），
    * 而且画面不会因为「我只转了一张图」就全变。返回更新后的完整 Episode
    * （`video.url` 带上了新的 `?v=` 版本号，`video.stale` 归位为 false）。
+   *
+   * `lang` 指定要重新合成哪个语言版本，省略时后端取主语言：
+   * 中英两版的视频是各自独立的产物，只该重做用户当前在看的那一版。
    */
-  rebuildVideo(id: string): Promise<Episode>
-  /** 脚本 txt 的下载地址（mock 下是 Blob URL） */
-  scriptTxtUrl(id: string): string
-  /** 结构化解读 md 的下载地址（mock 下是 Blob URL） */
-  analysisMdUrl(id: string): string
+  rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<Episode>
+  /** 脚本 txt 的下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
+  scriptTxtUrl(id: string, lang?: EpisodeLanguage): string
+  /** 结构化解读 md 的下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
+  analysisMdUrl(id: string, lang?: EpisodeLanguage): string
 }

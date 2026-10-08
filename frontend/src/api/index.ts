@@ -66,21 +66,22 @@ export function deleteFigure(id: string, figureId: string) {
 }
 
 /**
- * 用现有素材重新合成视频（契约 §2：POST /video/rebuild）。
+ * 用现有素材重新合成视频（契约 §2：POST /video/rebuild?lang=xx）。
  * 复用上次的画面分配、不调用模型，实测约 11 秒 —— 调用方必须给 loading 反馈，别当它瞬间返回。
+ * `lang` 指定重新合成哪个语言版本（中英两版的视频是两个独立产物），省略时取主语言。
  */
-export function rebuildVideo(id: string) {
-  return adapter.rebuildVideo(id)
+export function rebuildVideo(id: string, lang?: Parameters<ApiAdapter['rebuildVideo']>[1]) {
+  return adapter.rebuildVideo(id, lang)
 }
 
-/** 脚本 txt 下载地址（mock 下是 Blob URL） */
-export function scriptTxtUrl(id: string) {
-  return adapter.scriptTxtUrl(id)
+/** 脚本 txt 下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
+export function scriptTxtUrl(id: string, lang?: Parameters<ApiAdapter['scriptTxtUrl']>[1]) {
+  return adapter.scriptTxtUrl(id, lang)
 }
 
-/** 结构化解读 md 下载地址（mock 下是 Blob URL） */
-export function analysisMdUrl(id: string) {
-  return adapter.analysisMdUrl(id)
+/** 结构化解读 md 下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
+export function analysisMdUrl(id: string, lang?: Parameters<ApiAdapter['analysisMdUrl']>[1]) {
+  return adapter.analysisMdUrl(id, lang)
 }
 
 /** 音频地址：契约里 Episode.audio_url 已经是可播放的 URL（无音频时为 null） */
@@ -108,10 +109,12 @@ export type {
   CreateUrlInput,
   DurationOption,
   Episode,
+  EpisodeLanguage,
   EpisodeOptions,
   EpisodeOptionsInput,
   EpisodeStatus,
   EpisodeSummary,
+  EpisodeVersion,
   Figure,
   FigureRotateDirection,
   HealthPayload,
@@ -129,3 +132,5 @@ export type {
   VideoInfo,
   VoiceOption,
 } from './types'
+// 运行时函数：语言标识的收窄（老数据里可能是任意字符串）
+export { isEpisodeLanguage } from './types'

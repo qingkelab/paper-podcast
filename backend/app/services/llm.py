@@ -128,14 +128,16 @@ class LLMClient:
     # ---------- 对外 ----------
 
     def analyze_paper(
-        self, paper_text: str, *, title_hint: str = ""
+        self, paper_text: str, *, title_hint: str = "", language: str = "zh"
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """返回 (paper_meta, analysis)。"""
         if self.mock:
-            return mock_analysis(paper_text, title_hint=title_hint)
+            return mock_analysis(paper_text, title_hint=title_hint, language=language)
 
         data = self._chat_json(
-            prompts.build_analysis_messages(paper_text, title_hint=title_hint),
+            prompts.build_analysis_messages(
+                paper_text, title_hint=title_hint, language=language
+            ),
             max_tokens=4000,
         )
         meta = _normalize_meta(data.get("paper_meta"))
@@ -177,6 +179,7 @@ class LLMClient:
         level: str,
         speech_rate: int = 0,
         padding_sec: float = 0.0,
+        language: str = "zh",
     ) -> dict[str, Any]:
         """返回 script dict：{segments, word_count, est_duration_sec}。"""
         if self.mock:
@@ -187,6 +190,7 @@ class LLMClient:
                 level=level,
                 speech_rate=speech_rate,
                 padding_sec=padding_sec,
+                language=language,
             )
 
         data = self._chat_json(
@@ -197,6 +201,7 @@ class LLMClient:
                 level=level,
                 speech_rate=speech_rate,
                 padding_sec=padding_sec,
+                language=language,
             ),
             max_tokens=8000,
             temperature=0.9,  # 脚本需要文采，适度放开
@@ -206,7 +211,7 @@ class LLMClient:
             raise LLMError("模型生成的播客脚本过短，无法合成")
 
         script = build_script_payload(
-            segments, speech_rate=speech_rate, padding_sec=padding_sec
+            segments, speech_rate=speech_rate, padding_sec=padding_sec, language=language
         )
         return self._repair_length_if_needed(
             script,
@@ -215,6 +220,7 @@ class LLMClient:
             level=level,
             speech_rate=speech_rate,
             padding_sec=padding_sec,
+            language=language,
         )
 
     def _repair_length_if_needed(
@@ -226,6 +232,7 @@ class LLMClient:
         level: str,
         speech_rate: int,
         padding_sec: float = 0.0,
+        language: str = "zh",
     ) -> dict[str, Any]:
         """生成后做一次确定性长度检查，偏短就补一次扩写。
 
@@ -234,12 +241,16 @@ class LLMClient:
         程度不稳定，所以用「检查实际字数 → 不达标才补救」兜底，
         而不是反复调措辞。只补一次，避免无限循环和成本失控。
         """
-        target = prompts.target_chars(duration_min, speech_rate, padding_sec)
+        target = prompts.target_chars(duration_min, speech_rate, padding_sec, language)
         actual = script.get("word_count", 0)
 
         if actual > target * LENGTH_TRIM_THRESHOLD:
             return self._trim_script(
-                script, target=target, speech_rate=speech_rate, padding_sec=padding_sec
+                script,
+                target=target,
+                speech_rate=speech_rate,
+                padding_sec=padding_sec,
+                language=language,
             )
 
         if actual >= target * LENGTH_REPAIR_THRESHOLD:
@@ -255,7 +266,10 @@ class LLMClient:
         try:
             data = self._chat_json(
                 prompts.build_expand_messages(
-                    script["segments"], current_chars=actual, target=target
+                    script["segments"],
+                    current_chars=actual,
+                    target=target,
+                    language=language,
                 ),
                 max_tokens=12000,
                 temperature=0.85,
@@ -271,7 +285,7 @@ class LLMClient:
             return script
 
         repaired = build_script_payload(
-            expanded, speech_rate=speech_rate, padding_sec=padding_sec
+            expanded, speech_rate=speech_rate, padding_sec=padding_sec, language=language
         )
 
         # 扩写反而更短说明模型没按要求做，保留原稿更稳妥
@@ -295,6 +309,7 @@ class LLMClient:
         target: int,
         speech_rate: int,
         padding_sec: float = 0.0,
+        language: str = "zh",
     ) -> dict[str, Any]:
         """脚本超长时压缩一次。
 
@@ -312,7 +327,10 @@ class LLMClient:
         try:
             data = self._chat_json(
                 prompts.build_trim_messages(
-                    script["segments"], current_chars=actual, target=target
+                    script["segments"],
+                    current_chars=actual,
+                    target=target,
+                    language=language,
                 ),
                 max_tokens=8000,
                 temperature=0.4,  # 压缩要稳，不要发挥
@@ -327,7 +345,10 @@ class LLMClient:
             return script
 
         trimmed = build_script_payload(
-            trimmed_segments, speech_rate=speech_rate, padding_sec=padding_sec
+            trimmed_segments,
+            speech_rate=speech_rate,
+            padding_sec=padding_sec,
+            language=language,
         )
 
         # 精简后反而更长/基本没变，说明模型没按要求做。
@@ -523,15 +544,84 @@ def _normalize_segments(value: Any) -> list[dict[str, Any]]:
     return segments
 
 
+def split_long_segments(
+    segments: list[dict[str, Any]],
+    *,
+    max_chars: int = prompts.MAX_ROUND_CHARS,
+) -> list[dict[str, Any]]:
+    """把超过 TTS 单轮上限的发言切成多轮。
+
+    ⚠️ 为什么必须有这个兜底：豆包播客 TTS 对**单个 round 的文本长度**有硬上限
+    （实测 >300 字符直接拒绝，错误码 40000010）。prompt 里写了「每段 30-120 字」，
+    中文基本守规矩；**英文不守** —— 模型把「120 字」当成 120 个词，
+    写出一段 50 词 = 309 字符，于是整个任务在 TTS 阶段失败。
+    实测双语首次运行就这么挂的，而且失败后 worker 会整条流水线重跑一遍
+    （重新解读、重新生成配图、重新合成中文音频），代价很大。
+
+    切分点优先选句末标点，其次逗号，其次硬切 —— 尽量落在自然的停顿处，
+    听感上就是同一人换了口气。speaker 保持不变，但会变成连续两个 round。
+    输出顺序与输入一致，round 由 build_script_payload 重新编号。
+    """
+    if max_chars <= 0:
+        return list(segments)
+
+    out: list[dict[str, Any]] = []
+    for segment in segments:
+        text = str(segment.get("text") or "")
+        if len(text) <= max_chars:
+            out.append(dict(segment))
+            continue
+        for piece in _split_text(text, max_chars):
+            out.append({**segment, "text": piece})
+    return out
+
+
+# 切分优先在这些标点之后断开（从「最自然」到「最勉强」）
+_BREAK_TOKENS = ("。", "！", "？", "…", ". ", "! ", "? ", "；", "; ", "，", ", ", "、", " ")
+
+
+def _split_text(text: str, max_chars: int) -> list[str]:
+    """把一段长文本切成若干不超过 max_chars 的片段。"""
+    pieces: list[str] = []
+    remaining = text.strip()
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        cut = -1
+        for token in _BREAK_TOKENS:
+            index = window.rfind(token)
+            # 别切出一个只有几个字的碎片
+            if index >= max_chars // 2:
+                cut = index + len(token)
+                break
+        if cut <= 0:
+            cut = max_chars
+        piece = remaining[:cut].strip()
+        if piece:
+            pieces.append(piece)
+        remaining = remaining[cut:].strip()
+    if remaining:
+        pieces.append(remaining)
+    return pieces or [text]
+
+
 def build_script_payload(
-    segments: list[dict[str, Any]], *, speech_rate: int = 0, padding_sec: float = 0.0
+    segments: list[dict[str, Any]],
+    *,
+    speech_rate: int = 0,
+    padding_sec: float = 0.0,
+    language: str = "zh",
 ) -> dict[str, Any]:
-    """补上 round 编号与字数/时长统计。"""
+    """补上 round 编号与字数/时长统计。
+
+    `word_count` 是**时长预算的单位数**：中文数字符，英文数词。
+    两者量纲不同（350 字/分 vs 150 词/分），必须跟 `effective_rate` 对齐，
+    否则英文的时长会被算错（按字符数当年词数会高估 4~5 倍）。
+    """
     total_chars = 0
     payload_segments = []
     for index, segment in enumerate(segments):
         text = segment["text"]
-        total_chars += len(text)
+        total_chars += len(text.split()) if language == "en" else len(text)
         entry: dict[str, Any] = {
             "speaker": segment["speaker"],
             "text": text,
@@ -545,9 +635,52 @@ def build_script_payload(
         "segments": payload_segments,
         "word_count": total_chars,
         "est_duration_sec": prompts.estimate_duration_sec(
-            total_chars, speech_rate, padding_sec
+            total_chars, speech_rate, padding_sec, language
         ),
     }
+
+
+def _mock_script_en(
+    *,
+    title: str,
+    innovations: list[str],
+    limitations: list[str],
+    duration_min: int,
+    speech_rate: int,
+    padding_sec: float,
+    language: str,
+) -> dict[str, Any]:
+    """英文版 Mock 脚本（真正的英文对谈，不是中文的翻译副本）。"""
+    first = innovations[0] if innovations else "it swapped out the whole approach"
+    lines: list[tuple[str, str]] = [
+        ("A", f"Today's paper is \u201c{title}\u201d, and the one-line version is this: it turns something that used to be computed step by step into something computed all at once."),
+        ("B", "Hold on, that sounds like a pure engineering win. I want to know whether it actually performs better, or just trains faster."),
+        ("A", "Both. It wins at equal compute budget, and that's the part that matters — it's not just speed."),
+        ("B", "So what's the actual change? I don't want to hear \u201ca novel architecture\u201d."),
+        ("A", f"{first} Still abstract, so here's an analogy: the old model is a relay race — each runner waits for the baton. The new one has everyone watching the whole field at once, and whoever matters gets more attention."),
+        ("B", "Okay — so the point isn't that it does less work, it's that the steps that used to wait on each other can now happen in parallel."),
+        ("A", "Right, and not only parallel. Because any two positions can connect directly, information travels a shorter path, so long-range dependencies are easier to learn."),
+        ("B", "Here's my problem with it: once the sequence gets long, you're comparing everything to everything. Doesn't the cost explode?"),
+        ("A", f"That's exactly the criticism. {(limitations[0] if limitations else 'Cost grows quadratically with length')} Which is why a whole line of later work is about the length problem."),
+        ("B", "So it's a clear win on short sequences and a real cost on long ones — not something you use blindly."),
+        ("A", "That's a fair way to put it. You're trading long-sequence compute for generality and scalability. Whether the trade is worth it depends on what you're building."),
+        ("B", "And if someone's doing research now, what's left to dig into?"),
+        ("A", "Two things mainly: bringing that quadratic cost down, and making positional representations support much longer context. Both are still active."),
+        ("B", "Got it. So it isn't the finish line — it moved the track, and everyone kept running on the new one."),
+        ("A", "That's a good way to end it. Thanks for listening."),
+    ]
+
+    target = prompts.target_chars(duration_min, speech_rate, padding_sec, language)
+    total = sum(len(t.split()) for _, t in lines)
+    while total > target * 1.15 and len(lines) > 6:
+        remove_at = len(lines) - 3
+        total -= len(lines[remove_at][1].split())
+        lines.pop(remove_at)
+
+    segments = [{"speaker": speaker, "text": text} for speaker, text in lines]
+    return build_script_payload(
+        segments, speech_rate=speech_rate, padding_sec=padding_sec, language=language
+    )
 
 
 # --------------------------------------------------------------------------
@@ -603,8 +736,75 @@ def _pick_mock_meta(paper_text: str, title_hint: str = "") -> dict[str, Any]:
     return meta
 
 
-def mock_analysis(paper_text: str, *, title_hint: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
+def _mock_analysis_en(topic: str) -> dict[str, Any]:
+    """英文版 Mock 解读。
+
+    刻意写成真正的英文，而不是把中文那段复制过去 —— 离线演示要能看出
+    语言切换确实换了内容，否则等于没验证。
+    """
+    return {
+        "background": (
+            f"Work on \u201c{topic}\u201d previously relied on step-by-step sequential computation "
+            "or hand-designed structural priors. That made training hard to parallelise and hard "
+            "to scale. The paper asks a blunt question: can a more general mechanism do better "
+            "at the same or lower compute cost?"
+        ),
+        "innovations": [
+            "It replaces the sequential structure with a single attention mechanism, cutting the "
+            "path length between any two positions from linear to constant and making training "
+            "fully parallel.",
+            "A multi-head design lets the model attend in several representation subspaces at once, "
+            "which is measurably more stable than a single head at equal parameter count.",
+            "It reports a like-for-like comparison against existing methods at equal compute budget, "
+            "so the gain can be attributed to the architecture rather than to extra parameters.",
+        ],
+        "method": (
+            "The input is projected into queries, keys and values. The similarity between a query "
+            "and each key decides which positions to attend to, and those weights are used to "
+            "combine the values. Multiple heads do this in parallel from different angles; the "
+            "results are concatenated and linearly projected. The key benefit over sequential "
+            "structures is that every position can be computed at once, and any two positions "
+            "interact in a single step. Positional encodings restore order information, while "
+            "residual connections and normalisation keep deep stacks trainable."
+        ),
+        "experiments": (
+            "On standard translation benchmarks the model reaches 28.4 BLEU on WMT14 English-German, "
+            "roughly 2 BLEU above the previous best, at materially lower training cost. Ablations "
+            "show measurable losses when either the multi-head mechanism or the positional encoding "
+            "is removed, with the positional encoding mattering more on longer sentences. The paper "
+            "also checks transfer to constituency parsing."
+        ),
+        "conclusion": (
+            "The paper shows sequence modelling does not require sequential structure: attention "
+            "alone is enough for strong results, and it has a structural advantage in parallelism "
+            "and scalability."
+        ),
+        "limitations": [
+            "Self-attention cost grows quadratically with sequence length, which becomes prohibitive "
+            "for long documents.",
+            "Validation is concentrated on machine translation; generalisation to other modalities "
+            "was not established at the time.",
+            "Fixed positional encodings extrapolate poorly to sequences longer than those seen in training.",
+        ],
+        "value": (
+            "The architecture later became a building block for large language models and underpins "
+            "the pretrain-then-finetune paradigm. In engineering terms it made large-scale parallel "
+            "training practical, which is what allowed models to grow to hundreds of billions of parameters."
+        ),
+        "future": [
+            "Reducing the quadratic cost of attention through sparsity, linear approximations or chunking.",
+            "Better positional representations for length extrapolation and very long context.",
+            "Transferring the architecture to vision, speech and multimodal settings and testing how general it really is.",
+        ],
+    }
+
+
+def mock_analysis(
+    paper_text: str, *, title_hint: str = "", language: str = "zh"
+) -> tuple[dict[str, Any], dict[str, Any]]:
     meta = _pick_mock_meta(paper_text, title_hint)
+    if language == "en":
+        return meta, _mock_analysis_en(meta.get("title") or "this paper")
     topic = meta["title"]
     analysis = {
         "background": (
@@ -659,11 +859,23 @@ def mock_script(
     level: str,
     speech_rate: int = 0,
     padding_sec: float = 0.0,
+    language: str = "zh",
 ) -> dict[str, Any]:
     title = (paper_meta or {}).get("title") or "这篇论文"
     innovations = analysis.get("innovations") or []
     limitations = analysis.get("limitations") or []
     first_innovation = innovations[0] if innovations else "它换了一条技术路线"
+
+    if language == "en":
+        return _mock_script_en(
+            title=title,
+            innovations=innovations,
+            limitations=limitations,
+            duration_min=duration_min,
+            speech_rate=speech_rate,
+            padding_sec=padding_sec,
+            language=language,
+        )
 
     lines: list[tuple[str, str]] = [
         ("A", f"今天聊的这篇《{title}》，一句话说结论：它把过去必须一步步算的东西，变成了一次算完。"),
@@ -684,7 +896,7 @@ def mock_script(
     ]
 
     # 按目标时长裁剪：保留首尾，删掉中间对谈
-    target = prompts.target_chars(duration_min, speech_rate, padding_sec)
+    target = prompts.target_chars(duration_min, speech_rate, padding_sec, language)
     total = sum(len(t) for _, t in lines)
     while total > target * 1.15 and len(lines) > 6:
         remove_at = len(lines) - 3
@@ -692,4 +904,6 @@ def mock_script(
         lines.pop(remove_at)
 
     segments = [{"speaker": speaker, "text": text} for speaker, text in lines]
-    return build_script_payload(segments, speech_rate=speech_rate, padding_sec=padding_sec)
+    return build_script_payload(
+        segments, speech_rate=speech_rate, padding_sec=padding_sec, language=language
+    )

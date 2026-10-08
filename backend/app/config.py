@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     default_voice_a: str = "zh_male_dayixiansheng_v2_saturn_bigtts"
     default_voice_b: str = "zh_female_mizaitongxue_v2_saturn_bigtts"
 
+    # 英文版的主播音色（实测可直接用于播客接口，无需 speaker_additions）
+    default_voice_a_en: str = "en_male_alex_uranus_bigtts"
+    default_voice_b_en: str = "en_female_jenny_uranus_bigtts"
+
+    # 每集默认生成哪些语言版本，逗号分隔。留空表示只生成 default_language。
+    # 例：languages="zh,en" 表示每期都产出中英两版（TTS 成本与耗时翻倍）。
+    languages: str = "zh"
+    default_language: str = "zh"
+
     # ---- 片头 / 片尾音乐 ----
     # 默认**关掉**：服务端加的片头片尾音乐是通用罐头音乐，放在社区播客里
     # 品牌感是乱的，音画时长也不好控。社区自己的片头话术由 branding.py 提供。
@@ -106,6 +115,16 @@ class Settings(BaseSettings):
     max_topic_images: int = 4
 
     # ---------- 派生属性 ----------
+
+    @property
+    def language_list(self) -> list[str]:
+        """默认生成的语言版本列表，已去重并保证顺序合法。"""
+        raw = [x.strip().lower() for x in (self.languages or "").split(",") if x.strip()]
+        ordered: list[str] = []
+        for lang in [self.default_language, *raw]:
+            if lang in ("zh", "en") and lang not in ordered:
+                ordered.append(lang)
+        return ordered or ["zh"]
 
     @property
     def db_path(self) -> Path:

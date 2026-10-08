@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 SourceType = Literal["pdf", "url", "text"]
 Level = Literal["intro", "advanced", "expert"]
+Language = Literal["zh", "en"]
 Status = Literal[
     "queued", "parsing", "analyzing", "scripting", "synthesizing", "completed", "failed"
 ]
@@ -18,6 +19,11 @@ class EpisodeOptions(BaseModel):
     level: Level = "intro"
     voice_a: str = ""
     voice_b: str = ""
+    # 主语言：详情页默认展示、`?lang=` 缺省时取用的那一版
+    language: Language = "zh"
+    # 这一集实际产出哪些语言版本（含主语言）。双语会让 TTS 成本与耗时翻倍，
+    # 所以由服务端配置决定，不由前端逐集勾选。
+    languages: list[Language] = Field(default_factory=list)
 
     @field_validator("duration_min")
     @classmethod
@@ -98,6 +104,25 @@ class Illustration(BaseModel):
     source: Literal["model", "fallback"]
 
 
+class EpisodeVersion(BaseModel):
+    """一个语言版本的全部产物。
+
+    同一集的封面/论文配图是跨语言共用的（都来自同一份 PDF），
+    所以只有需要「用文字表达」的东西才逐语言各存一份：
+    解读、脚本、信息图、音频、视频。
+    """
+
+    language: Language
+    paper_meta: PaperMeta | None = None
+    analysis: Analysis | None = None
+    script: Script | None = None
+    illustration: Illustration | None = None
+    audio_url: str | None = None
+    audio_duration_sec: float | None = None
+    audio_bytes: int | None = None
+    video: VideoInfo | None = None
+
+
 class Episode(BaseModel):
     id: str
     title: str
@@ -108,6 +133,12 @@ class Episode(BaseModel):
     progress: int = 0
     error: str | None = None
     options: EpisodeOptions
+    # 主语言 + 已产出的语言列表。`paper_meta`/`analysis`/`script`/`audio_*`/`video`
+    # 这些顶层字段**镜像主语言那一版**，老前端不改也能用；
+    # 要取另一语言请读 `versions[lang]`。
+    language: Language = "zh"
+    languages: list[Language] = Field(default_factory=list)
+    versions: dict[str, EpisodeVersion] = Field(default_factory=dict)
     paper_meta: PaperMeta | None = None
     analysis: Analysis | None = None
     script: Script | None = None
@@ -125,7 +156,7 @@ class Episode(BaseModel):
 
 
 class EpisodeListItem(Episode):
-    """列表接口：省略 analysis / script 大字段。
+    """列表接口：省略 analysis / script / versions 大字段。
 
     但保留 cover_url —— 列表卡片要显示封面缩略图。
     figures / illustration 也省略，列表用不到。
@@ -136,6 +167,7 @@ class EpisodeListItem(Episode):
     figures: list[Figure] = Field(default_factory=list)
     illustration: None = None
     video: None = None
+    versions: dict[str, EpisodeVersion] = Field(default_factory=dict)
 
 
 class EpisodeList(BaseModel):
@@ -173,9 +205,15 @@ class VoiceItem(BaseModel):
     label: str
     gender: str
     pair: str
+    # 这个音色属于哪一种语言版本。前端按当前语言过滤音色列表 ——
+    # 拿中文音色去念英文虽然也能出声，但口音很明显。
+    language: Language = "zh"
 
 
 class OptionsResponse(BaseModel):
     durations: list[OptionItem]
     levels: list[OptionItem]
     voices: list[VoiceItem]
+    # 服务端**支持**的语言（新建时选要产出哪些版本）。
+    # 注意区分：Episode.languages 是「这一集实际产出了哪些」。
+    languages: list[OptionItem] = Field(default_factory=list)

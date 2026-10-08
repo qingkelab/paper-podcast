@@ -5,6 +5,7 @@
 把论文变成双人对谈播客的全栈应用。前端 Vue3 + 后端 FastAPI + DeepSeek（文本解读/脚本）+ 豆包语音播客（音频合成）。
 豆包方舟（Ark）作为大模型备选，用 `LLM_PROVIDER` 切换。
 **无密钥也能跑**：缺哪个密钥，哪一步就自动降级为 Mock。
+**同一集可以内嵌中英两版**（`LANGUAGES=zh,en`），前端切换器切语言，配图跨语言共用。
 
 ## 常用命令
 
@@ -153,15 +154,49 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **精简脚本时要检查实际缩减量**：只判「比原来短」不够，
   实测出现过 1175 → 1171 这种「改了等于没改」，白花一次调用。要求至少减 3%。
 
+### 双语（zh + en）
+
+- **`word_count` 是「时长预算的单位数」，不是一个物理量**。中文数字符，英文数词。
+  两者量纲不同（350 字/分 vs 141 词/分），必须跟 `prompts.effective_rate()` 对齐。
+  曾经统一按字符数统计，英文时长被高估 4~5 倍（2081 字符当成 2081 词 → 13.9 分钟，
+  实际 2.4 分钟）。
+- **英文语速常量是实测反推的，不是「英文播客常识」**：真跑一期 3 分钟英文播客，
+  正文 496 词 / 211.0 秒语音 = 141 词/分钟。早先按 150 估会短 6%。
+- **豆包播客 TTS 对单个 round 的文本长度有硬上限（300 字符）**，越界直接拒绝：
+  `40000010 nlp_texts round text length 309 is greater than max char length 300`。
+  它数的是**字符**：中文一段 120 字 ≈ 120 字符撞不到，**英文一段 50 个词就有 300 字符**，
+  所以这个坑是英文版上线时才炸出来的。而且炸在 TTS 阶段会触发 worker
+  **整条流水线重跑**（重新解读 + 重新生成配图 + 重合成中文音频），实测白烧 10 分钟。
+  除了 prompt 约束（`SCRIPT_SYSTEM_EN` 里的 HARD LIMIT），还必须有代码兜底
+  `llm.split_long_segments()`。
+- **英文版的 prompt 必须整段是英文**，包括那句长度预算和输出语言规则。
+  中文指令混在英文输出任务里，模型会跟着中文语感走 —— 实测把「120 字」当成
+  120 个词，脚本写到目标的 130%。见 `_build_script_messages_en` / `LEVEL_GUIDE_EN`。
+- **「服务端支持双语」≠「每一集都有英文版」**。判断 `?lang=` 是否合法只能看
+  **这一集实际产出了什么**（`Pipeline.available_languages()`）。拿配置的语言列表去判，
+  老数据的 `?lang=en` 会**静默返回中文内容**（200 + 主语言），前端以为切成功了。
+- **主语言的资源 URL 不带 `?lang=`**。带上会让已经发布出去的链接和缓存全部失效。
+- **配图分两类**：封面（PDF 第一页）和论文原图**跨语言共用**（同一份 PDF）；
+  信息图**跟随语言**（图上写着字，英文版配中文标注的图很割裂）。
+- **顶层字段镜像主语言那一版**（`paper_meta`/`analysis`/`script`/`audio_*`/`video`），
+  另一语言只在 `versions[lang]` 里。老前端一行不改也能正常显示。
+- **老数据没有 `versions`**，接口把顶层字段当成主语言那一版回填。
+  前端因此只需要处理一种形状，不必为历史数据写特例。
+- **双语时进度要按语言切区间**（15→99 平均切开）。两个阶段都从 35 开始会让进度条
+  倒退（中文跑完 75、英文又回 35），看起来像卡死重来。`stage_label` 要标出当前是哪一版。
+- **`_voices_for()` 按语言换音色**。中文音色念英文虽然也能出声，但口音很明显；
+  用户只在前端选过一次音色（主语言那一档），英文版必须换 `DEFAULT_VOICE_A_EN/B_EN`。
+
 ## 结构
 
 ```
 backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟) podcast_tts(语音)
                           figures(PDF封面+论文原图) illustration(生成信息图)
-                          video(视频合成) pipeline(编排)
+                          video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            284 项，改完必须全绿
+backend/tests/            320 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
+frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言
 ```
 
 ## Mock 模式

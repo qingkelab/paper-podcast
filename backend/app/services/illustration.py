@@ -113,7 +113,9 @@ ILLUSTRATION_SYSTEM = """你是信息图设计师，专门把论文的核心机�
 
 
 def build_illustration_messages(
-    analysis: dict[str, Any], paper_meta: dict[str, Any] | None
+    analysis: dict[str, Any],
+    paper_meta: dict[str, Any] | None,
+    language: str = "zh",
 ) -> list[dict[str, str]]:
     meta = paper_meta or {}
     bullets = analysis.get("innovations") or []
@@ -133,8 +135,15 @@ def build_illustration_messages(
         "请为这篇论文画一张信息图，把上面这些要点组织成一张能被一眼读懂的图。",
         "重点画「机制是怎么运作的」，而不是罗列文字。",
     ]
+    # 图上的文字跟随这一版的语言：英文版配一张满是中文标注的信息图会很割裂。
+    lang_rule = (
+        "\n\n【图上文字】全部用 **英文**（English）。"
+        '字体写 `font-family="Inter, Helvetica Neue, Arial, sans-serif"`。'
+        if language == "en"
+        else ""
+    )
     return [
-        {"role": "system", "content": ILLUSTRATION_SYSTEM},
+        {"role": "system", "content": ILLUSTRATION_SYSTEM + lang_rule},
         {"role": "user", "content": "\n".join(brief)},
     ]
 
@@ -354,17 +363,20 @@ def _wrap_cjk(text: str, per_line: int, max_lines: int) -> list[str]:
     return lines
 
 
-def fallback_svg(analysis: dict[str, Any], paper_meta: dict[str, Any] | None) -> str:
+def fallback_svg(
+    analysis: dict[str, Any], paper_meta: dict[str, Any] | None, language: str = "zh"
+) -> str:
     """本地拼一张信息图。
 
     用途：模型没配置、调用失败、或输出不合法时，保证封面不为空。
     纯字符串拼接，没有任何外部依赖，也绝不会失败。
     """
     meta = paper_meta or {}
-    title = (meta.get("title") or "论文解读").strip()
+    title = (meta.get("title") or ("论文解读" if language == "zh" else "Paper explained")).strip()
     year = meta.get("year")
     subtitle_bits = [str(b) for b in (meta.get("venue"), year) if b]
-    subtitle = " · ".join(subtitle_bits) if subtitle_bits else "AI 播客解读"
+    fallback_subtitle = "AI 播客解读" if language == "zh" else "AI podcast explainer"
+    subtitle = " · ".join(subtitle_bits) if subtitle_bits else fallback_subtitle
 
     innovations = [str(x) for x in (analysis.get("innovations") or [])][:3]
     keywords = [str(k) for k in (meta.get("keywords") or [])][:4]
@@ -381,7 +393,12 @@ def fallback_svg(analysis: dict[str, Any], paper_meta: dict[str, Any] | None) ->
         '<rect x="48" y="48" width="6" height="120" fill="#5b9bd5" rx="3"/>',
     ]
 
-    font = "PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+    font = (
+        "Inter, Helvetica Neue, Arial, sans-serif"
+        if language == "en"
+        else "PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+    )
+    footer = "论文解读 AI 播客" if language == "zh" else "Paper Podcast"
     y = 86
     for line in _wrap_cjk(title, 22, 3):
         parts.append(
@@ -437,7 +454,7 @@ def fallback_svg(analysis: dict[str, Any], paper_meta: dict[str, Any] | None) ->
 
     parts.append(
         f'<text x="{CANVAS_W - 48}" y="664" text-anchor="end" font-family="{font}" '
-        f'font-size="17" fill="#5d7ba3">论文解读 AI 播客</text>'
+        f'font-size="17" fill="#5d7ba3">{footer}</text>'
     )
     parts.append("</svg>")
     return "".join(parts)
@@ -454,6 +471,7 @@ def generate_illustration(
     paper_meta: dict[str, Any] | None,
     output_dir: Path,
     stem: str,
+    language: str = "zh",
 ) -> Illustration:
     """生成配图。返回的 Illustration 一定可用（失败时用本地兜底图）。
 
@@ -469,7 +487,7 @@ def generate_illustration(
     try:
         if not getattr(llm, "mock", True):
             raw = llm.complete(
-                build_illustration_messages(analysis, paper_meta),
+                build_illustration_messages(analysis, paper_meta, language),
                 max_tokens=8000,
                 temperature=0.7,
             )
@@ -482,7 +500,7 @@ def generate_illustration(
         source = "fallback"
 
     if svg_text is None:
-        svg_text = sanitize_svg(fallback_svg(analysis, paper_meta))
+        svg_text = sanitize_svg(fallback_svg(analysis, paper_meta, language))
         source = "fallback"
 
     try:
@@ -492,7 +510,7 @@ def generate_illustration(
         # 模型 SVG 能过清洗但还是渲染不出来 → 退回兜底图再试一次
         if source == "model":
             logger.warning("模型 SVG 渲染失败，改用兜底图：%s", exc)
-            svg_text = sanitize_svg(fallback_svg(analysis, paper_meta))
+            svg_text = sanitize_svg(fallback_svg(analysis, paper_meta, language))
             source = "fallback"
             svg_path.write_text(svg_text, encoding="utf-8")
             _, width, height = rasterize_svg(svg_text, png_path)

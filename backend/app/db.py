@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     timings_json       TEXT,
     video_path         TEXT,
     video_json         TEXT,
+    versions_json      TEXT,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
 );
@@ -94,6 +95,7 @@ class Database:
             "cover_height": "INTEGER",
             "figures_json": "TEXT",
             "illustration_json": "TEXT",
+            "versions_json": "TEXT",
         }
         for column, sql_type in additions.items():
             if column not in existing:
@@ -159,6 +161,7 @@ class Database:
             "timings": load(row["timings_json"]) or [],
             "video_path": row["video_path"],
             "video": load(row["video_json"]),
+            "versions": load(row["versions_json"]) or {},
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -240,6 +243,7 @@ class Database:
             "illustration",
             "timings",
             "video",
+            "versions",
         }
         sets: list[str] = []
         params: list[Any] = []
@@ -253,6 +257,7 @@ class Database:
                 "illustration": "illustration_json",
                 "timings": "timings_json",
                 "video": "video_json",
+                "versions": "versions_json",
             }.get(key, key)
             if key in json_fields:
                 value = json.dumps(value, ensure_ascii=False) if value is not None else None
