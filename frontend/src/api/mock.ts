@@ -57,7 +57,15 @@ import { countWords } from '../utils/format'
 
 export const mode = 'mock' as const
 
-const STORAGE_KEY = 'paper-podcast:mock:episodes:v1'
+/**
+ * 落盘的键带 schema 版本。**改动 Mock 数据语义时必须 +1** ——
+ * 老访客的 localStorage 里存着旧记录，`normalizeStored` 会原样恢复，
+ * 于是他们看到的是旧行为（实测：把预估时长改成按语言算之后，
+ * 老访客页面上的英文版仍是「1173 词 / 预估 05:00」）。
+ * 宁可让老访客重新播种一遍示例数据，也不要给他一个自相矛盾的页面。
+ */
+const STORAGE_SCHEMA = 2
+const STORAGE_KEY = `paper-podcast:mock:episodes:v${STORAGE_SCHEMA}`
 /** 每个阶段的模拟耗时（契约 §4 要求约 700ms） */
 const STAGE_MS = 700
 /** 来源（文件名 / 链接 / 文本）里带上这个标记，可演示失败态与重试流程 */
@@ -102,42 +110,68 @@ const OPTIONS: OptionsPayload = {
     { value: 'advanced', label: '进阶' },
     { value: 'expert', label: '专业' },
   ],
+  languages: [
+    { value: 'zh', label: '中文' },
+    { value: 'en', label: 'English' },
+  ],
   voices: [
+    // 英文音色（与真实后端的 DEFAULT_VOICE_A_EN / B_EN 对齐）。
+    // 少了它们，英文版脚本旁边会挂着中文主播名 —— 与实际听到的声音对不上。
+    {
+      id: 'en_male_alex_uranus_bigtts',
+      label: 'Alex（English · 男声，主讲）',
+      gender: 'male',
+      pair: 'alex-jenny',
+      language: 'en',
+    },
+    {
+      id: 'en_female_jenny_uranus_bigtts',
+      label: 'Jenny（English · 女声，提问）',
+      gender: 'female',
+      pair: 'alex-jenny',
+      language: 'en',
+    },
     {
       id: 'zh_male_dayixiansheng_v2_saturn_bigtts',
       label: '大义先生（男声·学术沉稳）',
       gender: 'male',
       pair: 'mizai-dayi',
+      language: 'zh',
     },
     {
       id: 'zh_female_mizaitongxue_v2_saturn_bigtts',
       label: '米仔同学（女声·清亮好奇）',
       gender: 'female',
       pair: 'mizai-dayi',
+      language: 'zh',
     },
     {
       id: 'zh_male_wennuanahu_v2_saturn_bigtts',
       label: '温暖阿虎（男声·温和解说）',
       gender: 'male',
       pair: 'ahu-wanwan',
+      language: 'zh',
     },
     {
       id: 'zh_female_wanwanxiaohe_v2_saturn_bigtts',
       label: '湾湾小何（女声·专业播报）',
       gender: 'female',
       pair: 'ahu-wanwan',
+      language: 'zh',
     },
     {
       id: 'zh_male_shaonianzixin_v2_saturn_bigtts',
       label: '少年梓辛（男声·年轻活力）',
       gender: 'male',
       pair: 'zixin-yujie',
+      language: 'zh',
     },
     {
       id: 'zh_female_gaolengyujie_v2_saturn_bigtts',
       label: '高冷御姐（女声·冷静克制）',
       gender: 'female',
       pair: 'zixin-yujie',
+      language: 'zh',
     },
   ],
 }
@@ -812,7 +846,7 @@ function stripVersionsForStorage(versions: Episode['versions']): Episode['versio
 function persist(): void {
   try {
     const payload = {
-      version: 1,
+      version: STORAGE_SCHEMA,
       episodes: episodes.map((episode) => ({
         ...episode,
         audio_url: null,
@@ -972,7 +1006,10 @@ function ensureLoaded(): void {
     const raw = window.localStorage.getItem(STORAGE_KEY)
     if (raw) {
       const parsed: unknown = JSON.parse(raw)
-      if (parsed && typeof parsed === 'object' && 'episodes' in parsed) {
+      // schema 对不上就整个丢掉重新播种：旧记录的形状可能已经不符合当前语义
+      const schemaMatches =
+        parsed && typeof parsed === 'object' && (parsed as { version?: unknown }).version === STORAGE_SCHEMA
+      if (schemaMatches && 'episodes' in (parsed as object)) {
         const list = (parsed as { episodes?: unknown }).episodes
         if (Array.isArray(list)) {
           restored = list.map(normalizeStored).filter((item): item is Episode => item !== null)
