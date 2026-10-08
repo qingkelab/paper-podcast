@@ -318,16 +318,21 @@ function planContent(paper: MockPaper, title: string, language: EpisodeLanguage)
   }
 }
 
-function buildScript(plan: ContentPlan, options: EpisodeOptions): Script {
+function buildScript(plan: ContentPlan, language: EpisodeLanguage): Script {
   const segments: ScriptSegment[] = plan.segments.map((segment, index) => ({
     speaker: segment.speaker,
     text: segment.text,
     round: index,
   }))
+  const wordCount = countWords(segments.map((segment) => segment.text).join(''))
+  // 时长按后端同一套语速常量估算（中文 350 字/分、英文 141 词/分）。
+  // 别再写死 duration_min * 60 —— 那会让英文版显示「1173 词 / 预估 05:00」，
+  // 一个自相矛盾的数字就这么摆在公开演示页上。
+  const rate = language === 'en' ? 141 : 350
   return {
     segments,
-    word_count: countWords(segments.map((segment) => segment.text).join('')),
-    est_duration_sec: options.duration_min * 60,
+    word_count: wordCount,
+    est_duration_sec: Math.max(Math.round((wordCount / rate) * 60), 1),
   }
 }
 
@@ -347,14 +352,10 @@ function requestedLanguages(options?: EpisodeOptionsInput): EpisodeLanguage[] {
 }
 
 /** 组装一个语言版本（音频/视频是异步产物，先留空，由 ensureAudio / ensureVideo 填） */
-function buildVersion(
-  language: EpisodeLanguage,
-  plan: ContentPlan,
-  options: EpisodeOptions,
-): EpisodeVersion {
+function buildVersion(language: EpisodeLanguage, plan: ContentPlan): EpisodeVersion {
   return {
     language,
-    script: buildScript(plan, options),
+    script: buildScript(plan, language),
     analysis: plan.analysis,
     paper_meta: plan.meta,
     audio_url: null,
@@ -416,11 +417,11 @@ function createEpisodeRecord(input: {
   const languages = requestedLanguages(input.options)
   const versions: Partial<Record<EpisodeLanguage, EpisodeVersion>> = {}
   languages.forEach((language) => {
-    versions[language] = buildVersion(language, planContent(paper, title, language), options)
+    versions[language] = buildVersion(language, planContent(paper, title, language))
   })
 
   const primary = languages[0] ?? DEFAULT_LANGUAGES[0] ?? 'zh'
-  const primaryVersion = versions[primary] ?? buildVersion(primary, planContent(paper, title, primary), options)
+  const primaryVersion = versions[primary] ?? buildVersion(primary, planContent(paper, title, primary))
   versions[primary] = primaryVersion
 
   const episode: Episode = {
