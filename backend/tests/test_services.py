@@ -652,3 +652,51 @@ class TestEnglishPromptIsWrittenInEnglish:
         )[-1]["content"]
         words = prompts.target_chars(10, 0, 0.0, "en")
         assert f"{int(words * 0.92)}-{int(words * 1.05)} words" in body
+
+
+class TestAnalysisPromptLanguage:
+    """英文版的解读 prompt 必须整段是英文。
+
+    踩过的坑：只给中文 `ANALYSIS_SYSTEM` 追加一句「请用英文输出」不管用 ——
+    模型跟着中文 system prompt 走了，英文版的 background 实测 83% 是中文。
+    脚本那边因为一开始就写了完整的 `SCRIPT_SYSTEM_EN`，反而没出问题。
+    输出语言这种事，**指令语言本身就得和目标语言一致**。
+    """
+
+    def test_english_system_prompt_has_no_chinese(self):
+        system = prompts.analysis_system("en")
+        cjk = sum(1 for ch in system if "\u4e00" <= ch <= "\u9fff")
+        assert cjk == 0, f"英文解读 prompt 里还有 {cjk} 个中文字"
+        assert '"analysis"' in system or '"paper_meta"' in system, "JSON 结构说明丢了"
+
+    def test_english_user_brief_has_no_chinese(self):
+        messages = prompts.build_analysis_messages(
+            "PAPER BODY TEXT", title_hint="A Title", language="en"
+        )
+        user = messages[1]["content"]
+        cjk = sum(1 for ch in user if "\u4e00" <= ch <= "\u9fff")
+        assert cjk == 0, f"英文解读的 user brief 里还有中文：{user[:80]}"
+        assert "A Title" in user and "PAPER BODY TEXT" in user
+
+    def test_chinese_path_unchanged(self):
+        messages = prompts.build_analysis_messages("正文", title_hint="标题", language="zh")
+        assert "论文正文" in messages[1]["content"]
+        assert "研究背景" in messages[0]["content"]
+
+    def test_both_languages_ask_for_the_same_json_shape(self):
+        import json
+        import re
+
+        def fields(system: str) -> set[str]:
+            match = re.search(r"\{.*\}", system, re.S)
+            assert match, "prompt 里找不到 JSON 结构说明"
+            return set(re.findall(r'"(\w+)":', match.group(0)))
+
+        zh = fields(prompts.analysis_system("zh"))
+        en = fields(prompts.analysis_system("en"))
+        assert zh == en, f"两版的 JSON 字段不一致：{zh ^ en}"
+
+    def test_not_covered_fallback_is_localised(self):
+        # 论文没写某个字段时的兜底文案也要跟着语言走
+        assert "论文未涉及" in prompts.analysis_system("zh")
+        assert "Not covered in the paper." in prompts.analysis_system("en")

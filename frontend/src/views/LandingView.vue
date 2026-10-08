@@ -9,46 +9,58 @@
  * 素材取不到时（空库 / 后端不可用 / 只有排队中的任务）整屏隐藏，
  * 页面退化成纯介绍，**不会出现空播放器或破图**。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { IS_MOCK, getEpisode, listEpisodes } from '../api'
-import type { Analysis, Figure, Illustration, ScriptSegment } from '../api'
+import { IS_MOCK, getEpisode, isEpisodeLanguage, listEpisodes } from '../api'
+import type {
+  Analysis,
+  EpisodeLanguage,
+  Figure,
+  Illustration,
+  ScriptSegment,
+} from '../api'
 import { useMetaStore } from '../stores/meta'
 import { formatDuration } from '../utils/format'
+import { languageLabel } from '../utils/language'
 
 const meta = useMetaStore()
+
+/** 一个语言版本的展示数据。切换器一按就换的就是这一坨。 */
+type ShowcaseVersion = {
+  language: EpisodeLanguage
+  videoUrl: string | null
+  audioUrl: string | null
+  /** 视频优先，没有就用音频时长 */
+  durationSec: number | null
+  segments: ScriptSegment[]
+  analysis: Analysis | null
+  illustration: Illustration | null
+}
 
 type Showcase = {
   episodeId: string
   title: string
   venue: string | null
   year: number | null
-  primaryLanguage: string | null
-  otherLanguage: string | null
-  /** 详情接口才有的字段，第二阶段补上 */
-  videoUrl: string | null
-  audioUrl: string | null
+  /** 封面（论文首页）和论文原图是**跨语言共用**的，不随切换器变 */
   posterUrl: string | null
-  illustration: Illustration | null
   figures: Figure[]
-  segments: ScriptSegment[]
-  analysis: Analysis | null
-  durationSec: number | null
+  /** 这一集实际产出了哪些语言，顺序 = 契约里的生成顺序 */
+  order: EpisodeLanguage[]
+  primaryLanguage: EpisodeLanguage
+  versions: Partial<Record<EpisodeLanguage, ShowcaseVersion>>
 }
 
 const showcase = ref<Showcase | null>(null)
 const showcaseLoading = ref(true)
 /** 详情（视频 / 配图 / 脚本 / 解读）是否已经补齐 */
 const showcaseDetailReady = ref(false)
+/** 当前展示的语言版本 */
+const showcaseLanguage = ref<EpisodeLanguage | null>(null)
 /** 首屏视觉里的播放入口：点击后真的就地播起来，而不是只做个样子 */
 const heroPlaying = ref(false)
 
 const videoRef = ref<HTMLVideoElement | null>(null)
-
-function languageText(language: string | null | undefined): string | null {
-  if (!language) return null
-  return language === 'en' ? 'English' : '中文'
-}
 
 /**
  * 取一期的真实产物。
@@ -63,56 +75,84 @@ async function loadShowcase(): Promise<void> {
   try {
     const list = await listEpisodes({ status: 'completed', limit: 12 })
     const candidates = list.items.filter((item) => item.status === 'completed')
-    // 优先挑多语言的：一屏就能把「视频 + 双语」两件事讲清楚
+    // 优先挑多语言的：一屏就能把「视频 + 双语 + 切换器」三件事讲清楚
     const picked =
       candidates.find((item) => item.languages && item.languages.length > 1) ?? candidates[0]
     if (!picked) return
 
     // 列表接口刻意不带 versions（它内部装的就是脚本/解读/视频这些大字段），
     // 所以第一阶段只能用顶层字段：封面、标题、主语言音频。
-    const primary = picked.language ?? picked.languages?.[0] ?? null
-    const other = (picked.languages ?? []).find((language) => language !== primary) ?? null
+    const order = (picked.languages ?? []).filter(isEpisodeLanguage)
+    const primary = isEpisodeLanguage(picked.language)
+      ? picked.language
+      : (order[0] ?? 'zh')
 
     showcase.value = {
       episodeId: picked.id,
       title: picked.title,
       venue: picked.paper_meta?.venue ?? null,
       year: picked.paper_meta?.year ?? null,
-      primaryLanguage: languageText(primary),
-      otherLanguage: languageText(other),
-      videoUrl: null,
-      audioUrl: picked.audio_url,
       posterUrl: picked.cover_url,
-      illustration: null,
       figures: [],
-      segments: [],
-      analysis: null,
-      durationSec: picked.audio_duration_sec,
+      order: order.length ? order : [primary],
+      primaryLanguage: primary,
+      versions: {
+        [primary]: {
+          language: primary,
+          videoUrl: null,
+          audioUrl: picked.audio_url,
+          durationSec: picked.audio_duration_sec,
+          segments: [],
+          analysis: null,
+          illustration: null,
+        },
+      },
     }
+    showcaseLanguage.value = primary
     showcaseLoading.value = false
 
     const full = await getEpisode(picked.id)
     if (!showcase.value || showcase.value.episodeId !== full.id) return
-    const fullPrimary = full.language ?? full.languages?.[0] ?? 'zh'
-    const fullVersion = full.versions?.[fullPrimary] ?? null
-    const script = fullVersion?.script ?? full.script
-    const video = fullVersion?.video ?? full.video
+
+    const fullPrimary = isEpisodeLanguage(full.language) ? full.language : primary
+    const fullOrder = (full.languages ?? []).filter(isEpisodeLanguage)
+    const order2 = fullOrder.length ? fullOrder : [fullPrimary]
+
+    // 每个语言版本都留一份：切换器一按就换，不再请求接口
+    const versions: Partial<Record<EpisodeLanguage, ShowcaseVersion>> = {}
+    order2.forEach((language) => {
+      const version = full.versions?.[language] ?? null
+      const script = version?.script ?? (language === fullPrimary ? full.script : null)
+      const video = version?.video ?? (language === fullPrimary ? full.video : null)
+      versions[language] = {
+        language,
+        videoUrl: video?.url ?? null,
+        audioUrl:
+          version?.audio_url ?? (language === fullPrimary ? full.audio_url : null),
+        durationSec:
+          video?.duration_sec ??
+          version?.audio_duration_sec ??
+          (language === fullPrimary ? full.audio_duration_sec : null),
+        // 品牌片头片尾不是论文正文，展示脚本片段时要排掉
+        segments: (script?.segments ?? []).filter((segment) => !segment.brand).slice(0, 4),
+        analysis: version?.analysis ?? (language === fullPrimary ? full.analysis : null),
+        // 信息图按语言各一份（图上写着字）；老数据只有顶层那一份，退回顶层
+        illustration: version?.illustration ?? full.illustration ?? null,
+      }
+    })
 
     showcase.value = {
       ...showcase.value,
       venue: full.paper_meta?.venue ?? showcase.value.venue,
       year: full.paper_meta?.year ?? showcase.value.year,
-      videoUrl: video?.url ?? null,
-      audioUrl: fullVersion?.audio_url ?? full.audio_url ?? showcase.value.audioUrl,
       posterUrl: full.cover_url ?? showcase.value.posterUrl,
-      illustration: fullVersion?.illustration ?? full.illustration,
       figures: full.figures ?? [],
-      // 品牌片头片尾不是论文正文，展示脚本片段时要排掉
-      segments: (script?.segments ?? []).filter((segment) => !segment.brand).slice(0, 4),
-      analysis: fullVersion?.analysis ?? full.analysis,
-      durationSec:
-        video?.duration_sec ?? fullVersion?.audio_duration_sec ?? showcase.value.durationSec,
+      order: order2,
+      primaryLanguage: fullPrimary,
+      versions,
     }
+    // 主语言可能变了（老数据没有 language 字段时由 languages[0] 推断）
+    showcaseLanguage.value = fullPrimary
     showcaseDetailReady.value = true
   } catch {
     // 首页不允许因为取素材失败而坏掉：整屏静默隐藏即可
@@ -121,6 +161,38 @@ async function loadShowcase(): Promise<void> {
     showcaseLoading.value = false
   }
 }
+
+/**
+ * 可切换的语言。**只列出真的有产物的**：
+ * 加载完之前不显示切换器，免得点过去是一片空白。
+ */
+const showcaseLanguages = computed<EpisodeLanguage[]>(() => {
+  const item = showcase.value
+  if (!item || !showcaseDetailReady.value) return []
+  return item.order.filter((language) => {
+    const version = item.versions[language]
+    return Boolean(version && (version.videoUrl || version.audioUrl))
+  })
+})
+
+const activeVersion = computed<ShowcaseVersion | null>(() => {
+  const item = showcase.value
+  const language = showcaseLanguage.value
+  if (!item || !language) return null
+  return item.versions[language] ?? null
+})
+
+function selectShowcaseLanguage(language: EpisodeLanguage): void {
+  if (language === showcaseLanguage.value) return
+  if (!showcaseLanguages.value.includes(language)) return
+  showcaseLanguage.value = language
+}
+
+// 语言一切就把首屏那份「正在播」的状态丢掉：两个播放器指向的是不同文件，
+// 留着播放按钮的隐藏状态会让人以为还在播同一段
+watch(showcaseLanguage, () => {
+  heroPlaying.value = false
+})
 
 function playHero(): void {
   heroPlaying.value = true
@@ -139,10 +211,17 @@ function scrollToShowcase(): void {
   document.getElementById('showcase')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
-const episodeDuration = computed(() => showcase.value?.durationSec ?? null)
+// ---- 下面这些全部取自「当前语言那一版」，切换器一按就跟着换 ----
+
+const activeLanguage = computed(() => showcaseLanguage.value)
+const episodeDuration = computed(() => activeVersion.value?.durationSec ?? null)
+
+/** 首屏浮动卡和成品区左栏都用它：非主语言带 ?lang=，切语言就是换文件 */
+const videoUrl = computed(() => activeVersion.value?.videoUrl ?? null)
+const audioUrl = computed(() => activeVersion.value?.audioUrl ?? null)
 
 const analysisPreview = computed(() => {
-  const analysis = showcase.value?.analysis
+  const analysis = activeVersion.value?.analysis
   if (!analysis) return []
   return [
     { label: '研究背景', text: analysis.background },
@@ -150,8 +229,13 @@ const analysisPreview = computed(() => {
   ].filter((row) => Boolean(row.text && row.text.trim()))
 })
 
-const primaryLanguageLabel = computed(() => showcase.value?.primaryLanguage ?? '中文')
-const otherLanguageLabel = computed(() => showcase.value?.otherLanguage ?? null)
+const scriptSegments = computed(() => activeVersion.value?.segments ?? [])
+const illustration = computed(() => activeVersion.value?.illustration ?? null)
+
+/** 这一集有哪些语言（给标签用）；只有一种时不显示切换器 */
+const languageNamesText = computed(() =>
+  (showcase.value?.order ?? []).map((language) => languageLabel(language)).join(' / '),
+)
 
 /** 首屏的短事实：每条都能在这页上被验证，不是口号 */
 const PROOF = computed(() => [
@@ -301,11 +385,12 @@ onMounted(() => {
         <div class="lp-hero__visual rise">
           <div class="lp-shot" :class="{ 'is-playing': heroPlaying }">
             <video
-              v-if="showcase?.videoUrl"
+              v-if="videoUrl"
+              :key="`hero-${activeLanguage ?? 'zh'}`"
               ref="videoRef"
               class="lp-shot__video"
-              :poster="showcase.posterUrl ?? undefined"
-              :src="showcase.videoUrl"
+              :poster="showcase?.posterUrl ?? undefined"
+              :src="videoUrl"
               preload="none"
               playsinline
               controls
@@ -321,7 +406,7 @@ onMounted(() => {
             </div>
 
             <button
-              v-if="showcase?.videoUrl && !heroPlaying"
+              v-if="videoUrl && !heroPlaying"
               type="button"
               class="lp-shot__play"
               aria-label="在首页直接播放这一期的视频解读"
@@ -338,10 +423,12 @@ onMounted(() => {
           <div v-if="showcase" class="lp-float lp-float--audio">
             <span class="lp-float__icon" aria-hidden="true">♪</span>
             <span class="lp-float__body">
-              <span class="lp-float__title">{{ primaryLanguageLabel }}版 · 双人对谈</span>
+              <span class="lp-float__title">
+                {{ activeLanguage ? languageLabel(activeLanguage) : '' }}版 · 双人对谈
+              </span>
               <span class="lp-float__meta">
-                {{ formatDuration(episodeDuration) }}<template v-if="otherLanguageLabel">
-                  · 另有 {{ otherLanguageLabel }}版</template
+                {{ formatDuration(episodeDuration) }}<template v-if="showcaseLanguages.length > 1">
+                  · 另有 {{ showcaseLanguages.length - 1 }} 个语言版本</template
                 >
               </span>
             </span>
@@ -379,14 +466,35 @@ onMounted(() => {
     <!-- ===================== 真实成品展示 ===================== -->
     <section v-if="showcaseLoading || showcase" id="showcase" class="lp-section lp-show">
       <div class="lp-container">
-        <header class="lp-head">
-          <p class="lp-head__eyebrow">Showcase</p>
-          <h2 class="lp-head__title">看一期真正的成品</h2>
-          <p class="lp-head__lede">
-            下面所有东西都来自库里真实生成的一期，不是示意图：
-            视频、音频、脚本、解读、配图都是它的产物。
-          </p>
-        </header>
+        <div class="lp-show__head">
+          <header class="lp-head lp-head--left">
+            <p class="lp-head__eyebrow">Showcase</p>
+            <h2 class="lp-head__title">看一期真正的成品</h2>
+            <p class="lp-head__lede">
+              下面所有东西都来自库里真实生成的一期，不是示意图：视频、音频、脚本、解读、
+              配图都是它的产物。中英两版各自有独立的脚本和音视频，按钮一按就换。
+            </p>
+          </header>
+
+          <!-- 语言切换器：只有这一集真的产出了多个语言版本时才出现 -->
+          <div v-if="showcaseLanguages.length > 1" class="lp-show__lang">
+            <span class="lang-switch__label">语言版本</span>
+            <div class="lang-switch" role="group" aria-label="切换展示的语言版本">
+              <button
+                v-for="language in showcaseLanguages"
+                :key="language"
+                type="button"
+                class="lang-switch__btn"
+                :class="{ 'is-active': language === activeLanguage }"
+                :aria-pressed="language === activeLanguage"
+                :title="`切换到${languageLabel(language)}版（视频 / 音频 / 脚本 / 解读 一起换）`"
+                @click="selectShowcaseLanguage(language)"
+              >
+                {{ languageLabel(language) }}
+              </button>
+            </div>
+          </div>
+        </div>
 
         <div v-if="showcaseLoading" class="lp-show__loading">
           <span class="skeleton" style="height: 320px"></span>
@@ -404,9 +512,10 @@ onMounted(() => {
               <span v-if="episodeDuration" class="lp-show__meta">{{ formatDuration(episodeDuration) }}</span>
             </div>
             <video
-              v-if="showcase.videoUrl"
+              v-if="videoUrl"
+              :key="activeLanguage ?? 'zh'"
               class="lp-show__video"
-              :src="showcase.videoUrl"
+              :src="videoUrl"
               :poster="showcase.posterUrl ?? undefined"
               preload="none"
               playsinline
@@ -433,29 +542,28 @@ onMounted(() => {
               <span v-if="showcase.year" class="lp-chip">
                 {{ showcase.year }}
               </span>
-              <span class="lp-chip lp-chip--accent">
-                {{ primaryLanguageLabel }}<template v-if="otherLanguageLabel">
-                  / {{ otherLanguageLabel }}</template
-                >
-              </span>
+              <span class="lp-chip lp-chip--accent">{{ languageNamesText }}</span>
             </div>
 
             <div class="lp-show__audio">
-              <span class="lp-show__audio-label" aria-hidden="true">♪ {{ primaryLanguageLabel }}版音频</span>
+              <span class="lp-show__audio-label" aria-hidden="true">
+                ♪ {{ activeLanguage ? languageLabel(activeLanguage) : '' }}版音频
+              </span>
               <audio
-                v-if="showcase.audioUrl"
+                v-if="audioUrl"
+                :key="`audio-${activeLanguage ?? 'zh'}`"
                 class="lp-show__audio-el"
-                :src="showcase.audioUrl"
+                :src="audioUrl"
                 preload="none"
                 controls
               ></audio>
             </div>
 
-            <div v-if="showcase.segments.length" class="lp-show__block">
+            <div v-if="scriptSegments.length" class="lp-show__block">
               <p class="lp-show__block-title">脚本片段</p>
               <ul class="lp-script">
                 <li
-                  v-for="(segment, index) in showcase.segments"
+                  v-for="(segment, index) in scriptSegments"
                   :key="index"
                   class="lp-script__row"
                   :class="`lp-script__row--${segment.speaker.toLowerCase()}`"
@@ -496,12 +604,12 @@ onMounted(() => {
                 </figcaption>
               </figure>
 
-              <figure v-if="showcase.illustration" class="lp-art__item">
+              <figure v-if="illustration" class="lp-art__item">
                 <!-- SVG 用 <object> 引：<img> 里 SMIL 动画不一定会跑 -->
                 <object
                   class="lp-art__img lp-art__img--svg"
                   type="image/svg+xml"
-                  :data="showcase.illustration.svg_url"
+                  :data="illustration.svg_url"
                   :aria-label="'模型生成的信息图'"
                 ></object>
                 <figcaption class="lp-art__cap">

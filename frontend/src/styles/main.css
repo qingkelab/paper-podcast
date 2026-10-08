@@ -2788,6 +2788,29 @@ pre {
   border-bottom: 1px solid var(--border-soft);
 }
 
+/* 区块标题 + 右侧语言切换器。切换器靠右、和标题同一基线，
+   让人一眼看出它管的是下面这一整块，而不是某一个播放器。 */
+.lp-show__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  margin-bottom: 28px;
+}
+
+.lp-show__head .lp-head {
+  margin-bottom: 0;
+  flex: 1 1 380px;
+}
+
+.lp-show__lang {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-bottom: 3px;
+}
+
 .lp-show__loading {
   display: block;
 }
@@ -3369,6 +3392,16 @@ pre {
 
   .lp-show__grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lp-show__head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .lp-show__lang {
+    padding-bottom: 0;
   }
 
   /* 五个步骤竖着排，连接线改成左侧的竖线 */

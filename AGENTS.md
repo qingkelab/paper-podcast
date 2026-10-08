@@ -53,6 +53,10 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   首屏会在骨架上停很久 —— 先用列表项（标题/封面/时长/语言）画出来，详情回来再补。
 - **列表接口不带 `versions`**（它内部装的就是脚本/解读/视频这些大字段）。
   首页第一阶段只能用顶层字段，别去读 `summary.versions`。
+- **首页成品展示要能切中英两版**，而且**只列出真的有产物的语言**
+  （`showcaseLanguages` 过滤掉没有音视频的版本）。切换时用 `:key` 重建
+  `<video>`/`<audio>` —— 两个语言是两份文件，不重建会继续放旧的那一份。
+  **封面和论文原图不跟着切**（跨语言共用），信息图跟（图上写着字）。
 
 ## 踩过的坑（别重犯）
 
@@ -180,6 +184,13 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **英文版的 prompt 必须整段是英文**，包括那句长度预算和输出语言规则。
   中文指令混在英文输出任务里，模型会跟着中文语感走 —— 实测把「120 字」当成
   120 个词，脚本写到目标的 130%。见 `_build_script_messages_en` / `LEVEL_GUIDE_EN`。
+- **解读的 system prompt 也必须整段英文**（`ANALYSIS_SYSTEM_EN`）。
+  一开始只给中文 `ANALYSIS_SYSTEM` 追加一句「请用英文输出」，实测**不管用**：
+  英文版的 `background` 有 83% 是中文，而且这个错误不会报错、不会失败，
+  只是内容悄悄是中文 —— 直到首页把两种语言的解读并排展示才看出来。
+  脚本那边因为一开始就写了完整的 `SCRIPT_SYSTEM_EN`，反而没踩到。
+  `tests/test_services.py::TestAnalysisPromptLanguage` 现在盯着这件事：
+  两版 prompt 的 JSON 字段必须完全一致，且英文那版一个中文字都不能有。
 - **「服务端支持双语」≠「每一集都有英文版」**。判断 `?lang=` 是否合法只能看
   **这一集实际产出了什么**（`Pipeline.available_languages()`）。拿配置的语言列表去判，
   老数据的 `?lang=en` 会**静默返回中文内容**（200 + 主语言），前端以为切成功了。
@@ -202,7 +213,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            320 项，改完必须全绿
+backend/tests/            325 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

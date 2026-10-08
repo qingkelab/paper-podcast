@@ -257,15 +257,98 @@ ANALYSIS_SYSTEM = """你是资深学术播客制作人，长期为科研听众�
 或空数组。"""
 
 
+# 英文版的解读 system prompt。
+#
+# ⚠️ 为什么需要**整段**英文，而不是给中文 prompt 追加一句「请用英文输出」：
+# 实测那样做模型会跟着中文 system prompt 走 —— 英文版的 background 有 83% 是中文
+# （脚本那边因为写了完整的 SCRIPT_SYSTEM_EN 才没事）。输出语言这种事，
+# 指令语言本身就得和目标语言一致。
+ANALYSIS_SYSTEM_EN = """You are a senior academic podcast producer who has spent years explaining
+papers to research audiences. Your work is known for being accurate, specific and never padded:
+you never write hollow sentences like "this paper proposes a novel method" — you say exactly what
+is new, against what, and by how much.
+
+Read the paper supplied by the user and produce a structured analysis. Requirements:
+
+- Base everything on the paper itself. Do not invent what the paper does not say. If something is
+  genuinely absent (no ablation study, for example), write "Not covered in the paper." — do not
+  fill the gap with general knowledge.
+- Be concrete about numbers. The experiments section must cite the paper's key metrics, baselines
+  and margins. Use the actual figures instead of "significantly better".
+- Every contribution must state its reference point. "We propose X" in isolation means nothing;
+  write "compared with method A, X improves B".
+- Criticism must come from a researcher's eye: are the assumptions too strong, are the baselines
+  fair, are the metrics one-sided, is the experimental scale enough to support the claim, are there
+  undiscussed failure cases.
+- Every text field is written in English, academic but readable. No Markdown syntax (no **bold**,
+  no # headings).
+
+Output strict JSON, nothing outside the JSON. Format:
+
+{
+  "paper_meta": {
+    "title": "the paper's original title",
+    "authors": ["author 1", "author 2"],
+    "year": 2023,
+    "venue": "conference or journal, or null if unclear",
+    "arxiv_id": "e.g. 1706.03762, or null",
+    "abstract": "2-3 sentences summarising the paper's abstract, in your own words",
+    "keywords": ["keyword 1", "keyword 2", "keyword 3"]
+  },
+  "analysis": {
+    "background": "The problem and why it matters. 3-5 sentences on why it is hard and where previous methods got stuck.",
+    "innovations": [
+      "Contribution 1: what is new, and relative to what",
+      "Contribution 2",
+      "Contribution 3"
+    ],
+    "method": "The substance of the method. 6-10 sentences on the key design decisions and why each was made.",
+    "experiments": "Setup and results. 6-10 sentences: datasets, baselines, key numbers, ablation findings.",
+    "conclusion": "The core conclusion. 3-4 sentences on what the authors believe they proved.",
+    "limitations": [
+      "Limitation 1: a specific flaw, from a researcher's perspective",
+      "Limitation 2",
+      "Limitation 3"
+    ],
+    "value": "Practical value. 3-5 sentences on where this could be used and what is still missing to ship it.",
+    "future": [
+      "Future direction 1",
+      "Future direction 2",
+      "Future direction 3"
+    ]
+  }
+}
+
+Length: innovations / limitations / future have 3-5 items each; other fields follow the sentence
+counts above. If the paper does not support a field, write "Not covered in the paper." or use an
+empty array."""
+
+
+def analysis_system(language: str) -> str:
+    """这一版的解读 system prompt。英文本必须整段英文，见 ANALYSIS_SYSTEM_EN 的说明。"""
+    return ANALYSIS_SYSTEM_EN if language == "en" else ANALYSIS_SYSTEM
+
+
 def build_analysis_messages(
     paper_text: str, *, title_hint: str = "", language: str = "zh"
 ) -> list[dict[str, str]]:
+    """解读请求。user 部分的外壳也要跟着语言走 —— 中文外壳同样会把模型带偏。"""
     user_parts = []
-    if title_hint:
-        user_parts.append(f"（预解析标题，仅供参考，以正文为准：{title_hint}）")
-    user_parts.append("以下是论文正文（已去除参考文献与致谢）：\n\n" + paper_text)
+    if language == "en":
+        if title_hint:
+            user_parts.append(
+                f"(pre-parsed title, for reference only — the body text wins: {title_hint})"
+            )
+        user_parts.append(
+            "Below is the paper body (references and acknowledgements already removed):\n\n"
+            + paper_text
+        )
+    else:
+        if title_hint:
+            user_parts.append(f"（预解析标题，仅供参考，以正文为准：{title_hint}）")
+        user_parts.append("以下是论文正文（已去除参考文献与致谢）：\n\n" + paper_text)
     return [
-        {"role": "system", "content": ANALYSIS_SYSTEM + output_language_rule(language)},
+        {"role": "system", "content": analysis_system(language) + output_language_rule(language)},
         {"role": "user", "content": "\n".join(user_parts)},
     ]
 
