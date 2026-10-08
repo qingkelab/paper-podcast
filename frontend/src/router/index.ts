@@ -39,6 +39,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '设置' },
   },
   {
+    path: '/about',
+    name: 'about',
+    component: () => import('../views/AboutView.vue'),
+    meta: { title: '项目介绍' },
+  },
+  {
     path: '/:pathMatch(.*)*',
     name: 'not-found',
     component: () => import('../views/NotFoundView.vue'),

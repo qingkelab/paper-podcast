@@ -413,12 +413,6 @@ pre {
   box-shadow: inset 0 0 0 1px rgba(211, 162, 74, 0.32);
 }
 
-@media (max-width: 560px) {
-  .page__actions {
-    align-items: flex-start;
-  }
-}
-
 /* ---------------------------------------------------------------- 卡片 */
 
 .card {
@@ -2361,11 +2355,359 @@ pre {
 
 /* ---------------------------------------------------------------- 响应式 */
 
+/* ==========================================================================
+   项目介绍页（/about）
+   内容型页面，不引入新依赖：复用卡片/徽章/表格的既有观感
+   ========================================================================== */
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 40px;
+}
+
+.stat {
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border-radius: var(--radius);
+  padding: 16px 18px 15px;
+}
+
+.stat__value {
+  font-family: var(--font-serif);
+  font-size: 30px;
+  line-height: 1.05;
+  color: var(--text);
+  letter-spacing: -0.5px;
+}
+
+.stat__unit {
+  font-size: 14px;
+  color: var(--accent);
+  margin-left: 4px;
+}
+
+.stat__label {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.stat__hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+/* 卡片里的小要点列表（事实清单，不是正文段落） */
+.fact-list {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.fact-list li {
+  position: relative;
+  padding-left: 15px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.fact-list li::before {
+  content: '—';
+  position: absolute;
+  left: 0;
+  color: var(--text-muted);
+}
+
+.fact-list--tight {
+  margin-top: 10px;
+}
+
+/* 流水线：左侧编号 + 竖线的步骤条 */
+.flow {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.flow__item {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 18px;
+  position: relative;
+  padding-bottom: 20px;
+}
+
+.flow__item:not(:last-child)::before {
+  content: '';
+  position: absolute;
+  left: 25px;
+  top: 42px;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.flow__marker {
+  width: 52px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-3);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: 0.5px;
+}
+
+.flow__body {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.flow__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.flow__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.flow__text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.72;
+  color: var(--text-dim);
+}
+
+/* 决策卡：两列，内容短，不需要更复杂的结构 */
+.decision-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.decision__title {
+  margin: 0 0 6px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.decision__body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.68;
+  color: var(--text-dim);
+}
+
+/* 数据表：窄屏会横向滚动，不挤压列宽 */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 10px 12px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.data-table thead th {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.4px;
+  border-bottom-color: var(--border);
+}
+
+.data-table tbody tr:last-child th,
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.data-table tbody th {
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.data-table__value {
+  font-family: var(--font-mono);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.data-table td {
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+/* 键值行：技术栈 */
+.kv {
+  display: flex;
+  flex-direction: column;
+}
+
+.kv__row {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.kv__row:last-child {
+  border-bottom: none;
+}
+
+.kv__key {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.kv__value {
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+/* FAQ：复用详情页折叠区的观感 */
+.faq {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.faq__item {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 0 18px;
+}
+
+.faq__q {
+  cursor: pointer;
+  padding: 14px 0;
+  font-size: 14.5px;
+  font-weight: 500;
+  color: var(--text);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.faq__q::-webkit-details-marker {
+  display: none;
+}
+
+.faq__q::before {
+  content: '+';
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  width: 12px;
+  flex: none;
+}
+
+.faq__item[open] .faq__q::before {
+  content: '−';
+}
+
+.faq__item[open] .faq__q {
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.faq__a {
+  margin: 0;
+  padding: 13px 0 16px 22px;
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--text-dim);
+}
+
+.code-block {
+  margin: 0;
+  padding: 16px 18px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--text-dim);
+}
+
+.code-block code {
+  font-family: inherit;
+}
+
+
+
 @media (max-width: 860px) {
   .app-header__inner,
   .container,
   .app-footer__inner {
     padding: 0 18px;
+  }
+
+  /* 项目介绍页：统计卡两列、决策卡与流水线单列 */
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .decision-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .flow__item {
+    grid-template-columns: 40px minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .flow__marker {
+    width: 40px;
+    font-size: 12px;
+  }
+
+  .flow__item:not(:last-child)::before {
+    left: 19px;
+  }
+
+  .kv__row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .data-table th,
+  .data-table td {
+    padding: 9px 8px;
   }
 
   .brand__tagline {
@@ -2451,6 +2793,26 @@ pre {
 
   .lightbox__paper {
     max-width: 18ch;
+  }
+}
+
+@media (max-width: 560px) {
+  .page__actions {
+    align-items: flex-start;
+  }
+
+  /* 项目介绍页：统计卡单列，流水线卡片收紧内边距 */
+  .stat-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .stat__value {
+    font-size: 26px;
+  }
+
+  .flow__body {
+    padding: 13px 14px;
   }
 }
 

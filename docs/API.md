@@ -362,6 +362,7 @@ range 请求探测 moov box）。无视频时 `404`。
 | 播客库 | `/library` | `GET /api/episodes`、`DELETE /api/episodes/{id}` |
 | 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../video`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md` |
 | 设置 | `/settings` | `GET /api/options`、`GET /api/health`（本地存储偏好） |
+| 项目介绍 | `/about` | 无（纯静态内容；只读 `health` 的 version/modes 做状态提示，取不到就降级） |
 
 ---
 
