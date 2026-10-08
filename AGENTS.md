@@ -45,6 +45,14 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **生成的信息图要走 `<object type="image/svg+xml">` 引用**，不要用 `<img>`
   （部分浏览器不会跑 `<img>` 里 SVG 的 SMIL 动画），也**不要内联进 HTML**
   （内容是模型生成的）。后端已做白名单清洗并加了 CSP 兜底。
+- **首页是产品介绍页（`/`），导入表单在 `/create`**。首页的产品展示区读库里最近一期
+  已完成的播客，用**真实产物**（视频/音频/脚本/解读/配图）说话；取不到就整区隐藏，
+  不要留空播放器。它是全站唯一不套 `.container/.page` 常规节奏的页面（类名前缀 `lp-`）。
+- **首页的产物展示要分两阶段加载**。真实后端下详情响应带视频/音频/配图；
+  离线演示（Mock）里视频是 MediaRecorder **实时录制**的。等详情回来才渲染，
+  首屏会在骨架上停很久 —— 先用列表项（标题/封面/时长/语言）画出来，详情回来再补。
+- **列表接口不带 `versions`**（它内部装的就是脚本/解读/视频这些大字段）。
+  首页第一阶段只能用顶层字段，别去读 `summary.versions`。
 
 ## 踩过的坑（别重犯）
 
@@ -196,6 +204,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
 backend/tests/            320 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
+frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言
 ```
 

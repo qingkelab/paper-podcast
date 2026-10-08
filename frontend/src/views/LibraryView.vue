@@ -167,7 +167,7 @@ onBeforeUnmount(() => {
           <span v-if="refreshing" class="spinner" aria-hidden="true" />
           {{ refreshing ? '刷新中…' : '刷新' }}
         </button>
-        <RouterLink to="/" class="btn btn--primary">导入新论文</RouterLink>
+        <RouterLink to="/create" class="btn btn--primary">导入新论文</RouterLink>
       </div>
     </header>
 
@@ -235,7 +235,7 @@ onBeforeUnmount(() => {
       <template v-else>
         <p class="empty__title">播客库还是空的</p>
         <p style="margin-bottom: 18px">导入第一篇论文，几分钟后这里就会出现一条双人播客。</p>
-        <RouterLink to="/" class="btn btn--primary">去导入论文</RouterLink>
+        <RouterLink to="/create" class="btn btn--primary">去导入论文</RouterLink>
       </template>
     </div>
 

@@ -58,7 +58,8 @@ src/
     mockPapers.ts  4 篇内置示例（Attention / ResNet / LoRA + 1 个通用模板）
     types.ts       契约 §1 的数据模型
   components/      AppHeader、AudioPlayer、ScriptView、AnalysisView、StageTimeline、EpisodeCard、StatusBadge、ConfirmDialog
-  views/           HomeView、TaskView、LibraryView、EpisodeView、SettingsView、NotFoundView
+  views/           LandingView(首页·产品介绍)、CreateView(导入表单)、TaskView、
+                   LibraryView、EpisodeView、SettingsView、NotFoundView
   stores/          preferences（localStorage 偏好）、meta（options + health + Mock 角标）
   utils/           format（时间/大小格式化）、stages（状态机与阶段定义）
   styles/main.css  设计系统（CSS 变量）

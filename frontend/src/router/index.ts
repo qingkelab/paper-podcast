@@ -10,9 +10,16 @@ import { IS_MOCK } from '../api'
 const routes: RouteRecordRaw[] = [
   {
     path: '/',
-    name: 'home',
-    component: () => import('../views/HomeView.vue'),
-    meta: { title: '导入论文' },
+    name: 'landing',
+    component: () => import('../views/LandingView.vue'),
+    meta: { title: '论文解读 AI 播客' },
+  },
+  {
+    // 导入表单从首页搬到 /create：首页要专心做产品介绍，不能被表单割成两半
+    path: '/create',
+    name: 'create',
+    component: () => import('../views/CreateView.vue'),
+    meta: { title: '生成新播客' },
   },
   {
     path: '/task/:id',
@@ -39,12 +46,6 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '设置' },
   },
   {
-    path: '/about',
-    name: 'about',
-    component: () => import('../views/AboutView.vue'),
-    meta: { title: '项目介绍' },
-  },
-  {
     path: '/:pathMatch(.*)*',
     name: 'not-found',
     component: () => import('../views/NotFoundView.vue'),
@@ -60,7 +61,8 @@ const router = createRouter({
 
 router.afterEach((to) => {
   const title = to.meta.title as string | undefined
-  document.title = title ? `${title} · 论文解读 AI 播客` : '论文解读 AI 播客'
+  // 首页就是产品本身，标题不重复拼品牌名
+  document.title = to.name === 'landing' ? '论文解读 AI 播客' : title ? `${title} · 论文解读 AI 播客` : '论文解读 AI 播客'
 })
 
 export default router

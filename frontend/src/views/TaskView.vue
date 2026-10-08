@@ -183,7 +183,7 @@ watch(id, () => {
           <span v-if="retrying" class="spinner" aria-hidden="true" />
           {{ retrying ? '正在重新排队…' : '重新生成' }}
         </button>
-        <RouterLink to="/" class="btn btn--ghost">换一篇论文</RouterLink>
+        <RouterLink to="/create" class="btn btn--ghost">换一篇论文</RouterLink>
       </div>
 
       <section class="section">

@@ -357,12 +357,16 @@ range 请求探测 moov box）。无视频时 `404`。
 
 | 页面 | 路由 | 用到的接口 |
 |---|---|---|
-| 首页/导入 | `/` | `POST /api/episodes`、`GET /api/options`、`GET /api/health` |
+| 首页（产品介绍） | `/` | `GET /api/episodes?status=completed`、`GET /api/episodes/{id}`（拿一期真实产物做展示）、`GET /api/health` |
+| 生成新播客 | `/create` | `POST /api/episodes`、`GET /api/options`、`GET /api/health` |
 | 任务进度 | `/task/:id` | `GET /api/episodes/{id}`（轮询）、`POST .../retry` |
 | 播客库 | `/library` | `GET /api/episodes`、`DELETE /api/episodes/{id}` |
 | 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../video`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md` |
 | 设置 | `/settings` | `GET /api/options`、`GET /api/health`（本地存储偏好） |
-| 项目介绍 | `/about` | 无（纯静态内容；只读 `health` 的 version/modes 做状态提示，取不到就降级） |
+
+**首页是产品介绍页，不是表单**：导入表单在 `/create`。
+首页的产品展示区读库里最近一期**已完成**的播客，把真实的视频/音频/脚本/解读/配图摆出来；
+取不到（空库 / 后端不可用）时整区隐藏，页面退化成纯介绍，不会出现空播放器或破图。
 
 ---
 

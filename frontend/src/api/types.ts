@@ -51,6 +51,12 @@ export interface ScriptSegment {
   speaker: 'A' | 'B'
   text: string
   round: number
+  /**
+   * "intro" / "outro" 表示这是社区品牌话术，不是论文正文（契约 §1）。
+   * 老后端不返回这个字段。视频层靠它把片尾渲染成品牌卡，
+   * 首页展示脚本片段时要把它排除掉 —— 否则露出来的第一句是「这里是青稞社区」。
+   */
+  brand?: 'intro' | 'outro' | null
 }
 
 export interface Script {
@@ -145,6 +151,11 @@ export interface EpisodeVersion {
   analysis: Analysis | null
   /** 该语言的论文元信息（标题作者本身多为英文，两版通常一致） */
   paper_meta: PaperMeta | null
+  /**
+   * 该语言的信息图（契约 §1）。
+   * 信息图**按语言各出一份**（图上写着字），封面和论文原图才是跨语言共用的。
+   */
+  illustration?: Illustration | null
   /** 该语言的音频（契约 §2：GET /episodes/{id}/audio?lang=xx） */
   audio_url: string | null
   audio_duration_sec: number | null

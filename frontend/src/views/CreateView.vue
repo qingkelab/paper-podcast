@@ -180,11 +180,11 @@ onMounted(() => {
 <template>
   <div class="container page">
     <header class="page__head">
-      <p class="eyebrow">Import · 导入论文</p>
-      <h1 class="page-title">把一篇论文，变成一档双人播客</h1>
+      <p class="eyebrow">Create · 生成新播客</p>
+      <h1 class="page-title">选好来源和参数，剩下的交给流水线</h1>
       <p class="page-subtitle">
         上传 PDF、贴一条 arXiv 链接，或者直接粘贴论文正文。系统会依次完成「解析论文 → 深度解读 → 生成脚本 →
-        合成音频」，产出可播放的双人对谈播客、逐段脚本与结构化解读。
+        合成音频 → 合成视频」，产出可播放的双人对谈播客、逐段脚本与结构化解读。
       </p>
     </header>
 

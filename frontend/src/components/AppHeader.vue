@@ -5,9 +5,9 @@ import { useMetaStore } from '../stores/meta'
 const meta = useMetaStore()
 
 const links = [
-  { to: '/', label: '导入论文' },
+  { to: '/', label: '首页' },
+  { to: '/create', label: '开始生成' },
   { to: '/library', label: '播客库' },
-  { to: '/about', label: '项目介绍' },
   { to: '/settings', label: '设置' },
 ]
 </script>
