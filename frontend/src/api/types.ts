@@ -239,12 +239,27 @@ export interface VoiceOption {
   label: string
   gender: string
   pair: string
+  /**
+   * 这个音色属于哪一种语言版本。
+   * 英文版不能用中文音色（虽然也能出声，但口音很明显），
+   * 所以说话人名字要按当前语言去对应语言的音色里取。
+   * 后端老版本不返回这个字段，缺省按中文处理。
+   */
+  language?: EpisodeLanguage
+}
+
+/** 服务端支持的语言（新建时选要产出哪些版本） */
+export interface LanguageOption {
+  value: EpisodeLanguage
+  label: string
 }
 
 export interface OptionsPayload {
   durations: DurationOption[]
   levels: LevelOption[]
   voices: VoiceOption[]
+  /** 后端老版本不返回，做可选处理 */
+  languages?: LanguageOption[]
 }
 
 export interface HealthPayload {

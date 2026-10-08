@@ -33,12 +33,14 @@ import FigureLightbox from '../components/FigureLightbox.vue'
 import PaperMetaSection from '../components/PaperMetaSection.vue'
 import ScriptView from '../components/ScriptView.vue'
 import StatusBadge from '../components/StatusBadge.vue'
+import { useMetaStore } from '../stores/meta'
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
 import { languageLabel, languageShort, loadEpisodeLanguage, rememberEpisodeLanguage } from '../utils/language'
 import { LEVEL_LABELS, SOURCE_LABELS } from '../utils/stages'
 
 const route = useRoute()
 const router = useRouter()
+const meta = useMetaStore()
 
 const id = computed(() => String(route.params.id ?? ''))
 const episode = ref<Episode | null>(null)
@@ -557,6 +559,29 @@ const scriptWords = computed(() => displayScript.value?.word_count ?? 0)
  * 英文版写「427 字」是把词当成了字，会让「目标 3 分钟」看着像严重超时。
  */
 const scriptUnit = computed(() => (activeLanguage.value === 'en' ? '词' : '字'))
+
+/**
+ * 当前语言版本实际用的两位主播音色。
+ *
+ * 英文版必须显示英文音色名：`options.voice_a/b` 存的是**主语言**那一档（中文），
+ * 直接拿它渲染，英文脚本旁边会挂着「大义先生 / 米仔同学」，与实际听到的声音对不上。
+ * 音色表里没有该语言的音色时退回主语言的取值 —— 宁可显示得不精确，也不要空着。
+ */
+function voiceForSpeaker(speaker: 'A' | 'B'): string {
+  const primary = episode.value?.options?.[speaker === 'A' ? 'voice_a' : 'voice_b'] ?? ''
+  const language = activeLanguage.value
+  if (!language || !showLanguageSwitch.value) return primary
+
+  const wanted = speaker === 'A' ? 'male' : 'female'
+  const candidates = meta.options.voices.filter(
+    (voice) => (voice.language ?? 'zh') === language,
+  )
+  const match = candidates.find((voice) => voice.gender === wanted) ?? candidates[0]
+  return match?.id ?? primary
+}
+
+const voiceA = computed(() => voiceForSpeaker('A'))
+const voiceB = computed(() => voiceForSpeaker('B'))
 const analysisCards = computed(() => {
   const analysis = displayAnalysis.value
   if (!analysis) return 0
@@ -1234,8 +1259,8 @@ onBeforeUnmount(() => {
             <ScriptView
               :script="displayScript"
               :language="activeLanguage ?? undefined"
-              :voice-a="episode.options.voice_a"
-              :voice-b="episode.options.voice_b"
+              :voice-a="voiceA"
+              :voice-b="voiceB"
             />
           </div>
         </div>
@@ -1250,8 +1275,8 @@ onBeforeUnmount(() => {
           <ScriptView
             :script="displayScript"
             :language="activeLanguage ?? undefined"
-            :voice-a="episode.options.voice_a"
-            :voice-b="episode.options.voice_b"
+            :voice-a="voiceA"
+            :voice-b="voiceB"
           />
         </div>
       </section>
