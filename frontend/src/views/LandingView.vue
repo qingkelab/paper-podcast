@@ -19,6 +19,7 @@ import type {
   Illustration,
   ScriptSegment,
 } from '../api'
+import LanguageSwitch from '../components/LanguageSwitch.vue'
 import { useMetaStore } from '../stores/meta'
 import { formatDuration } from '../utils/format'
 import { languageLabel } from '../utils/language'
@@ -55,8 +56,16 @@ const showcase = ref<Showcase | null>(null)
 const showcaseLoading = ref(true)
 /** 详情（视频 / 配图 / 脚本 / 解读）是否已经补齐 */
 const showcaseDetailReady = ref(false)
-/** 当前展示的语言版本 */
+/** 成品展示区当前展示的语言版本 */
 const showcaseLanguage = ref<EpisodeLanguage | null>(null)
+/**
+ * 首屏视频**自己**的语言开关。
+ *
+ * 刻意和 `showcaseLanguage` 分开：首屏那个只换首屏那段视频，
+ * 不动下面展示区的视频/音频/脚本/解读。两处共用一个状态的话，
+ * 在首屏切一下语言会把下面整块也换掉，不是「只切换视频」。
+ */
+const heroLanguage = ref<EpisodeLanguage | null>(null)
 /** 首屏视觉里的播放入口：点击后真的就地播起来，而不是只做个样子 */
 const heroPlaying = ref(false)
 
@@ -109,6 +118,7 @@ async function loadShowcase(): Promise<void> {
       },
     }
     showcaseLanguage.value = primary
+    heroLanguage.value = primary
     showcaseLoading.value = false
 
     const full = await getEpisode(picked.id)
@@ -153,6 +163,7 @@ async function loadShowcase(): Promise<void> {
     }
     // 主语言可能变了（老数据没有 language 字段时由 languages[0] 推断）
     showcaseLanguage.value = fullPrimary
+    heroLanguage.value = fullPrimary
     showcaseDetailReady.value = true
   } catch {
     // 首页不允许因为取素材失败而坏掉：整屏静默隐藏即可
@@ -182,17 +193,39 @@ const activeVersion = computed<ShowcaseVersion | null>(() => {
   return item.versions[language] ?? null
 })
 
+/** 首屏那一版（和展示区相互独立） */
+const heroVersion = computed<ShowcaseVersion | null>(() => {
+  const item = showcase.value
+  const language = heroLanguage.value
+  if (!item || !language) return null
+  return item.versions[language] ?? null
+})
+
 function selectShowcaseLanguage(language: EpisodeLanguage): void {
   if (language === showcaseLanguage.value) return
   if (!showcaseLanguages.value.includes(language)) return
   showcaseLanguage.value = language
 }
 
-// 语言一切就把首屏那份「正在播」的状态丢掉：两个播放器指向的是不同文件，
-// 留着播放按钮的隐藏状态会让人以为还在播同一段
-watch(showcaseLanguage, () => {
+function selectHeroLanguage(language: EpisodeLanguage): void {
+  if (language === heroLanguage.value) return
+  if (!showcaseLanguages.value.includes(language)) return
+  heroLanguage.value = language
+}
+
+// 首屏换了语言就把「正在播」的状态丢掉：两个语言是两份文件，视频元素会重建，
+// 留着播放按钮的隐藏状态会让人以为还在放同一段
+watch(heroLanguage, () => {
   heroPlaying.value = false
 })
+
+function languageSwitchHint(language: EpisodeLanguage): string {
+  return `切换到${languageLabel(language)}版视频`
+}
+
+function showcaseSwitchHint(language: EpisodeLanguage): string {
+  return `切换到${languageLabel(language)}版（视频 / 音频 / 脚本 / 解读 / 信息图 一起换）`
+}
 
 function playHero(): void {
   heroPlaying.value = true
@@ -216,8 +249,11 @@ function scrollToShowcase(): void {
 const activeLanguage = computed(() => showcaseLanguage.value)
 const episodeDuration = computed(() => activeVersion.value?.durationSec ?? null)
 
-/** 首屏浮动卡和成品区左栏都用它：非主语言带 ?lang=，切语言就是换文件 */
+/** 成品区左栏的视频 */
 const videoUrl = computed(() => activeVersion.value?.videoUrl ?? null)
+/** 首屏那一段视频（只跟着首屏自己的开关走） */
+const heroVideoUrl = computed(() => heroVersion.value?.videoUrl ?? null)
+const heroDuration = computed(() => heroVersion.value?.durationSec ?? null)
 const audioUrl = computed(() => activeVersion.value?.audioUrl ?? null)
 
 const analysisPreview = computed(() => {
@@ -381,16 +417,16 @@ onMounted(() => {
           </ul>
         </div>
 
-        <!-- 首屏视觉：真实封面 + 就地可播的真实视频 -->
+        <!-- 首屏视觉：真实封面 + 就地可播的真实视频（自带语言开关，见 .lp-shot__lang） -->
         <div class="lp-hero__visual rise">
           <div class="lp-shot" :class="{ 'is-playing': heroPlaying }">
             <video
-              v-if="videoUrl"
-              :key="`hero-${activeLanguage ?? 'zh'}`"
+              v-if="heroVideoUrl"
+              :key="`hero-${heroLanguage ?? 'zh'}`"
               ref="videoRef"
               class="lp-shot__video"
               :poster="showcase?.posterUrl ?? undefined"
-              :src="videoUrl"
+              :src="heroVideoUrl"
               preload="none"
               playsinline
               controls
@@ -406,7 +442,7 @@ onMounted(() => {
             </div>
 
             <button
-              v-if="videoUrl && !heroPlaying"
+              v-if="heroVideoUrl && !heroPlaying"
               type="button"
               class="lp-shot__play"
               aria-label="在首页直接播放这一期的视频解读"
@@ -417,6 +453,17 @@ onMounted(() => {
             </button>
 
             <span v-if="showcase && !heroPlaying" class="lp-shot__badge">936 × 1210</span>
+
+            <!-- 首屏自己的语言开关：只换上面这段视频，不动下面的成品展示区 -->
+            <LanguageSwitch
+              v-if="showcaseLanguages.length > 1"
+              class="lp-shot__lang"
+              overlay
+              :languages="showcaseLanguages"
+              :model-value="heroLanguage"
+              :hint="languageSwitchHint"
+              @update:model-value="selectHeroLanguage"
+            />
           </div>
 
           <!-- 浮动信息卡：把「这一期到底产出了什么」摊开给人看 -->
@@ -424,10 +471,10 @@ onMounted(() => {
             <span class="lp-float__icon" aria-hidden="true">♪</span>
             <span class="lp-float__body">
               <span class="lp-float__title">
-                {{ activeLanguage ? languageLabel(activeLanguage) : '' }}版 · 双人对谈
+                {{ heroLanguage ? languageLabel(heroLanguage) : '' }}版 · 双人对谈
               </span>
               <span class="lp-float__meta">
-                {{ formatDuration(episodeDuration) }}<template v-if="showcaseLanguages.length > 1">
+                {{ formatDuration(heroDuration) }}<template v-if="showcaseLanguages.length > 1">
                   · 另有 {{ showcaseLanguages.length - 1 }} 个语言版本</template
                 >
               </span>
@@ -472,28 +519,21 @@ onMounted(() => {
             <h2 class="lp-head__title">看一期真正的成品</h2>
             <p class="lp-head__lede">
               下面所有东西都来自库里真实生成的一期，不是示意图：视频、音频、脚本、解读、
-              配图都是它的产物。中英两版各自有独立的脚本和音视频，按钮一按就换。
+              配图都是它的产物。中英两版各有独立的脚本和音视频 —— 这里的按钮换的是**这一整块**；
+              首屏视频上的那个按钮只换首屏那段视频。
             </p>
           </header>
 
           <!-- 语言切换器：只有这一集真的产出了多个语言版本时才出现 -->
-          <div v-if="showcaseLanguages.length > 1" class="lp-show__lang">
-            <span class="lang-switch__label">语言版本</span>
-            <div class="lang-switch" role="group" aria-label="切换展示的语言版本">
-              <button
-                v-for="language in showcaseLanguages"
-                :key="language"
-                type="button"
-                class="lang-switch__btn"
-                :class="{ 'is-active': language === activeLanguage }"
-                :aria-pressed="language === activeLanguage"
-                :title="`切换到${languageLabel(language)}版（视频 / 音频 / 脚本 / 解读 一起换）`"
-                @click="selectShowcaseLanguage(language)"
-              >
-                {{ languageLabel(language) }}
-              </button>
-            </div>
-          </div>
+          <LanguageSwitch
+            v-if="showcaseLanguages.length > 1"
+            class="lp-show__lang"
+            label="语言版本"
+            :languages="showcaseLanguages"
+            :model-value="activeLanguage"
+            :hint="showcaseSwitchHint"
+            @update:model-value="selectShowcaseLanguage"
+          />
         </div>
 
         <div v-if="showcaseLoading" class="lp-show__loading">

@@ -413,6 +413,27 @@ pre {
   box-shadow: inset 0 0 0 1px rgba(211, 162, 74, 0.32);
 }
 
+/* 切换器 + 可选标题（首页两处都用它，状态各管各的） */
+.lang-switch-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 叠在视频/封面上的那一份：底色要够实，否则白底论文画面会把按钮衬得看不清；
+   同时要压住全屏的播放遮罩，不然点不到 */
+.lang-switch-group--overlay .lang-switch {
+  background: rgba(9, 13, 19, 0.82);
+  border-color: var(--border-strong);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.36);
+}
+
+.lang-switch-group--overlay .lang-switch__btn {
+  padding: 5px 11px;
+  font-size: 12px;
+}
+
 /* ---------------------------------------------------------------- 卡片 */
 
 .card {
@@ -2595,9 +2616,19 @@ pre {
   color: var(--text);
 }
 
+/* 首屏语言开关：左上角。左下角有「936×1210」角标、右下角被浮动卡压着，
+   所以只有左上角是干净的。z-index 要高过全屏播放遮罩，否则点击被它吃掉。 */
+.lp-shot__lang {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 3;
+}
+
+/* 角标放右下角：左下角会被「音频」浮动卡压住（实测整块盖住，等于白摆一个角标） */
 .lp-shot__badge {
   position: absolute;
-  left: 12px;
+  right: 12px;
   bottom: 12px;
   padding: 4px 10px;
   border-radius: var(--radius-pill);
@@ -3610,6 +3641,15 @@ pre {
 
   .lp-art {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lp-shot__lang {
+    top: 10px;
+    left: 10px;
+  }
+
+  .lang-switch-group--overlay .lang-switch__btn {
+    padding: 5px 9px;
   }
 
 }
