@@ -532,9 +532,15 @@ def build_script_payload(
     for index, segment in enumerate(segments):
         text = segment["text"]
         total_chars += len(text)
-        payload_segments.append(
-            {"speaker": segment["speaker"], "text": text, "round": index}
-        )
+        entry: dict[str, Any] = {
+            "speaker": segment["speaker"],
+            "text": text,
+            "round": index,
+        }
+        # 保留品牌标记（intro / outro）：视频层要靠它把片尾渲染成品牌卡片
+        if segment.get("brand"):
+            entry["brand"] = segment["brand"]
+        payload_segments.append(entry)
     return {
         "segments": payload_segments,
         "word_count": total_chars,

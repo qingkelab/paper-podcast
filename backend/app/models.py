@@ -52,6 +52,9 @@ class ScriptSegment(BaseModel):
     speaker: Literal["A", "B"]
     text: str
     round: int = 0
+    # "intro" / "outro" 表示这是社区品牌话术（不是论文正文），
+    # 视频层据此把片尾渲染成品牌卡片
+    brand: Literal["intro", "outro"] | None = None
 
 
 class Script(BaseModel):

@@ -31,6 +31,7 @@ from app.services.video import (
     heuristic_assignment,
     heuristic_per_segment,
     merge_runs_to_cap,
+    render_endcard,
     render_slide,
 )
 
@@ -929,3 +930,226 @@ class TestBrandingInjection:
             assert seg["speaker"] in ("A", "B")
             assert seg["text"].strip()
             assert seg.get("brand") in ("intro", "outro")
+
+
+# --------------------------------------------------------------------------
+# 社区 logo 与片尾关注引导
+# --------------------------------------------------------------------------
+
+
+class TestBrandEndCard:
+    """片尾做成深色品牌卡（logo + 关注引导）。
+
+    为什么片尾要单独深色：社区 logo 是**浅色**字标（社区自己的视频也用深色星空底），
+    白底上会直接消失；而正文又必须是白底 —— 论文配图本身就是白底图表。
+    所以两种底各归其位：正文白底保证可读，片尾深色保证品牌正确。
+    """
+
+    @staticmethod
+    def _pixels(path):
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(path))
+        n, W = pix.n, pix.width
+        s = pix.samples
+
+        def at(x: int, y: int):
+            i = (y * W + x) * n
+            return (s[i], s[i + 1], s[i + 2])
+
+        return at, pix.width, pix.height
+
+    def test_logo_asset_exists(self):
+        from app.branding import logo_path
+
+        assert logo_path().exists(), "内置的社区 logo 丢了"
+
+    def test_logo_data_uri_is_cached(self):
+        from app.services.video import _logo_data_uri
+
+        first = _logo_data_uri(120)
+        assert first is not None
+        second = _logo_data_uri(120)
+        assert first is second, "同一宽度应当命中缓存，否则每帧都要重解码"
+
+    def test_endcard_is_dark_with_brand_colors(self, tmp_path):
+        from app.services.video import BRAND_DARK, BRAND_GOLD, BRAND_GREEN
+
+        image = make_png(tmp_path / "i.png", 600, 400)
+        scene = Scene(
+            start=0, end=6, image=image, kind="illustration", speaker="A",
+            text="关注青稞，每天学习最新论文。下期见。", brand="outro",
+        )
+        out = render_endcard(scene, tmp_path / "end.png", title="测试标题")
+        at, W, H = self._pixels(out)
+
+        # 四角是品牌深色底
+        assert at(6, 6) == (10, 18, 12), f"片尾不是深色底：{at(6, 6)}"
+
+        # 画面里应当出现青稞绿与麦金（logo 或文字带进来的）
+        def near(c, target, tol=60):
+            return all(abs(a - b) < tol for a, b in zip(c, target))
+
+        gold = (245, 200, 66)
+        green = (124, 179, 66)
+        has_gold = any(
+            near(at(x, y), gold) for y in range(380, H - 260, 12) for x in range(60, W - 60, 12)
+        )
+        has_green = any(
+            near(at(x, y), green) for y in range(380, H - 260, 12) for x in range(60, W - 60, 12)
+        )
+        assert has_gold, "片尾没出现麦金（关注引导的主句）"
+        assert has_green, "片尾没出现青稞绿"
+
+    def test_endcard_subtitle_panel_is_dark(self, tmp_path):
+        from app.services.video import SUBTITLE_TOP
+
+        image = make_png(tmp_path / "i.png", 600, 400)
+        scene = Scene(start=0, end=6, image=image, kind="illustration", text="下期见。", brand="outro")
+        out = render_endcard(scene, tmp_path / "end2.png")
+        at, W, H = self._pixels(out)
+        # 字幕面板底色应当是深色（与正文页的浅底相反）
+        r, g, b = at(W - 20, SUBTITLE_TOP + 10)
+        assert (r + g + b) / 3 < 80, f"片尾字幕面板不是深色：{(r,g,b)}"
+
+    def test_content_slide_still_white_and_has_watermark(self, tmp_path):
+        """正文页保持白底，同时右上角有 logo 水印（垫了深色底才看得见）。"""
+        from app.services.video import VIDEO_W, WATERMARK_W
+
+        image = make_png(tmp_path / "i.png", 600, 400, color=(220, 220, 220))
+        scene = Scene(start=0, end=5, image=image, kind="figure", speaker="A", text="正文内容")
+        out = render_slide(scene, tmp_path / "body.png", title="标题")
+        at, W, H = self._pixels(out)
+
+        assert at(6, 6) == (255, 255, 255), "正文页应当仍是白底"
+
+        # 水印区域应当出现深色底（logo 是浅色的，必须垫底）
+        chip_w = WATERMARK_W + 20
+        chip_x = W - 40 - chip_w
+        dark_found = any(
+            sum(at(x, y)) / 3 < 60
+            for y in range(18, 70, 3)
+            for x in range(chip_x, W - 40, 4)
+        )
+        assert dark_found, "正文页右上角没找到 logo 水印的深色底"
+
+    def test_watermark_stays_in_the_header(self, tmp_path):
+        """水印只占右上角一小块，不能溢出到标题行下面或图片上。
+
+        注意别拿页眉整行去采样 —— 标题本身就画在那一行（基线 y=46），
+        会把「有深色像素」误判成水印溢出。这里检查的是**页眉之下的那一条**。
+        """
+        from app.services.video import TITLE_BASELINE
+
+        image = make_png(tmp_path / "i.png", 600, 400, color=(220, 220, 220))
+        scene = Scene(start=0, end=5, image=image, kind="figure", speaker="A", text="正文内容")
+        out = render_slide(scene, tmp_path / "body2.png", title="标题")
+        at, W, H = self._pixels(out)
+
+        from app.services.video import (
+            IMAGE_TOP,
+            WATERMARK_PAD,
+            WATERMARK_W,
+            _logo_data_uri,
+        )
+
+        # 先算清楚水印底块的实际边界，再验证它确实落在图片区之上
+        _, _, logo_h = _logo_data_uri(WATERMARK_W)
+        chip_bottom = 18 + logo_h + WATERMARK_PAD * 2
+        assert chip_bottom <= IMAGE_TOP, (
+            f"水印底块下沿 {chip_bottom} 已经压到图片区（顶部 {IMAGE_TOP}）"
+        )
+
+        # 水印底块与图片之间的那条空隙必须整条是白的
+        leaked = [
+            (x, y)
+            for y in range(chip_bottom + 1, IMAGE_TOP)
+            for x in range(20, W - 20, 10)
+            if sum(at(x, y)) / 3 < 240
+        ]
+        assert not leaked, f"水印溢出了页眉：{leaked[:5]}"
+
+
+class TestBrandCta:
+    """片尾的关注引导：声音里说一遍，画面上出大字。"""
+
+    def test_cta_text(self):
+        from app import branding
+
+        assert branding.BRAND_CTA_TITLE == "关注青稞，每天学习最新论文"
+        assert branding.BRAND_CTA_SUBTITLE
+
+    def test_cta_is_also_spoken_in_outro(self):
+        """画面上的引导必须在语音里也说一遍 —— 只出字幕会漏掉纯听的场景。"""
+        from app import branding
+
+        spoken = "".join(t for _, t in branding.BRAND_OUTRO)
+        assert "关注青稞" in spoken
+        assert "每天学习最新论文" in spoken
+
+    def test_outro_mentions_community(self):
+        from app import branding
+
+        spoken = "".join(t for _, t in branding.BRAND_OUTRO)
+        assert "青稞社区" in spoken
+
+
+class TestEndCardRouting:
+    def test_outro_scenes_use_endcard(self, tmp_path, monkeypatch):
+        """片尾段必须走品牌卡渲染，正文段走普通页。"""
+        from app.services import video as video_module
+
+        rendered: list[str] = []
+        real_slide, real_end = video_module.render_slide, video_module.render_endcard
+
+        def spy_slide(scene, path, **kw):
+            rendered.append("slide")
+            return real_slide(scene, path, **kw)
+
+        def spy_end(scene, path, **kw):
+            rendered.append("endcard")
+            return real_end(scene, path, **kw)
+
+        monkeypatch.setattr(video_module, "render_slide", spy_slide)
+        monkeypatch.setattr(video_module, "render_endcard", spy_end)
+
+        cover = make_png(tmp_path / "c.png")
+        illu = make_png(tmp_path / "u.png")
+        audio = tmp_path / "a.wav"
+        import wave
+
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 3)
+
+        segments = [
+            {"speaker": "A", "text": "正文一", "brand": "intro"},
+            {"speaker": "B", "text": "正文二"},
+            {"speaker": "A", "text": "关注青稞", "brand": "outro"},
+        ]
+        timings = [
+            FakeTiming(0, "A", 0.0, 1.0),
+            FakeTiming(1, "B", 1.0, 2.0),
+            FakeTiming(2, "A", 2.0, 3.0),
+        ]
+
+        video_module.compose_video(
+            segments=segments,
+            timings=timings,
+            audio_path=audio,
+            audio_duration=3.0,
+            cover_path=str(cover),
+            figures=[],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "w",
+            output_path=tmp_path / "o.mp4",
+            title="t",
+            llm=None,
+            preset_scenes=[{"index": i, "image": "illustration"} for i in range(3)],
+            preset_assets={"illustration": str(illu), "cover": str(cover)},
+        )
+
+        assert "endcard" in rendered, "片尾段没有走品牌卡渲染"
+        assert rendered.count("endcard") == 1, f"品牌卡帧数不对：{rendered}"

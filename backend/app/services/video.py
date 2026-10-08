@@ -38,6 +38,17 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# 社区品牌配色与素材（取自社区自己的视频合成项目 qingkelab/qingke-video）
+BRAND_DARK = "#0a120c"
+BRAND_DARK_PANEL = "#0f1a14"
+BRAND_GREEN = "#7CB342"
+BRAND_GOLD = "#F5C842"
+BRAND_TEXT = "#f5f5f0"
+
+# 正文页右上角的 logo 水印尺寸（logo 是 1074x288，宽高比约 3.73）
+WATERMARK_W = 120
+WATERMARK_PAD = 10
+
 # 画幅 = 论文 PDF 首页渲染图的尺寸（935x1210）。
 #
 # ⚠️ 宽度必须取 936 而不是 935：H.264 的 yuv420p 是 4:2:0 色度抽样，
@@ -95,6 +106,8 @@ class Scene:
     speaker: str = ""
     text: str = ""
     caption: str = ""  # 图片说明（图注），显示在图片下方
+    # "outro" 表示这是片尾品牌段 —— 视频层会把它渲染成品牌卡片而不是普通配图页
+    brand: str = ""
 
     @property
     def duration(self) -> float:
@@ -349,6 +362,7 @@ def build_scenes(
                 speaker=str(segment.get("speaker") or getattr(timing, "speaker", "") or "A"),
                 text=str(segment.get("text") or ""),
                 caption=asset.caption,
+                brand=str(segment.get("brand") or ""),
             )
         )
 
@@ -376,6 +390,7 @@ def build_scenes(
                 kind=tail_kind,
                 caption=tail_caption,
                 text="以上就是这篇论文的解读，感谢收听。",
+                brand="outro",  # 收尾一律用品牌卡，不要用普通配图页结尾
             )
         )
 
@@ -390,6 +405,42 @@ def build_scenes(
 # --------------------------------------------------------------------------
 # 幻灯片渲染
 # --------------------------------------------------------------------------
+
+
+_LOGO_CACHE: dict[int, tuple[str, int, int]] = {}
+
+
+def _logo_data_uri(width: int) -> tuple[str, int, int] | None:
+    """读取内置的社区 logo，缩放到指定宽度后转 data URI。
+
+    每帧都要内嵌一次，所以按宽度缓存 —— 否则每帧都要重新解码缩放同一张 PNG。
+    logo 是**浅色**字标（为深色底设计），放在白底正文上必须垫一块深色底，
+    否则白字会消失。片尾卡整张就是深色，可以直接用。
+    """
+    if width in _LOGO_CACHE:
+        return _LOGO_CACHE[width]
+
+    from ..branding import logo_path
+
+    path = logo_path()
+    if not path.exists():
+        logger.warning("未找到社区 logo（%s），跳过水印", path)
+        return None
+
+    try:
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(path))
+        if width != pix.width:
+            target_h = max(int(pix.height * width / pix.width), 1)
+            pix = pymupdf.Pixmap(pix, width, target_h)
+        uri = "data:image/png;base64," + base64.b64encode(pix.tobytes("png")).decode("ascii")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("社区 logo 处理失败，跳过水印：%s", exc)
+        return None
+
+    _LOGO_CACHE[width] = (uri, pix.width, pix.height)
+    return _LOGO_CACHE[width]
 
 
 def _prepare_image(path: Path, max_w: int, max_h: int) -> tuple[str, int, int]:
@@ -518,6 +569,23 @@ def render_slide(scene: Scene, output_path: Path, *, title: str = "") -> Path:
             f'fill="{TITLE_COLOR}">{html.escape(title[:40])}</text>'
         )
 
+    # 右上角社区 logo 水印。
+    # logo 是浅色字标，白底上直接放会看不见，所以垫一块深色圆角底。
+    logo = _logo_data_uri(WATERMARK_W)
+    if logo:
+        uri, lw, lh = logo
+        chip_w, chip_h = lw + WATERMARK_PAD * 2, lh + WATERMARK_PAD * 2
+        chip_x = VIDEO_W - 40 - chip_w
+        chip_y = 18
+        parts.append(
+            f'<rect x="{chip_x}" y="{chip_y}" width="{chip_w}" height="{chip_h}" '
+            f'rx="8" fill="{BRAND_DARK}" opacity="0.9"/>'
+        )
+        parts.append(
+            f'<image x="{chip_x + WATERMARK_PAD}" y="{chip_y + WATERMARK_PAD}" '
+            f'width="{lw}" height="{lh}" href="{uri}"/>'
+        )
+
     # 配图（浅灰细边框，白底上用来界定图片边界）
     parts.append(
         f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" height="{img_h + 4}" '
@@ -555,6 +623,95 @@ def render_slide(scene: Scene, output_path: Path, *, title: str = "") -> Path:
             f'<text x="{SUBTITLE_LEFT}" y="{SUBTITLE_TEXT_TOP + offset * line_height:.0f}" '
             f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
             f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
+        )
+
+    parts.append("</svg>")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _rasterize_custom("\n".join(parts), output_path)
+    return output_path
+
+
+def render_endcard(scene: Scene, output_path: Path, *, title: str = "") -> Path:
+    """片尾品牌卡：深色底 + 社区 logo + 关注引导。
+
+    ## 为什么片尾要单独做成深色
+
+    logo 是**浅色**字标（社区自己的视频也用深色星空底），白底上会直接消失。
+    而正文又必须是白底 —— 论文配图本身就是白底图表，深色画布会把它们衬得像贴图。
+
+    所以两种底各归其位：**正文白底保证可读，片尾深色保证品牌正确**。
+    顺带这也让「节目结束」有一个明确的视觉信号，而不是在正文风格里悄悄停掉。
+
+    引导语除了画面上出大字，语音里也会说一遍（见 branding.BRAND_OUTRO）——
+    听众往往是听到结尾才决定要不要关注，这时画面和声音必须同时给到指引。
+    """
+    from ..branding import BRAND_CTA_SUBTITLE, BRAND_CTA_TITLE
+
+    font_size, lines = _fit_subtitle(scene.text, max_lines=4)
+    logo = _logo_data_uri(460)
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{VIDEO_H}" '
+        f'viewBox="0 0 {VIDEO_W} {VIDEO_H}">',
+        f'<rect width="{VIDEO_W}" height="{VIDEO_H}" fill="{BRAND_DARK}"/>',
+    ]
+
+    # 左上角小标题，保持和正文页一致的定位
+    if title:
+        parts.append(
+            f'<text x="40" y="{TITLE_BASELINE}" font-family="{FONT_STACK}" font-size="22" '
+            f'fill="{BRAND_GREEN}" opacity="0.85">{html.escape(title[:40])}</text>'
+        )
+
+    if logo:
+        uri, lw, lh = logo
+        lx = (VIDEO_W - lw) / 2
+        ly = 392
+        parts.append(f'<image x="{lx:.1f}" y="{ly}" width="{lw}" height="{lh}" href="{uri}"/>')
+        divider_y = ly + lh + 60
+    else:
+        # 没有 logo 也不能空着，直接用社区名顶上
+        parts.append(
+            f'<text x="{VIDEO_W / 2:.0f}" y="470" text-anchor="middle" '
+            f'font-family="{FONT_STACK}" font-size="56" fill="{BRAND_TEXT}" '
+            f'font-weight="600">青稞社区</text>'
+        )
+        divider_y = 530
+
+    # 青稞绿的细分隔线
+    parts.append(
+        f'<rect x="{VIDEO_W / 2 - 110:.0f}" y="{divider_y}" width="220" height="2" '
+        f'fill="{BRAND_GREEN}" opacity="0.85"/>'
+    )
+
+    # 关注引导：主句用麦金强调，副句用青稞绿
+    parts.append(
+        f'<text x="{VIDEO_W / 2:.0f}" y="{divider_y + 88}" text-anchor="middle" '
+        f'font-family="{FONT_STACK}" font-size="44" font-weight="600" '
+        f'fill="{BRAND_GOLD}">{html.escape(BRAND_CTA_TITLE)}</text>'
+    )
+    parts.append(
+        f'<text x="{VIDEO_W / 2:.0f}" y="{divider_y + 140}" text-anchor="middle" '
+        f'font-family="{FONT_STACK}" font-size="24" '
+        f'fill="{BRAND_GREEN}">{html.escape(BRAND_CTA_SUBTITLE)}</text>'
+    )
+
+    # 字幕区：深色面板 + 浅色字（与其他页的浅底深字相反）
+    parts.append(
+        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" '
+        f'height="{VIDEO_H - SUBTITLE_TOP}" fill="{BRAND_DARK_PANEL}"/>'
+    )
+    parts.append(
+        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" height="2" '
+        f'fill="{BRAND_GREEN}" opacity="0.5"/>'
+    )
+    line_height = font_size * 1.36
+    for offset, line in enumerate(lines):
+        parts.append(
+            f'<text x="{SUBTITLE_LEFT}" y="{SUBTITLE_TEXT_TOP + offset * line_height:.0f}" '
+            f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
+            f'fill="{BRAND_TEXT}">{html.escape(line)}</text>'
         )
 
     parts.append("</svg>")
@@ -978,11 +1135,19 @@ def compose_video(
 
     work_dir.mkdir(parents=True, exist_ok=True)
     slide_paths: list[Path] = []
+    endcard_count = 0
     for index, scene in enumerate(scenes):
         slide_path = work_dir / f"slide-{index:04d}.png"
-        render_slide(scene, slide_path, title=title)
+        if scene.brand == "outro":
+            # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页
+            render_endcard(scene, slide_path, title=title)
+            endcard_count += 1
+        else:
+            render_slide(scene, slide_path, title=title)
         slide_paths.append(slide_path)
-    logger.info("已渲染 %d 帧画面", len(slide_paths))
+    logger.info(
+        "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧）", len(slide_paths), endcard_count
+    )
 
     result = encode_video(
         scenes, slide_paths, audio_path, output_path, target_duration=audio_duration

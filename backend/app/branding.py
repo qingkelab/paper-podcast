@@ -29,9 +29,19 @@ BRAND_INTRO: list[tuple[str, str]] = [
 
 BRAND_OUTRO: list[tuple[str, str]] = [
     ("A", "这篇就聊到这儿。"),
-    ("B", "如果你想找原文、想看我们读过的其他论文，来青稞社区。"),
-    ("A", "我们只推真正读过的东西。下期见。"),
+    ("B", "想找原文、想跟着读更多论文，来青稞社区。"),
+    ("A", "关注青稞，每天学习最新论文。下期见。"),
 ]
+
+# 片尾卡片上的行动号召。语音里也会说，但画面上单独留一行大字，
+# 因为听众往往是「听到结尾才决定要不要关注」，这时候画面必须给到明确指引。
+BRAND_CTA_TITLE = "关注青稞，每天学习最新论文"
+BRAND_CTA_SUBTITLE = "青稞社区 · 只推我们真正读过的东西"
+
+# 内置的社区 logo（来源：qingkelab/qingke-video/assets/logo.png，与社区自己的
+# 视频用的是同一份）。它是**浅色**字标，为深色底设计 —— 所以片尾卡片做成深色，
+# 而正文保持白底（论文配图本身就是白底图表）。
+LOGO_FILENAME = "qingke-logo.png"
 
 
 def intro_segments() -> list[dict]:
@@ -48,6 +58,13 @@ def outro_segments() -> list[dict]:
         {"speaker": speaker, "text": text, "round": index, "brand": "outro"}
         for index, (speaker, text) in enumerate(BRAND_OUTRO)
     ]
+
+
+def logo_path() -> "pathlib.Path":
+    """内置 logo 的绝对路径。"""
+    import pathlib
+
+    return pathlib.Path(__file__).resolve().parent / "assets" / LOGO_FILENAME
 
 
 def brand_char_count() -> int:

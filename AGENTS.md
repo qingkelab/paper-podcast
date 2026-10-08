@@ -128,6 +128,14 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   （合规要求，别关），其余经测是说话特征（过零率 0.117，与说话区 0.076~0.102 同档）。
 - **品牌话术要从时长预算里扣掉**。它和音乐一样是固定开销，不扣的话正文写满就超时。
   `prompts.compute_padding_sec()` 统一算，别在别处再手写一遍。
+- **社区 logo 是浅色字标，必须垫深色底**。它来自社区自己的视频项目
+  （`qingkelab/qingke-video/assets/logo.png`，已内置到 `backend/app/assets/`）。
+  配色取社区视频的品牌规范：青稞绿 `#7CB342` + 麦金 `#F5C842` + 深底 `#0a120c`。
+  正文页白底 + 右上角深色圆角底块垫 logo；**片尾整张做成品牌深色卡**。
+  别把 logo 反相 —— 它含金色的麦穗元素，反相会变成蓝紫色。
+- **品牌段要带 `brand` 标记传到视频层**。`build_script_payload` 会保留
+  `brand: intro/outro`，视频据此把片尾渲染成品牌卡；丢掉这个标记片尾就退化成普通配图页。
+- **关注引导画面和语音都要有**。只出字幕会漏掉纯听的场景，只说语音则画面没有落点。
 - **视频画面是白底**。论文配图多数本身就是白底图表，深色画布会把它们衬得像贴图；
   白底更接近读论文的观感，也方便投屏和截图。**不要显示「主播A / 主播B」标签** ——
   谁在说话听声音就知道，画面上多一行标签既分散注意力又占掉字幕空间。
@@ -152,7 +160,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排)
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            274 项，改完必须全绿
+backend/tests/            284 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 ```
 
