@@ -366,6 +366,28 @@ V2 起每集属于一个用户，并且可以对外分享。三个字段：
   这样动画会播放；用 `<img>` 引用时部分浏览器不会跑动画。
   不要内联进页面 HTML（内容是模型生成的，虽然已在入库前白名单清洗）。
 
+### 视频画幅（横版 / 竖版）
+
+视频有**两种画幅**，可以同时存在：
+
+| orientation | 画幅 | 用途 |
+|---|---|---|
+| `portrait`（默认） | 936×1210（论文首页比例） | 手机全屏 |
+| `landscape` | 1920×1080（16:9） | 投屏、B 站、X |
+
+- **竖版是默认形态**：`video` / `video_path` / `<id>.mp4` 全部保持原样，
+  老链接、老缓存、老客户端一个字都不用改。
+- **横版是额外产出的一份**：文件名 `<id>.landscape.mp4`（双语非主语言是
+  `<id>.<lang>.landscape.mp4`），字段是 `video_landscape`（Episode 顶层镜像主语言那一版，
+  `versions[lang].video_landscape` 是各语言自己的）。
+- 生成：`POST /api/episodes/{id}/video/rebuild?orientation=landscape`
+  （不带参数 = 竖版）。**复用已有的画面分配与强调行，不调用模型**。
+  未知取值 `400`。
+- 取用：`GET /api/episodes/{id}/video?orientation=landscape`
+  （公开页同理：`GET /api/share/{token}/video?orientation=landscape`）。
+  没有这一份时 `404`，`detail` 里明说是「还没有横版视频」。
+- `VideoInfo.orientation` 标出这一份是哪种画幅；老后端不返回，缺失按 `portrait` 处理。
+
 ### `GET /api/episodes/{id}/video`
 
 视频解读播客，`video/mp4`（H.264 + AAC）。

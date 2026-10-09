@@ -348,6 +348,34 @@ cd frontend && pnpm test:units
 两个踩过的坑：**判据要挑对颜色** —— 用「够亮」去找强调行会把白底也算进去，
 得用「偏蓝」；**抽帧要用 `-i` 之后的 `-ss`**（放前面时邻近时间点会取到同一帧）。
 
+### 横版 / 竖版（两种画幅并存）
+
+同一个渲染管线支持两种画幅，**换朝向只换数值，不换阅读顺序** ——
+版式都是「标题条 → 图片区 → 图注 → 强调行 → 字幕带」这一条纵向流，
+所以两版看起来是同一个产品，而不是两种风格。
+
+| | 画幅 | 文件 | 字段 |
+|---|---|---|---|
+| `portrait`（默认） | 936×1210 | `<id>.mp4` / `<id>.<lang>.mp4` | `video` / `video_path` |
+| `landscape` | 1920×1080 | `<id>.landscape.mp4` | `video_landscape` |
+
+- **竖版的名字与字段一个字都没改**：老链接、老缓存、老客户端全都不受影响。
+  横版是**额外产出**，永远不会顶掉竖版 —— 存储上就是两个不同的键
+  （`video` vs `video_landscape`）。踩过的坑：给单语言集（没有 `versions`）加横版后，
+  接口一直返回 `null` —— 因为「老数据兜底」那段代码把顶层字段拼成版本时
+  **没有把 `video_landscape` 带进去**，而顶层 `to_episode` 也漏了这个键。
+  两个地方都要加。
+- **`Layout` 是 dataclass，不是一堆全局常量**：`PORTRAIT` / `LANDSCAPE` 两个实例，
+  渲染函数一律收 `layout: Layout = PORTRAIT`。老代码里那些 `VIDEO_W` / `SUBTITLE_TOP`
+  之类的常量保留成**竖版的别名**，测试和别处直接引用的地方不用改。
+- **`_rasterize_custom` 必须显式传 width/height**：resvg 是按宽度缩放、高度按比例推的，
+  渲染 896×742 的图片卡时传 `width=936` 会得到 936×776。
+- **横版编码更慢是正常的**：像素数是竖版的 2.4 倍，实测同一条 250 秒的片子
+  竖版约 50s、横版约 168s。
+- **画幅是每集各自的产物**：切集/切语言要复位到竖版，否则会拿着上一集的画幅状态。
+  前端只有在**真的存在**那一份时才给切换器，没有就给一个「生成横版」按钮
+  （点了能出东西的按钮，比一个点了没反应的开关强）。
+
 ### 双语（zh + en）
 
 - **`word_count` 是「时长预算的单位数」，不是一个物理量**。中文数字符，英文数词。
@@ -492,7 +520,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            465 项，改完必须全绿
+backend/tests/            474 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

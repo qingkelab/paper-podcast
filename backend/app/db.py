@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     timings_json       TEXT,
     video_path         TEXT,
     video_json         TEXT,
+    video_landscape_json TEXT,
     versions_json      TEXT,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
@@ -149,6 +150,7 @@ class Database:
             "timings_json": "TEXT",
             "video_path": "TEXT",
             "video_json": "TEXT",
+            "video_landscape_json": "TEXT",
             "cover_width": "INTEGER",
             "cover_height": "INTEGER",
             "figures_json": "TEXT",
@@ -232,6 +234,7 @@ class Database:
             "timings": load(row["timings_json"]) or [],
             "video_path": row["video_path"],
             "video": load(row["video_json"]),
+            "video_landscape": load(row["video_landscape_json"]),
             "versions": load(row["versions_json"]) or {},
             "user_id": row["user_id"],
             "visibility": row["visibility"] or "private",
@@ -338,6 +341,7 @@ class Database:
             "illustration",
             "timings",
             "video",
+            "video_landscape",
             "versions",
         }
         sets: list[str] = []
@@ -352,6 +356,7 @@ class Database:
                 "illustration": "illustration_json",
                 "timings": "timings_json",
                 "video": "video_json",
+                "video_landscape": "video_landscape_json",
                 "versions": "versions_json",
             }.get(key, key)
             if key in json_fields:

@@ -87,8 +87,12 @@ export function deleteFigure(id: string, figureId: string) {
  * 复用上次的画面分配、不调用模型，实测约 11 秒 —— 调用方必须给 loading 反馈，别当它瞬间返回。
  * `lang` 指定重新合成哪个语言版本（中英两版的视频是两个独立产物），省略时取主语言。
  */
-export function rebuildVideo(id: string, lang?: Parameters<ApiAdapter['rebuildVideo']>[1]) {
-  return adapter.rebuildVideo(id, lang)
+export function rebuildVideo(
+  id: string,
+  lang?: Parameters<ApiAdapter['rebuildVideo']>[1],
+  orientation?: Parameters<ApiAdapter['rebuildVideo']>[2],
+) {
+  return adapter.rebuildVideo(id, lang, orientation)
 }
 
 /** 脚本 txt 下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
@@ -261,8 +265,9 @@ export type {
   UsagePayload,
   User,
   VideoInfo,
+  VideoOrientation,
   Visibility,
   VoiceOption,
 } from './types'
 // 运行时函数：语言标识的收窄（老数据里可能是任意字符串）
-export { isEpisodeLanguage } from './types'
+export { isEpisodeLanguage, VIDEO_ORIENTATIONS } from './types'

@@ -92,6 +92,8 @@ class VideoInfo(BaseModel):
     # 配图在视频生成之后被改过（人工校正 / 重新提取）时为 true，
     # 此时视频里还是旧画面，前端应提示可以重新合成
     stale: bool = False
+    # 画幅：`portrait`（936×1210，默认）/ `landscape`（1920×1080）。老数据没有这个字段
+    orientation: Literal["portrait", "landscape"] = "portrait"
 
 
 class Illustration(BaseModel):
@@ -121,6 +123,7 @@ class EpisodeVersion(BaseModel):
     audio_duration_sec: float | None = None
     audio_bytes: int | None = None
     video: VideoInfo | None = None
+    video_landscape: VideoInfo | None = None
 
 
 class Episode(BaseModel):
@@ -148,6 +151,7 @@ class Episode(BaseModel):
     figures: list[Figure] = Field(default_factory=list)
     illustration: Illustration | None = None
     video: VideoInfo | None = None
+    video_landscape: VideoInfo | None = None
     audio_url: str | None = None
     audio_duration_sec: float | None = None
     audio_bytes: int | None = None
@@ -317,6 +321,7 @@ class ShareView(BaseModel):
     figures: list[Figure] = Field(default_factory=list)
     illustration: Illustration | None = None
     video: VideoInfo | None = None
+    video_landscape: VideoInfo | None = None
     audio_url: str | None = None
     audio_duration_sec: float | None = None
     audio_bytes: int | None = None
@@ -336,6 +341,7 @@ class ShareVersion(BaseModel):
     audio_duration_sec: float | None = None
     audio_bytes: int | None = None
     video: VideoInfo | None = None
+    video_landscape: VideoInfo | None = None
 
 
 class UsageResponse(BaseModel):

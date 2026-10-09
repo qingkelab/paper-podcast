@@ -27,6 +27,7 @@ import type {
   ShareView,
   UsagePayload,
   User,
+  VideoOrientation,
 } from './types'
 
 /**
@@ -251,11 +252,16 @@ export function deleteFigure(id: string, figureId: string): Promise<Episode> {
  * 返回更新后的完整 Episode：`video.url` 上带着新的 `?v=` 版本号（内容变了，缓存自动失效），
  * `video.stale` 归位为 false。没有视频时后端返回 409，由 ApiError 带到界面上。
  */
-export function rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<Episode> {
-  return request<Episode>(
-    `/episodes/${encodeURIComponent(id)}/video/rebuild${langQuery(lang)}`,
-    { method: 'POST' },
-  )
+export function rebuildVideo(
+  id: string,
+  lang?: EpisodeLanguage,
+  orientation: VideoOrientation = 'portrait',
+): Promise<Episode> {
+  // 画幅是**额外产出**：横版不会顶掉竖版，两种可以同时存在（契约 §2）
+  const query = `${langQuery(lang)}${lang ? '&' : '?'}orientation=${orientation}`
+  return request<Episode>(`/episodes/${encodeURIComponent(id)}/video/rebuild${query}`, {
+    method: 'POST',
+  })
 }
 
 export function scriptTxtUrl(id: string, lang?: EpisodeLanguage): string {

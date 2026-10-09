@@ -14,6 +14,8 @@ import pytest
 
 from app.services.video import (
     CAPTION_FADE_SEC,
+    LANDSCAPE,
+    PORTRAIT,
     CAPTION_TOP,
     FADE_IN_SEC,
     IMAGE_BOX_H,
@@ -62,6 +64,7 @@ from app.services.video import (
     merge_runs_to_cap,
     point_char_limit,
     progress_bar_svg,
+    layout_for,
     plan_transitions,
     render_caption_band,
     render_chrome,
@@ -70,6 +73,12 @@ from app.services.video import (
     render_point_row,
     render_slide,
     split_caption_beats,
+)
+
+
+SAMPLE_TEXT = (
+    "这是一篇关于注意力机制的论文。" * 30
+    + "我们提出了一个新的方法，在多个基准上取得了更好的效果。"
 )
 
 
@@ -2013,3 +2022,225 @@ class TestWaveformStrip:
         video = self._encode(tmp_path, waveform=False)
         ink, _ = self._strip_stats(self._frame(video, 0.5, tmp_path / "off.png"))
         assert ink == 0, "关掉之后不该再有声波条"
+
+
+class TestLandscapeLayout:
+    """横版（1920×1080）与竖版的版式同构，只有数值不同。
+
+    版式是「标题条 → 图片区 → 图注 → 强调行 → 字幕带」这一条纵向流，
+    所以两版看起来是同一个产品。这里钉住几何：各条带不重叠、都在画幅内。
+    """
+
+    def test_two_layouts_differ_only_in_numbers(self):
+        for layout in (PORTRAIT, LANDSCAPE):
+            bands = [
+                ("标题", 0, layout.title_baseline + 10),
+                ("图片区", layout.image_top, layout.image_top + layout.image_box_h),
+                ("图注", layout.caption_top, layout.point_top),
+                ("强调行", layout.point_top, layout.point_top + layout.point_height),
+                ("字幕带", layout.subtitle_top, layout.height),
+            ]
+            for index in range(len(bands) - 1):
+                _, _, top_end = bands[index]
+                _, next_start, _ = bands[index + 1]
+                assert top_end <= next_start, f"{layout.width}px 版式里 {bands[index][0]} 与 {bands[index+1][0]} 重叠"
+            assert layout.waveform_top + 20 <= layout.height
+            assert layout.image_box_left + layout.image_box_w <= layout.width
+            assert layout.point_left + layout.point_width <= layout.width
+            assert layout.subtitle_left + layout.subtitle_width <= layout.width
+            # 声波条贴在字幕带底部
+            assert layout.waveform_top > layout.subtitle_top
+
+    def test_landscape_is_16_by_9(self):
+        assert LANDSCAPE.width == 1920 and LANDSCAPE.height == 1080
+        assert abs(LANDSCAPE.width / LANDSCAPE.height - 16 / 9) < 0.01
+        assert PORTRAIT.width == 936 and PORTRAIT.height == 1210
+
+    def test_layout_for_accepts_aliases(self):
+        assert layout_for("landscape") is LANDSCAPE
+        assert layout_for("16:9") is LANDSCAPE
+        assert layout_for("portrait") is PORTRAIT
+        assert layout_for(None) is PORTRAIT, "老数据没有画幅字段，默认竖版"
+        assert layout_for("乱写") is PORTRAIT
+
+    def test_landscape_renderers_use_the_landscape_canvas(self, tmp_path):
+        import pymupdf
+
+        image = make_png(tmp_path / "img.png", 900, 400)
+        scene = Scene(
+            start=0, end=2, image=image, kind="figure", text="第一段。", point="成功率 67%"
+        )
+        chrome = pymupdf.Pixmap(str(render_chrome(scene, tmp_path / "c.png", title="标题", layout=LANDSCAPE)))
+        assert (chrome.width, chrome.height) == (LANDSCAPE.width, LANDSCAPE.height)
+        card = pymupdf.Pixmap(str(render_image_card(scene, tmp_path / "card.png", layout=LANDSCAPE)))
+        assert (card.width, card.height) == (LANDSCAPE.image_box_w, LANDSCAPE.image_box_h)
+        row = pymupdf.Pixmap(str(render_point_row("成功率 67%", tmp_path / "p.png", layout=LANDSCAPE)))
+        assert (row.width, row.height) == (LANDSCAPE.width, LANDSCAPE.point_height)
+        band = pymupdf.Pixmap(str(render_caption_band("一句字幕。", tmp_path / "b.png", layout=LANDSCAPE)))
+        assert (band.width, band.height) == (LANDSCAPE.width, LANDSCAPE.height - LANDSCAPE.subtitle_top)
+
+    def test_portrait_render_is_unchanged_by_default(self, tmp_path):
+        import pymupdf
+
+        image = make_png(tmp_path / "img.png", 700, 500)
+        scene = Scene(start=0, end=2, image=image, kind="figure", text="第一段。")
+        chrome = pymupdf.Pixmap(str(render_chrome(scene, tmp_path / "c.png", title="标题")))
+        assert (chrome.width, chrome.height) == (VIDEO_W, VIDEO_H)
+
+
+@pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
+class TestLandscapeEncode:
+    def test_landscape_video_is_1920x1080_and_keeps_the_audio_length(self, tmp_path):
+        import wave
+
+        image = make_png(tmp_path / "img.png", 900, 400)
+        scenes = [
+            Scene(start=0, end=2, image=image, kind="figure", text="第一段。", speaker="A"),
+            Scene(start=2, end=4, image=image, kind="figure", text="第二段。", speaker="B"),
+        ]
+        chromes = [
+            render_chrome(scene, tmp_path / f"c{i}.png", title="标题", layout=LANDSCAPE)
+            for i, scene in enumerate(scenes)
+        ]
+        cards = [
+            render_image_card(scene, tmp_path / f"k{i}.png", layout=LANDSCAPE)
+            for i, scene in enumerate(scenes)
+        ]
+        audio = tmp_path / "a.wav"
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 4)
+
+        out = tmp_path / "landscape.mp4"
+        encode_video(
+            scenes,
+            chromes,
+            audio,
+            out,
+            target_duration=4.0,
+            image_cards=cards,
+            transitions=plan_transitions(
+                scenes, [str(s.image) for s in scenes], cards=cards, slides=chromes
+            ),
+            layout=LANDSCAPE,
+        )
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        assert f"{LANDSCAPE.width},{LANDSCAPE.height}" in probe, probe
+        duration = float(
+            subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(out)],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        )
+        assert duration == pytest.approx(4.0, abs=0.3), f"横版长度没对齐音频：{duration}"
+
+
+class TestLandscapeApi:
+    """横版是**额外产出**的一份，不是替换竖版。
+
+    对外只有三件事要说清楚：怎么生成、怎么取、竖版有没有被动过。
+    """
+
+    @staticmethod
+    def _client(tmp_path):
+        from fastapi.testclient import TestClient
+
+        from app.config import Settings
+        from app.main import create_app
+
+        settings = Settings(
+            force_mock=True,
+            enable_video=True,
+            data_dir=tmp_path / "data",
+            database_path=tmp_path / "data" / "landscape.db",
+        )
+        app = create_app(settings)
+        return TestClient(app), settings
+
+    @staticmethod
+    def _wait(client, episode_id: str, timeout: float = 180.0) -> dict:
+        import time as _time
+
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            body = client.get(f"/api/episodes/{episode_id}").json()
+            if body["status"] in ("completed", "failed"):
+                return body
+            _time.sleep(0.2)
+        raise AssertionError("任务超时")
+
+    def test_landscape_rebuild_keeps_portrait_and_adds_a_second_file(self, tmp_path):
+        client, settings = self._client(tmp_path)
+        with client:
+            created = client.post(
+                "/api/episodes", json={"source_type": "text", "text": SAMPLE_TEXT}
+            ).json()
+            episode = self._wait(client, created["id"])
+            portrait = episode.get("video")
+            assert portrait is not None and episode.get("video_landscape") is None
+
+            response = client.post(
+                f"/api/episodes/{created['id']}/video/rebuild", params={"orientation": "landscape"}
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+
+            # 竖版原样不动（URL 里没有 orientation、字节数一致）
+            assert body["video"]["url"] == portrait["url"]
+            assert body["video"]["bytes"] == portrait["bytes"]
+            landscape = body["video_landscape"]
+            assert landscape is not None, "应当产出横版"
+            assert "orientation=landscape" in landscape["url"]
+            assert landscape["orientation"] == "landscape"
+
+            landscape_path = Path(settings.video_dir) / f"{created['id']}.landscape.mp4"
+            assert landscape_path.exists(), "横版文件应当叫 <id>.landscape.mp4"
+            assert landscape_path.stat().st_size != landscape_path.stat().st_size - 1
+
+            # 两种画幅都能放出来，且横版是 1920×1080
+            import subprocess
+
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0", str(landscape_path)],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            assert "1920,1080" in probe, probe
+
+            served = client.get(
+                f"/api/episodes/{created['id']}/video", params={"orientation": "landscape"}
+            )
+            assert served.status_code == 200
+            assert served.headers["accept-ranges"] == "bytes"
+            assert served.content[4:8] == b"ftyp"
+
+    def test_landscape_404_before_it_is_generated(self, tmp_path):
+        client, _ = self._client(tmp_path)
+        with client:
+            created = client.post(
+                "/api/episodes", json={"source_type": "text", "text": SAMPLE_TEXT}
+            ).json()
+            self._wait(client, created["id"])
+            response = client.get(
+                f"/api/episodes/{created['id']}/video", params={"orientation": "landscape"}
+            )
+            assert response.status_code == 404
+            assert "横版" in response.json()["detail"]
+
+    def test_unknown_orientation_is_rejected(self, tmp_path):
+        client, _ = self._client(tmp_path)
+        with client:
+            created = client.post(
+                "/api/episodes", json={"source_type": "text", "text": SAMPLE_TEXT}
+            ).json()
+            self._wait(client, created["id"])
+            response = client.post(
+                f"/api/episodes/{created['id']}/video/rebuild", params={"orientation": "竖向"}
+            )
+            assert response.status_code == 400
+            assert "未知画幅" in response.json()["detail"]

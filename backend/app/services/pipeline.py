@@ -56,8 +56,16 @@ def audio_filename(episode_id: str, language: str, primary: str) -> str:
     return f"{episode_id}.mp3" if language == primary else f"{episode_id}.{language}.mp3"
 
 
-def video_filename(episode_id: str, language: str, primary: str) -> str:
-    return f"{episode_id}.mp4" if language == primary else f"{episode_id}.{language}.mp4"
+def video_filename(
+    episode_id: str, language: str, primary: str, orientation: str = "portrait"
+) -> str:
+    """视频文件名。横版加 `.landscape` 后缀，**竖版的名字一个字都不改** ——
+    已经发布出去的链接、缓存、以及别处按文件名找文件的逻辑都靠它保持不变。
+    """
+    stem = f"{episode_id}.mp4" if language == primary else f"{episode_id}.{language}.mp4"
+    if (orientation or "portrait").lower() in ("landscape", "horizontal", "16:9"):
+        stem = stem.replace(".mp4", ".landscape.mp4")
+    return stem
 
 
 def language_plan(options: dict[str, Any], settings: Settings) -> tuple[str, list[str]]:
@@ -307,7 +315,12 @@ class Pipeline:
             "video": record.get("video"),
         }
 
-    async def rebuild_video(self, episode_id: str, language: str | None = None) -> dict[str, Any]:
+    async def rebuild_video(
+        self,
+        episode_id: str,
+        language: str | None = None,
+        orientation: str = "portrait",
+    ) -> dict[str, Any]:
         """用现有素材重新合成视频（配图被人工校正后用）。
 
         关键点：**复用上次的画面分配，不再问模型**。因为
@@ -316,6 +329,9 @@ class Pipeline:
 
         音频、脚本、解读都不动 —— 只重新渲染幻灯片并编码。
         双语集要指定 `language`，否则只重合成主语言那一版。
+
+        `orientation="landscape"` 会额外产出**横版**（1920×1080）那一份，
+        存进 `video_landscape`（竖版 `video` 原样保留）—— 两种画幅可以同时在。
         """
         record = self.db.get_episode(episode_id)
         if not record:
@@ -348,7 +364,10 @@ class Pipeline:
             for i, t in enumerate(timings_raw)
         ]
 
-        output_path = self.settings.video_dir / video_filename(episode_id, lang, primary)
+        landscape = (orientation or "portrait").lower() in ("landscape", "horizontal", "16:9")
+        output_path = self.settings.video_dir / video_filename(
+            episode_id, lang, primary, orientation
+        )
         result = await asyncio.to_thread(
             compose_video,
             segments=segments,
@@ -369,9 +388,19 @@ class Pipeline:
             preset_scenes=stored.get("scenes") or None,
             preset_assets=stored.get("assets") or None,
             language=lang,
+            orientation="landscape" if landscape else "portrait",
         )
 
-        video = {**result.to_dict(), "url": f"/api/episodes/{episode_id}/video"}
+        video = {
+            **result.to_dict(),
+            "url": f"/api/episodes/{episode_id}/video"
+            + ("?orientation=landscape" if landscape else ""),
+            "orientation": "landscape" if landscape else "portrait",
+            # 存文件路径：横版不在 video_path 列里（那是竖版的），媒体路由靠它定位
+            "path": str(result.video_path),
+        }
+        # 横版只覆盖 `video_landscape`，绝不碰 `video`（竖版是默认形态，不能被横版顶掉）
+        video_field = "video_landscape" if landscape else "video"
 
         # 回写：双语集写进对应语言那一版；**只有主语言**才镜像到顶层字段。
         #
@@ -381,23 +410,26 @@ class Pipeline:
         mirrored = lang == primary or not self._version_records(record)
         fields: dict[str, Any] = {}
         if mirrored:
-            fields["video"] = video
-            fields["video_path"] = str(result.video_path)
+            fields[video_field] = video
+            if not landscape:
+                fields["video_path"] = str(result.video_path)
 
         if self._version_records(record) or lang != primary:
             versions = self._version_records(record)
             entry = dict(versions.get(lang) or {})
             entry["language"] = lang
-            entry["video_path"] = str(result.video_path)
-            entry["video"] = video
+            if not landscape:
+                entry["video_path"] = str(result.video_path)
+            entry[video_field] = video
             versions[lang] = entry
             fields["versions"] = versions
 
         if fields:
             self.db.update_episode(episode_id, **fields)
         logger.info(
-            "视频已重新合成（%s）：%d 帧 / %.1f 秒（复用画面分配：%s）",
+            "视频已重新合成（%s/%s）：%d 帧 / %.1f 秒（复用画面分配：%s）",
             lang,
+            "横版" if landscape else "竖版",
             result.scene_count,
             result.duration_sec,
             result.assignment,

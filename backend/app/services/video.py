@@ -64,23 +64,116 @@ VIDEO_W = 936
 VIDEO_H = 1210
 FPS = 30
 
+# ---------------------------------------------------------------------------
+# 画幅与版式
+# ---------------------------------------------------------------------------
+#
+# 两种朝向共用同一套版式逻辑，只是数值不同：**竖版**（936×1210，论文首页的比例，
+# 适合手机全屏）与**横版**（1920×1080，适合投屏、B 站/X 这类横屏场景）。
+#
+# 结构都是「标题条 → 图片区 → 图注 → 强调行 → 字幕带」这一条纵向流，
+# 换朝向只换数值，不换阅读顺序 —— 这样两版看起来是同一个产品，而不是两种风格。
+@dataclass(frozen=True)
+class Layout:
+    width: int
+    height: int
+    title_baseline: int
+    image_top: int
+    image_box_left: int
+    image_box_w: int
+    image_box_h: int
+    caption_top: int
+    subtitle_top: int
+    subtitle_left: int
+    subtitle_width: int
+    subtitle_text_top: int
+    subtitle_max_height: int
+    point_top: int
+    point_left: int
+    point_width: int
+    point_height: int
+    point_max_font: float
+    waveform_top: int
+    waveform_left: int
+    waveform_width: int
+    # 图片区之外、字幕带之上那块空间的高矮（强调行要摆进去，横竖版差很多）
+    landscape: bool = False
+
+
+PORTRAIT = Layout(
+    width=936,
+    height=1210,
+    title_baseline=46,
+    image_top=74,
+    image_box_left=20,
+    image_box_w=896,
+    image_box_h=742,
+    caption_top=822,
+    subtitle_top=968,
+    subtitle_left=40,
+    subtitle_width=856,
+    subtitle_text_top=1012,
+    subtitle_max_height=186,
+    point_top=878,
+    point_left=40,
+    point_width=856,
+    point_height=74,
+    point_max_font=40.0,
+    waveform_top=1180,
+    waveform_left=40,
+    waveform_width=856,
+)
+
+# 横版：图片区吃满整宽（论文里的图大多是横的，横版正好），底线位置与竖版同构。
+LANDSCAPE = Layout(
+    width=1920,
+    height=1080,
+    title_baseline=60,
+    image_top=92,
+    image_box_left=64,
+    image_box_w=1792,
+    image_box_h=560,
+    caption_top=660,
+    subtitle_top=828,
+    subtitle_left=64,
+    subtitle_width=1792,
+    subtitle_text_top=876,
+    subtitle_max_height=150,
+    point_top=716,
+    point_left=64,
+    point_width=1792,
+    point_height=92,
+    point_max_font=44.0,
+    waveform_top=1040,
+    waveform_left=64,
+    waveform_width=1792,
+    landscape=True,
+)
+
+
+def layout_for(orientation: str | None) -> Layout:
+    """按朝向取版式；认不出的取值一律当竖版（老数据的默认）。"""
+    return LANDSCAPE if (orientation or "").lower() in ("landscape", "horizontal", "16:9") else PORTRAIT
+
+
+# 兼容：老代码与测试直接引用这些常量，它们就是竖版版式的数值
 # 竖版布局：标题条 → 图片区 → 图注 → **强调行** → 字幕面板
 #
 # 图片区从 812 收到 742：腾出来的 70px 给「本段要点」那一行大字。
 # 这是刻意的取舍 —— 观众要的是「这段在讲什么」，论文配图是佐证。
 # 图注、强调行、字幕三者的位置必须互不重叠，改任何一个都要一起看。
-TITLE_BASELINE = 46
-IMAGE_TOP = 74
-IMAGE_BOX_W = VIDEO_W - 40      # 896
-IMAGE_BOX_H = 742
-IMAGE_BOX_LEFT = (VIDEO_W - IMAGE_BOX_W) // 2   # 20：图片卡叠到骨架上的横坐标
-CAPTION_TOP = IMAGE_TOP + IMAGE_BOX_H + 6
+TITLE_BASELINE = PORTRAIT.title_baseline
+IMAGE_TOP = PORTRAIT.image_top
+IMAGE_BOX_W = PORTRAIT.image_box_w
+IMAGE_BOX_H = PORTRAIT.image_box_h
+IMAGE_BOX_LEFT = PORTRAIT.image_box_left
+CAPTION_TOP = PORTRAIT.caption_top
 
 # 「本段要点」强调行：浅蓝底 + 左侧色条 + 大字，是画面上最抢眼的一行
-POINT_TOP = 878
-POINT_LEFT = 40
-POINT_WIDTH = VIDEO_W - POINT_LEFT * 2
-POINT_HEIGHT = 74
+POINT_TOP = PORTRAIT.point_top
+POINT_LEFT = PORTRAIT.point_left
+POINT_WIDTH = PORTRAIT.point_width
+POINT_HEIGHT = PORTRAIT.point_height
 POINT_BAR_W = 6
 POINT_BG = "#eef4fb"
 POINT_BAR = "#2f6fb5"
@@ -101,12 +194,12 @@ def point_char_limit(language: str) -> int:
     """强调行的长度上限（按语言）。prompt 里的字数要求必须和它对齐。"""
     return POINT_MAX_CHARS_EN if language == "en" else POINT_MAX_CHARS
 
-SUBTITLE_TOP = 968
-SUBTITLE_LEFT = 40
-SUBTITLE_WIDTH = VIDEO_W - SUBTITLE_LEFT * 2
+SUBTITLE_TOP = PORTRAIT.subtitle_top
+SUBTITLE_LEFT = PORTRAIT.subtitle_left
+SUBTITLE_WIDTH = PORTRAIT.subtitle_width
 # 去掉主播标签后，文字可以往上提、可用高度也变大，字幕能放得更大更好读
-SUBTITLE_TEXT_TOP = 1012        # 第一行文字的基线
-SUBTITLE_MAX_HEIGHT = 186       # 留给文字的总高度
+SUBTITLE_TEXT_TOP = PORTRAIT.subtitle_text_top   # 第一行文字的基线
+SUBTITLE_MAX_HEIGHT = PORTRAIT.subtitle_max_height   # 留给文字的总高度
 
 FONT_STACK = "PingFang SC, Hiragino Sans GB, Microsoft YaHei, Noto Sans CJK SC, sans-serif"
 
@@ -183,9 +276,9 @@ FADE_IN_SEC = 0.30                # 首段从白底淡入
 # 2. 它画的是「黑底上的彩色波形」，直接叠到浅色字幕带上会留一层黑底
 #    → 用 `format=gray` 当 alpha，和纯色源 `alphamerge`，得到干净的上色波形
 #    （实测残余暗像素 0，而这正是「够亮」判据看不出来的那种脏东西）。
-WAVEFORM_TOP = 1180               # 贴字幕带底部
-WAVEFORM_LEFT = SUBTITLE_LEFT     # 40：和字幕左对齐
-WAVEFORM_WIDTH = SUBTITLE_WIDTH   # 856
+WAVEFORM_TOP = PORTRAIT.waveform_top          # 贴字幕带底部
+WAVEFORM_LEFT = PORTRAIT.waveform_left        # 和字幕左对齐
+WAVEFORM_WIDTH = PORTRAIT.waveform_width
 WAVEFORM_HEIGHT = 18
 WAVEFORM_RENDER_SIZE = "800x60"   # 见上面第 1 条坑：别改这个宽度
 WAVEFORM_COLOR = "#2f6fb5"
@@ -863,7 +956,11 @@ def _wrap(text: str, max_units: float) -> list[str]:
 
 
 def _fit_subtitle(
-    text: str, *, max_lines: int = 6, max_size: float = 30.0
+    text: str,
+    *,
+    max_lines: int = 6,
+    max_size: float = 30.0,
+    layout: Layout = PORTRAIT,
 ) -> tuple[float, list[str]]:
     """选一个既能放下、又不至于太小的字号。
 
@@ -877,7 +974,7 @@ def _fit_subtitle(
         return 24.0, []
 
     def wrap_at(size: float) -> list[str]:
-        units = SUBTITLE_WIDTH / size
+        units = layout.subtitle_width / size
         lines: list[str] = []
         current = ""
         width = 0.0
@@ -897,7 +994,7 @@ def _fit_subtitle(
 
     for size in (max_size - 2 * step for step in range(6)):
         lines = wrap_at(size)
-        if len(lines) <= max_lines and len(lines) * size * 1.36 <= SUBTITLE_MAX_HEIGHT:
+        if len(lines) <= max_lines and len(lines) * size * 1.36 <= layout.subtitle_max_height:
             return size, lines
 
     # 还是放不下：用最小字号，超出部分截断加省略号
@@ -916,6 +1013,7 @@ def render_slide(
     title: str = "",
     include_subtitle: bool = True,
     include_point: bool = True,
+    layout: Layout = PORTRAIT,
 ) -> Path:
     """渲染一帧画面：配图 + 图注 + 字幕（白底竖版，与论文首页同尺寸）。
 
@@ -934,6 +1032,7 @@ def render_slide(
         include_subtitle=include_subtitle,
         include_point=include_point,
         include_image=True,
+        layout=layout,
     )
 
 
@@ -944,6 +1043,7 @@ def render_chrome(
     title: str = "",
     include_subtitle: bool = True,
     include_point: bool = True,
+    layout: Layout = PORTRAIT,
 ) -> Path:
     """只渲染**骨架**：白底 + 标题 + logo + 图注 + 强调行 + 字幕带（图片区留白）。
 
@@ -958,23 +1058,26 @@ def render_chrome(
         include_subtitle=include_subtitle,
         include_point=include_point,
         include_image=False,
+        layout=layout,
     )
 
 
-def render_image_card(scene: Scene, output_path: Path) -> Path:
+def render_image_card(
+    scene: Scene, output_path: Path, *, layout: Layout = PORTRAIT
+) -> Path:
     """只渲染**图片卡**：图片 + 贴着图片的那圈浅灰细边框，其余透明。
 
-    画幅是图片区（`IMAGE_BOX_W × IMAGE_BOX_H`），叠在骨架的 `(20, IMAGE_TOP)`。
+    画幅是图片区（`layout.image_box_w × layout.image_box_h`），叠在骨架的 `(20, layout.image_top)`。
     边框跟着图片走（它是贴着图片量的 2px 内缩），所以它属于这一层 ——
     转场时「带框的图」整体淡入淡出，而不是框留在原地、图在里面换。
     """
-    data_uri, img_w, img_h = _prepare_image(scene.image, IMAGE_BOX_W, IMAGE_BOX_H)
-    img_x = (VIDEO_W - img_w) / 2 - IMAGE_BOX_LEFT
-    img_y = (IMAGE_BOX_H - img_h) / 2
+    data_uri, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, layout.image_box_h)
+    img_x = (layout.width - img_w) / 2 - layout.image_box_left
+    img_y = (layout.image_box_h - img_h) / 2
 
     parts: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{IMAGE_BOX_W}" height="{IMAGE_BOX_H}" '
-        f'viewBox="0 0 {IMAGE_BOX_W} {IMAGE_BOX_H}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.image_box_w}" height="{layout.image_box_h}" '
+        f'viewBox="0 0 {layout.image_box_w} {layout.image_box_h}">',
         f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
         f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>',
         f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" '
@@ -983,7 +1086,7 @@ def render_image_card(scene: Scene, output_path: Path) -> Path:
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _rasterize_custom(
-        "\n".join(parts), output_path, width=IMAGE_BOX_W, height=IMAGE_BOX_H
+        "\n".join(parts), output_path, width=layout.image_box_w, height=layout.image_box_h
     )
     return output_path
 
@@ -996,28 +1099,29 @@ def _render_slide_layers(
     include_subtitle: bool,
     include_point: bool,
     include_image: bool,
+    layout: Layout = PORTRAIT,
 ) -> Path:
     """骨架与整页共用的渲染实现（`include_image` 决定图片层要不要画进来）。"""
     img_x = img_y = 0.0
     img_w = img_h = 0.0
     data_uri = ""
     if include_image:
-        data_uri, img_w, img_h = _prepare_image(scene.image, IMAGE_BOX_W, IMAGE_BOX_H)
-        img_x = (VIDEO_W - img_w) / 2
-        img_y = IMAGE_TOP + (IMAGE_BOX_H - img_h) / 2
+        data_uri, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, layout.image_box_h)
+        img_x = (layout.width - img_w) / 2
+        img_y = layout.image_top + (layout.image_box_h - img_h) / 2
 
     font_size, lines = _fit_subtitle(scene.text)
 
     parts: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{VIDEO_H}" '
-        f'viewBox="0 0 {VIDEO_W} {VIDEO_H}">',
-        f'<rect width="{VIDEO_W}" height="{VIDEO_H}" fill="{BG_COLOR}"/>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{layout.height}" '
+        f'viewBox="0 0 {layout.width} {layout.height}">',
+        f'<rect width="{layout.width}" height="{layout.height}" fill="{BG_COLOR}"/>',
     ]
 
     # 顶部标题条
     if title:
         parts.append(
-            f'<text x="40" y="{TITLE_BASELINE}" font-family="{FONT_STACK}" font-size="22" '
+            f'<text x="40" y="{layout.title_baseline}" font-family="{FONT_STACK}" font-size="22" '
             f'fill="{TITLE_COLOR}">{html.escape(title[:40])}</text>'
         )
 
@@ -1027,7 +1131,7 @@ def _render_slide_layers(
     if logo:
         uri, lw, lh = logo
         chip_w, chip_h = lw + WATERMARK_PAD * 2, lh + WATERMARK_PAD * 2
-        chip_x = VIDEO_W - 40 - chip_w
+        chip_x = layout.width - 40 - chip_w
         chip_y = 18
         parts.append(
             f'<rect x="{chip_x}" y="{chip_y}" width="{chip_w}" height="{chip_h}" '
@@ -1051,10 +1155,10 @@ def _render_slide_layers(
 
     # 图注
     if scene.caption:
-        caption_lines = _wrap(scene.caption, SUBTITLE_WIDTH / 18)[:2]
+        caption_lines = _wrap(scene.caption, layout.subtitle_width / 18)[:2]
         for offset, line in enumerate(caption_lines):
             parts.append(
-                f'<text x="{SUBTITLE_LEFT}" y="{CAPTION_TOP + 22 + offset * 23}" '
+                f'<text x="{layout.subtitle_left}" y="{layout.caption_top + 22 + offset * 23}" '
                 f'font-family="{FONT_STACK}" font-size="18" fill="{CAPTION_COLOR}">'
                 f"{html.escape(line)}</text>"
             )
@@ -1063,31 +1167,31 @@ def _render_slide_layers(
     # 这里**不显示「主播A / 主播B」标签** —— 谁在说话听声音就知道，
     # 画面上多一行标签只会分散注意力、也占掉字幕的空间。
     parts.append(
-        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" '
-        f'height="{VIDEO_H - SUBTITLE_TOP}" fill="{SUBTITLE_BG}"/>'
+        f'<rect x="0" y="{layout.subtitle_top}" width="{layout.width}" '
+        f'height="{layout.height - layout.subtitle_top}" fill="{SUBTITLE_BG}"/>'
     )
     parts.append(
-        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" height="2" fill="{SUBTITLE_RULE}"/>'
+        f'<rect x="0" y="{layout.subtitle_top}" width="{layout.width}" height="2" fill="{SUBTITLE_RULE}"/>'
     )
 
     if include_point and scene.point:
         # 强调行：浅蓝底 + 左侧色条 + 大字。它是画面上最抢眼的一行，
         # 也是「突出解读内容」的落点（不是装饰，是每一段的核心结论）。
         parts.append(
-            f'<rect x="{POINT_LEFT}" y="{POINT_TOP}" width="{POINT_WIDTH}" '
-            f'height="{POINT_HEIGHT}" rx="10" fill="{POINT_BG}"/>'
+            f'<rect x="{layout.point_left}" y="{layout.point_top}" width="{layout.point_width}" '
+            f'height="{layout.point_height}" rx="10" fill="{POINT_BG}"/>'
         )
         parts.append(
-            f'<rect x="{POINT_LEFT}" y="{POINT_TOP}" width="{POINT_BAR_W}" '
-            f'height="{POINT_HEIGHT}" rx="3" fill="{POINT_BAR}"/>'
+            f'<rect x="{layout.point_left}" y="{layout.point_top}" width="{POINT_BAR_W}" '
+            f'height="{layout.point_height}" rx="3" fill="{POINT_BAR}"/>'
         )
         point_size, point_lines = _fit_subtitle(
-            scene.point, max_lines=1, max_size=POINT_MAX_FONT
+            scene.point, max_lines=1, max_size=layout.point_max_font
         )
         if point_lines:
-            baseline = POINT_TOP + POINT_HEIGHT / 2 + point_size * 0.36
+            baseline = layout.point_top + layout.point_height / 2 + point_size * 0.36
             parts.append(
-                f'<text x="{POINT_LEFT + POINT_BAR_W + 18}" y="{baseline:.0f}" '
+                f'<text x="{layout.point_left + POINT_BAR_W + 18}" y="{baseline:.0f}" '
                 f'font-family="{FONT_STACK}" font-size="{point_size:.0f}" '
                 f'font-weight="600" fill="{POINT_TEXT}">{html.escape(point_lines[0])}</text>'
             )
@@ -1096,7 +1200,7 @@ def _render_slide_layers(
         line_height = font_size * 1.36
         for offset, line in enumerate(lines):
             parts.append(
-                f'<text x="{SUBTITLE_LEFT}" y="{SUBTITLE_TEXT_TOP + offset * line_height:.0f}" '
+                f'<text x="{layout.subtitle_left}" y="{layout.subtitle_text_top + offset * line_height:.0f}" '
                 f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
                 f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
             )
@@ -1104,7 +1208,12 @@ def _render_slide_layers(
     parts.append("</svg>")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _rasterize_custom("\n".join(parts), output_path)
+    _rasterize_custom(
+        "\n".join(parts),
+        output_path,
+        width=layout.width,
+        height=layout.height,
+    )
     return output_path
 
 
@@ -1125,7 +1234,9 @@ def _number_runs(line: str) -> list[tuple[str, bool]]:
     return runs
 
 
-def _caption_line_parts(line: str, *, baseline: float, font_size: float) -> list[str]:
+def _caption_line_parts(
+    line: str, *, baseline: float, font_size: float, layout: Layout = PORTRAIT
+) -> list[str]:
     """渲染字幕的一行：数字用强调色 + 浅色底标出来，其余照常。
 
     为什么值得单独做：一期论文解读里真正有信息量的往往就是那个「67%」，
@@ -1136,13 +1247,13 @@ def _caption_line_parts(line: str, *, baseline: float, font_size: float) -> list
     runs = _number_runs(line)
     if not any(is_number for _, is_number in runs):
         return [
-            f'<text x="{SUBTITLE_LEFT}" y="{baseline:.0f}" '
+            f'<text x="{layout.subtitle_left}" y="{baseline:.0f}" '
             f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
             f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
         ]
 
     parts: list[str] = []
-    cursor = SUBTITLE_LEFT
+    cursor = layout.subtitle_left
     for text_run, is_number in runs:
         width = sum(_char_width(char) for char in text_run) * font_size
         if is_number:
@@ -1160,52 +1271,61 @@ def _caption_line_parts(line: str, *, baseline: float, font_size: float) -> list
     return parts
 
 
-def render_point_row(point: str, output_path: Path) -> Path:
-    """只渲染「本段要点」那一行（画幅 936×POINT_HEIGHT，叠在 y=POINT_TOP）。
+def render_point_row(
+    point: str, output_path: Path, *, layout: Layout = PORTRAIT
+) -> Path:
+    """只渲染「本段要点」那一行（画幅 936×layout.point_height，叠在 y=layout.point_top）。
 
     单独成层是为了让它**滑入**：一段新的内容开始时，这行从左边滑进来 0.4 秒。
     这是有意保留的动效 —— 它标记「内容换了一段」，跟画面在讲什么直接相关，
     与那种「整张图慢慢放大」的无意义运动不是一回事。
     """
     parts: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{POINT_HEIGHT}" '
-        f'viewBox="0 0 {VIDEO_W} {POINT_HEIGHT}">',
-        f'<rect x="{POINT_LEFT}" y="0" width="{POINT_WIDTH}" height="{POINT_HEIGHT}" '
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{layout.point_height}" '
+        f'viewBox="0 0 {layout.width} {layout.point_height}">',
+        f'<rect x="{layout.point_left}" y="0" width="{layout.point_width}" height="{layout.point_height}" '
         f'rx="10" fill="{POINT_BG}"/>',
-        f'<rect x="{POINT_LEFT}" y="0" width="{POINT_BAR_W}" height="{POINT_HEIGHT}" '
+        f'<rect x="{layout.point_left}" y="0" width="{POINT_BAR_W}" height="{layout.point_height}" '
         f'rx="3" fill="{POINT_BAR}"/>',
     ]
-    size, lines = _fit_subtitle(point, max_lines=1, max_size=POINT_MAX_FONT)
+    size, lines = _fit_subtitle(point, max_lines=1, max_size=layout.point_max_font)
     if lines:
-        baseline = POINT_HEIGHT / 2 + size * 0.36
+        baseline = layout.point_height / 2 + size * 0.36
         parts.append(
-            f'<text x="{POINT_LEFT + POINT_BAR_W + 18}" y="{baseline:.0f}" '
+            f'<text x="{layout.point_left + POINT_BAR_W + 18}" y="{baseline:.0f}" '
             f'font-family="{FONT_STACK}" font-size="{size:.0f}" '
             f'font-weight="600" fill="{POINT_TEXT}">{html.escape(lines[0])}</text>'
         )
     parts.append("</svg>")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _rasterize_custom("\n".join(parts), output_path)
+    _rasterize_custom(
+        "\n".join(parts),
+        output_path,
+        width=layout.width,
+        height=layout.point_height,
+    )
     return output_path
 
 
-def render_caption_band(text: str, output_path: Path) -> Path:
+def render_caption_band(
+    text: str, output_path: Path, *, layout: Layout = PORTRAIT
+) -> Path:
     """只渲染底部那条字幕带，用于「字幕逐句出现」。
 
-    画幅是 `VIDEO_W × (VIDEO_H - SUBTITLE_TOP)`，位置固定叠在 `y=SUBTITLE_TOP`，
+    画幅是 `layout.width × (layout.height - layout.subtitle_top)`，位置固定叠在 `y=layout.subtitle_top`，
     所以它盖住的就是底图那一条空字幕区。
 
     字号比整页字幕放大到 38：观众真正在读的是这两行，而一句比一整段短得多，
     放得下更大的字（放不下会自动往小退，见 `_fit_subtitle`）。
     """
-    band_h = VIDEO_H - SUBTITLE_TOP
+    band_h = layout.height - layout.subtitle_top
     font_size, lines = _fit_subtitle(text, max_lines=3, max_size=CAPTION_BAND_MAX_FONT)
 
     parts: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{band_h}" '
-        f'viewBox="0 0 {VIDEO_W} {band_h}">',
-        f'<rect width="{VIDEO_W}" height="{band_h}" fill="{SUBTITLE_BG}"/>',
-        f'<rect width="{VIDEO_W}" height="2" fill="{SUBTITLE_RULE}"/>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{band_h}" '
+        f'viewBox="0 0 {layout.width} {band_h}">',
+        f'<rect width="{layout.width}" height="{band_h}" fill="{SUBTITLE_BG}"/>',
+        f'<rect width="{layout.width}" height="2" fill="{SUBTITLE_RULE}"/>',
     ]
 
     if lines:
@@ -1222,11 +1342,18 @@ def render_caption_band(text: str, output_path: Path) -> Path:
 
     parts.append("</svg>")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _rasterize_custom("\n".join(parts), output_path)
+    _rasterize_custom(
+        "\n".join(parts),
+        output_path,
+        width=layout.width,
+        height=layout.height - layout.subtitle_top,
+    )
     return output_path
 
 
-def render_endcard(scene: Scene, output_path: Path, *, title: str = "") -> Path:
+def render_endcard(
+    scene: Scene, output_path: Path, *, title: str = "", layout: Layout = PORTRAIT
+) -> Path:
     """片尾品牌卡：深色底 + 社区 logo + 关注引导。
 
     ## 为什么片尾要单独做成深色
@@ -1246,28 +1373,28 @@ def render_endcard(scene: Scene, output_path: Path, *, title: str = "") -> Path:
     logo = _logo_data_uri(460)
 
     parts: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{VIDEO_H}" '
-        f'viewBox="0 0 {VIDEO_W} {VIDEO_H}">',
-        f'<rect width="{VIDEO_W}" height="{VIDEO_H}" fill="{BRAND_DARK}"/>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{layout.height}" '
+        f'viewBox="0 0 {layout.width} {layout.height}">',
+        f'<rect width="{layout.width}" height="{layout.height}" fill="{BRAND_DARK}"/>',
     ]
 
     # 左上角小标题，保持和正文页一致的定位
     if title:
         parts.append(
-            f'<text x="40" y="{TITLE_BASELINE}" font-family="{FONT_STACK}" font-size="22" '
+            f'<text x="40" y="{layout.title_baseline}" font-family="{FONT_STACK}" font-size="22" '
             f'fill="{BRAND_GREEN}" opacity="0.85">{html.escape(title[:40])}</text>'
         )
 
     if logo:
         uri, lw, lh = logo
-        lx = (VIDEO_W - lw) / 2
+        lx = (layout.width - lw) / 2
         ly = 392
         parts.append(f'<image x="{lx:.1f}" y="{ly}" width="{lw}" height="{lh}" href="{uri}"/>')
         divider_y = ly + lh + 60
     else:
         # 没有 logo 也不能空着，直接用社区名顶上
         parts.append(
-            f'<text x="{VIDEO_W / 2:.0f}" y="470" text-anchor="middle" '
+            f'<text x="{layout.width / 2:.0f}" y="470" text-anchor="middle" '
             f'font-family="{FONT_STACK}" font-size="56" fill="{BRAND_TEXT}" '
             f'font-weight="600">青稞社区</text>'
         )
@@ -1275,35 +1402,35 @@ def render_endcard(scene: Scene, output_path: Path, *, title: str = "") -> Path:
 
     # 青稞绿的细分隔线
     parts.append(
-        f'<rect x="{VIDEO_W / 2 - 110:.0f}" y="{divider_y}" width="220" height="2" '
+        f'<rect x="{layout.width / 2 - 110:.0f}" y="{divider_y}" width="220" height="2" '
         f'fill="{BRAND_GREEN}" opacity="0.85"/>'
     )
 
     # 关注引导：主句用麦金强调，副句用青稞绿
     parts.append(
-        f'<text x="{VIDEO_W / 2:.0f}" y="{divider_y + 88}" text-anchor="middle" '
+        f'<text x="{layout.width / 2:.0f}" y="{divider_y + 88}" text-anchor="middle" '
         f'font-family="{FONT_STACK}" font-size="44" font-weight="600" '
         f'fill="{BRAND_GOLD}">{html.escape(BRAND_CTA_TITLE)}</text>'
     )
     parts.append(
-        f'<text x="{VIDEO_W / 2:.0f}" y="{divider_y + 140}" text-anchor="middle" '
+        f'<text x="{layout.width / 2:.0f}" y="{divider_y + 140}" text-anchor="middle" '
         f'font-family="{FONT_STACK}" font-size="24" '
         f'fill="{BRAND_GREEN}">{html.escape(BRAND_CTA_SUBTITLE)}</text>'
     )
 
     # 字幕区：深色面板 + 浅色字（与其他页的浅底深字相反）
     parts.append(
-        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" '
-        f'height="{VIDEO_H - SUBTITLE_TOP}" fill="{BRAND_DARK_PANEL}"/>'
+        f'<rect x="0" y="{layout.subtitle_top}" width="{layout.width}" '
+        f'height="{layout.height - layout.subtitle_top}" fill="{BRAND_DARK_PANEL}"/>'
     )
     parts.append(
-        f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" height="2" '
+        f'<rect x="0" y="{layout.subtitle_top}" width="{layout.width}" height="2" '
         f'fill="{BRAND_GREEN}" opacity="0.5"/>'
     )
     line_height = font_size * 1.36
     for offset, line in enumerate(lines):
         parts.append(
-            f'<text x="{SUBTITLE_LEFT}" y="{SUBTITLE_TEXT_TOP + offset * line_height:.0f}" '
+            f'<text x="{layout.subtitle_left}" y="{layout.subtitle_text_top + offset * line_height:.0f}" '
             f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
             f'fill="{BRAND_TEXT}">{html.escape(line)}</text>'
         )
@@ -1311,7 +1438,12 @@ def render_endcard(scene: Scene, output_path: Path, *, title: str = "") -> Path:
     parts.append("</svg>")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _rasterize_custom("\n".join(parts), output_path)
+    _rasterize_custom(
+        "\n".join(parts),
+        output_path,
+        width=layout.width,
+        height=layout.height,
+    )
     return output_path
 
 
@@ -1426,7 +1558,7 @@ def beat_windows_aligned(
 # --------------------------------------------------------------------------
 
 
-def progress_bar_svg() -> str:
+def progress_bar_svg(*, layout: Layout = PORTRAIT) -> str:
     """进度条素材：一条**全宽**的色带。
 
     用法不是「把它截短」，而是整条叠上去、用 overlay 的逐帧 `x` 把它从左往右推进画面。
@@ -1438,8 +1570,8 @@ def progress_bar_svg() -> str:
     （理论值 93 / 468 / 842）。
     """
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{PROGRESS_BAR_H}">'
-        f'<rect width="{VIDEO_W}" height="{PROGRESS_BAR_H}" fill="{PROGRESS_BAR_COLOR}"/>'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{PROGRESS_BAR_H}">'
+        f'<rect width="{layout.width}" height="{PROGRESS_BAR_H}" fill="{PROGRESS_BAR_COLOR}"/>'
         f"</svg>"
     )
 
@@ -1592,6 +1724,7 @@ def encode_video(
     image_cards: list[Path | None] | None = None,
     transitions: list[Transition] | None = None,
     waveform: bool = True,
+    layout: Layout = PORTRAIT,
 ) -> VideoResult:
     """把幻灯片序列和音频合成 MP4。
 
@@ -1638,7 +1771,7 @@ def encode_video(
     silent_path = output_path.parent / f"{output_path.stem}-video-only.mp4"
     bar_path = clips_dir / "progress.png"
     clips_dir.mkdir(parents=True, exist_ok=True)
-    _rasterize_custom(progress_bar_svg(), bar_path)
+    _rasterize_custom(progress_bar_svg(layout=layout), bar_path, width=layout.width, height=PROGRESS_BAR_H)
 
     bands = caption_bands or [[] for _ in scenes]
     rows = point_rows or [None] * len(scenes)
@@ -1700,7 +1833,7 @@ def encode_video(
 
             chrome_in = add_image(slide)
             bar_in = add_image(bar_path)
-            graph = [f"[{chrome_in}:v]scale={VIDEO_W}:{VIDEO_H}[v0]"]
+            graph = [f"[{chrome_in}:v]scale={layout.width}:{layout.height}[v0]"]
             last, node = "v0", 0
 
             # ---- 转场：发生在这一段**内部**，所以总帧数一个都不变 ----
@@ -1718,18 +1851,18 @@ def encode_video(
                 # 先把图片区从骨架里裁出来当「窗口」：这样两张卡在窗口内滑动/淡入淡出时
                 # 会被自动裁切在图片框里，不会糊到标题或字幕上
                 graph.append(
-                    f"[{chrome_in}:v]crop={IMAGE_BOX_W}:{IMAGE_BOX_H}:{IMAGE_BOX_LEFT}:"
-                    f"{IMAGE_TOP}[win{node}]"
+                    f"[{chrome_in}:v]crop={layout.image_box_w}:{layout.image_box_h}:{layout.image_box_left}:"
+                    f"{layout.image_top}[win{node}]"
                 )
                 if transition.kind == "push":
                     # 横推：两张卡在窗口里左右滑动（窗口只有图片区那么大，超出部分自动裁掉）
                     graph.append(f"[{prev_in}:v]format=rgba[pa{node}]")
                     graph.append(f"[{cur_in}:v]format=rgba[ca{node}]")
                     graph.append(
-                        f"[win{node}][pa{node}]overlay=x='-{IMAGE_BOX_W}*{span}':y=0[wm{node}]"
+                        f"[win{node}][pa{node}]overlay=x='-{layout.image_box_w}*{span}':y=0[wm{node}]"
                     )
                     graph.append(
-                        f"[wm{node}][ca{node}]overlay=x='{IMAGE_BOX_W}*(1-{span})':y=0[wc{node}]"
+                        f"[wm{node}][ca{node}]overlay=x='{layout.image_box_w}*(1-{span})':y=0[wc{node}]"
                     )
                 else:
                     graph.append(
@@ -1743,7 +1876,7 @@ def encode_video(
                     graph.append(f"[win{node}][po{node}]overlay=0:0[wm{node}]")
                     graph.append(f"[wm{node}][co{node}]overlay=0:0[wc{node}]")
                 graph.append(
-                    f"[{last}][wc{node}]overlay={IMAGE_BOX_LEFT}:{IMAGE_TOP}[v{node}]"
+                    f"[{last}][wc{node}]overlay={layout.image_box_left}:{layout.image_top}[v{node}]"
                 )
                 last = f"v{node}"
             elif card is not None:
@@ -1751,7 +1884,7 @@ def encode_video(
                 node += 1
                 graph.append(f"[{cur_in}:v]format=rgba[ca{node}]")
                 graph.append(
-                    f"[{last}][ca{node}]overlay={IMAGE_BOX_LEFT}:{IMAGE_TOP}[v{node}]"
+                    f"[{last}][ca{node}]overlay={layout.image_box_left}:{layout.image_top}[v{node}]"
                 )
                 last = f"v{node}"
 
@@ -1786,7 +1919,7 @@ def encode_video(
                 graph.append(f"[{row_in}:v]format=rgba[pt{node}]")
                 graph.append(
                     f"[{last}][pt{node}]overlay="
-                    f"x='-(W)+W*min(1,t/{POINT_SLIDE_SEC:.2f})':y={POINT_TOP}[v{node}]"
+                    f"x='-(W)+W*min(1,t/{POINT_SLIDE_SEC:.2f})':y={layout.point_top}[v{node}]"
                 )
                 last = f"v{node}"
 
@@ -1815,7 +1948,7 @@ def encode_video(
                     f"d={CAPTION_FADE_SEC}:alpha=1[cap{node}]"
                 )
                 graph.append(
-                    f"[{last}][cap{node}]overlay=x=0:y={SUBTITLE_TOP}:"
+                    f"[{last}][cap{node}]overlay=x=0:y={layout.subtitle_top}:"
                     f"enable='gte(t,{beat_start:.3f})'[v{node}]"
                 )
                 last = f"v{node}"
@@ -1835,10 +1968,10 @@ def encode_video(
                 )
                 graph.append(
                     f"[{color_in}:v][msk{node}]alphamerge,"
-                    f"scale={WAVEFORM_WIDTH}:{WAVEFORM_HEIGHT},format=rgba[wave{node}]"
+                    f"scale={layout.waveform_width}:{WAVEFORM_HEIGHT},format=rgba[wave{node}]"
                 )
                 graph.append(
-                    f"[{last}][wave{node}]overlay=x={WAVEFORM_LEFT}:y={WAVEFORM_TOP}[v{node}]"
+                    f"[{last}][wave{node}]overlay=x={layout.waveform_left}:y={layout.waveform_top}[v{node}]"
                 )
                 last = f"v{node}"
 
@@ -2002,6 +2135,7 @@ def compose_video(
     preset_assets: dict[str, str] | None = None,
     allow_point_llm: bool | None = None,
     language: str = "zh",
+    orientation: str = "portrait",
 ) -> VideoResult:
     """合成视频解读播客。任何一步失败都抛 VideoError，由调用方降级。
 
@@ -2229,6 +2363,7 @@ def compose_video(
         points=points,
     )
 
+    layout = layout_for(orientation)
     work_dir.mkdir(parents=True, exist_ok=True)
     slide_paths: list[Path] = []
     caption_bands: list[list[CaptionBand]] = []
@@ -2250,7 +2385,7 @@ def compose_video(
             # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
             # 品牌卡上的字是大号引导语，不参与「字幕逐句出现」——那会把它切碎。
             # 它整页都是牌子，没有「图片层」，转场用 to_card（上一整页淡出）代替。
-            render_endcard(scene, slide_path, title=title)
+            render_endcard(scene, slide_path, title=title, layout=layout)
             endcard_count += 1
         else:
             # 正文：**骨架 + 图片卡** 两层。骨架（标题/图注/强调行/字幕带）全程不动，
@@ -2261,14 +2396,15 @@ def compose_video(
                 title=title,
                 include_subtitle=len(beats) <= 1,
                 include_point=False,
+                layout=layout,
             )
             card_path = work_dir / f"card-{index:04d}.png"
-            render_image_card(scene, card_path)
+            render_image_card(scene, card_path, layout=layout)
             card_paths.append(card_path)
             if len(beats) > 1:
                 for beat_index, beat in enumerate(beats):
                     band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
-                    render_caption_band(beat, band_path)
+                    render_caption_band(beat, band_path, layout=layout)
                     bands.append(CaptionBand(text=beat, image=band_path))
                     band_paths.append(band_path)
                 beat_count += 1
@@ -2282,7 +2418,7 @@ def compose_video(
 
         if scene.point and scene.brand != "outro":
             point_path = work_dir / f"point-{index:04d}.png"
-            render_point_row(scene.point, point_path)
+            render_point_row(scene.point, point_path, layout=layout)
             point_rows.append(point_path)
             point_paths.append(point_path)
         else:
@@ -2311,6 +2447,7 @@ def compose_video(
         pauses=pauses,
         image_cards=image_cards,
         transitions=transitions,
+        layout=layout,
     )
     result.assignment = strategy
     result.scenes = [

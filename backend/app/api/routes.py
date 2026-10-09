@@ -163,6 +163,28 @@ def _version_payload(
             or _video_provenance_unknown(stored_video, record, version),
         }
 
+    # 横版：与竖版并存的一份（`?orientation=landscape`，1920×1080）
+    video_landscape = None
+    if include_large:
+        stored_landscape = version.get("video_landscape") or {}
+        landscape_path = stored_landscape.get("path")
+        if landscape_path and Path(landscape_path).exists():
+            query = _lang_query(record, version)
+            separator = "&" if query else "?"
+            video_landscape = {
+                "url": (
+                    f"/api/episodes/{episode_id}/video{query}"
+                    f"{separator}orientation=landscape&v={_asset_version(landscape_path)}"
+                ),
+                "duration_sec": stored_landscape.get("duration_sec"),
+                "scene_count": stored_landscape.get("scene_count"),
+                "bytes": stored_landscape.get("bytes"),
+                # 横版和竖版用的是同一批素材，过时判断一致
+                "stale": is_video_stale(stored_landscape)
+                or _video_provenance_unknown(stored_landscape, record, version),
+                "orientation": "landscape",
+            }
+
     illustration = None
     stored = version.get("illustration") if include_large else None
     if stored and stored.get("png_path") and Path(stored["png_path"]).exists():
@@ -191,6 +213,7 @@ def _version_payload(
         "audio_duration_sec": version.get("audio_duration_sec"),
         "audio_bytes": version.get("audio_bytes"),
         "video": video,
+        "video_landscape": video_landscape,
     }
 
 
@@ -251,6 +274,9 @@ def _all_versions(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "timings": record.get("timings") or [],
             "video_path": record.get("video_path"),
             "video": record.get("video"),
+            # 横版也要带进来：漏掉它的话，单语言集（没有 versions）生成横版后
+            # 接口会看不到那一份 —— 实测踩到过
+            "video_landscape": record.get("video_landscape"),
         }
     }
 
@@ -330,6 +356,8 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
         "figures": figures,
         "illustration": surface.get("illustration"),
         "video": surface.get("video"),
+        # 顶层镜像主语言那一版（同 video），老前端不改也能看到横版
+        "video_landscape": surface.get("video_landscape"),
         "audio_url": surface.get("audio_url"),
         "audio_duration_sec": surface.get("audio_duration_sec"),
         "audio_bytes": surface.get("audio_bytes"),
@@ -1204,12 +1232,21 @@ async def get_share(request: Request, token: str):
 
 
 @router.get("/share/{token}/video")
-async def get_share_video(request: Request, token: str, lang: str | None = Query(None)):
+async def get_share_video(
+    request: Request,
+    token: str,
+    lang: str | None = Query(None),
+    orientation: str = Query("portrait"),
+):
     record = _share_episode(request, token)
     _, version = _resolve_version(request, record, lang)
-    path = version.get("video_path")
+    landscape = (orientation or "portrait").lower() in ("landscape", "horizontal", "16:9")
+    path = _landscape_path(version) if landscape else version.get("video_path")
     if not path or not Path(path).exists():
-        raise HTTPException(status_code=404, detail="这一集还没有视频")
+        raise HTTPException(
+            status_code=404,
+            detail="这一集还没有横版视频" if landscape else "这一集还没有视频",
+        )
     return _ranged_response(request, Path(path), "video/mp4")
 
 
@@ -1720,7 +1757,10 @@ async def get_audio(request: Request, episode_id: str, lang: str | None = Query(
 
 @router.post("/episodes/{episode_id}/video/rebuild", response_model=Episode)
 async def rebuild_video(
-    request: Request, episode_id: str, lang: str | None = Query(None)
+    request: Request,
+    episode_id: str,
+    lang: str | None = Query(None),
+    orientation: str = Query("portrait"),
 ):
     """用现有素材重新合成视频（配图人工校正后用）。
 
@@ -1728,6 +1768,8 @@ async def rebuild_video(
     不再调用模型 —— 否则「我只转了一张图，怎么画面全变了」。
 
     双语集要用 `?lang=` 指定重合成哪一版；不带则重合成主语言那一版。
+    `?orientation=landscape` 产出横版（1920×1080），竖版那一份原样保留 ——
+    两种画幅可以同时存在，前端给一个切换。
 
     重新合成是重活（渲染 + 编码，约 20 秒），所以同步等待而不是丢进队列：
     调用方（前端）要明确知道什么时候能看到新视频。
@@ -1738,8 +1780,11 @@ async def rebuild_video(
     if not record.get("video_path") and not (record.get("versions") or {}):
         raise HTTPException(status_code=409, detail="这一集还没有视频，无法重新合成")
 
+    if orientation not in ("portrait", "landscape"):
+        raise HTTPException(status_code=400, detail=f"未知画幅：{orientation}")
+
     try:
-        await _queue(request).pipeline.rebuild_video(episode_id, lang)
+        await _queue(request).pipeline.rebuild_video(episode_id, lang, orientation)
     except LanguageNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except VideoError as exc:
@@ -1750,18 +1795,34 @@ async def rebuild_video(
     return to_episode(refreshed)
 
 
+def _landscape_path(version: dict[str, Any]) -> str | None:
+    """横版视频的文件路径。存在 `video_landscape.path` 里（见 pipeline.rebuild_video）。"""
+    stored = version.get("video_landscape") or {}
+    path = stored.get("path")
+    return str(path) if path else None
+
+
 @router.get("/episodes/{episode_id}/video")
-async def get_video(request: Request, episode_id: str, lang: str | None = Query(None)):
-    """视频解读播客（MP4）。
+async def get_video(
+    request: Request,
+    episode_id: str,
+    lang: str | None = Query(None),
+    orientation: str = Query("portrait"),
+):
+    """视频解读播客（MP4）。`orientation=landscape` 取横版（1920×1080）。
 
     同样支持 Range：视频拖动进度条比音频更依赖它，而且播放器通常先发一个
     小 range 探测 moov box。
     """
     record = _require_episode(request, episode_id)
     _, version = _resolve_version(request, record, lang)
-    video_path = version.get("video_path")
+    landscape = (orientation or "portrait").lower() in ("landscape", "horizontal", "16:9")
+    video_path = _landscape_path(version) if landscape else version.get("video_path")
     if not video_path or not Path(video_path).exists():
-        raise HTTPException(status_code=404, detail="这一集还没有视频")
+        raise HTTPException(
+            status_code=404,
+            detail="这一集还没有横版视频" if landscape else "这一集还没有视频",
+        )
 
     return _ranged_response(request, Path(video_path), "video/mp4")
 

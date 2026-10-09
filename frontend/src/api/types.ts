@@ -124,7 +124,20 @@ export interface VideoInfo {
    * 当作「没问题」处理 —— 拿不准的时候宁可少提示，也不要平白吓唬用户。
    */
   stale?: boolean
+  /** 画幅：竖版（936×1210，默认）/ 横版（1920×1080）。老后端不返回，缺失按竖版处理 */
+  orientation?: VideoOrientation
 }
+
+/**
+ * 视频画幅。竖版跟着论文首页的比例（手机全屏好看），横版 16:9（投屏、B 站、X）。
+ * 两者可以同时存在：横版是**额外产出**的一份，不会顶掉竖版。
+ */
+export type VideoOrientation = 'portrait' | 'landscape'
+
+export const VIDEO_ORIENTATIONS: ReadonlyArray<{ value: VideoOrientation; label: string }> = [
+  { value: 'portrait', label: '竖版' },
+  { value: 'landscape', label: '横版' },
+]
 
 /**
  * 语言版本标识（契约 §1「双语版本（bilingual）」）。
@@ -166,6 +179,8 @@ export interface EpisodeVersion {
   audio_bytes: number | null
   /** 该语言的视频解读，无则 null */
   video: VideoInfo | null
+  /** 横版（1920×1080）。没生成过就是 null —— 竖版与横版可以并存 */
+  video_landscape?: VideoInfo | null
 }
 
 export interface Episode {
@@ -191,6 +206,8 @@ export interface Episode {
   illustration: Illustration | null
   /** 视频解读播客，无则 null（未启用视频合成 / 合成失败 / 老数据） */
   video: VideoInfo | null
+  /** 横版（1920×1080）。没生成过就是 null —— 竖版与横版可以并存 */
+  video_landscape?: VideoInfo | null
   audio_url: string | null
   audio_duration_sec: number | null
   audio_bytes: number | null
@@ -420,6 +437,8 @@ export interface ShareVersion {
   audio_duration_sec: number | null
   audio_bytes: number | null
   video: VideoInfo | null
+  /** 横版（1920×1080）。没生成过就是 null —— 竖版与横版可以并存 */
+  video_landscape?: VideoInfo | null
 }
 
 export interface ShareAuthor {
@@ -441,6 +460,8 @@ export interface ShareView {
   figures: Figure[]
   illustration: Illustration | null
   video: VideoInfo | null
+  /** 横版（1920×1080）。没生成过就是 null —— 竖版与横版可以并存 */
+  video_landscape?: VideoInfo | null
   audio_url: string | null
   audio_duration_sec: number | null
   audio_bytes: number | null
@@ -557,7 +578,11 @@ export interface ApiAdapter {
    * `lang` 指定要重新合成哪个语言版本，省略时后端取主语言：
    * 中英两版的视频是各自独立的产物，只该重做用户当前在看的那一版。
    */
-  rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<Episode>
+  rebuildVideo(
+    id: string,
+    lang?: EpisodeLanguage,
+    orientation?: VideoOrientation,
+  ): Promise<Episode>
   /** 脚本 txt 的下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
   scriptTxtUrl(id: string, lang?: EpisodeLanguage): string
   /** 结构化解读 md 的下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */

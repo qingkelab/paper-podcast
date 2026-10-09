@@ -13,6 +13,7 @@ import {
   isApiError,
   // 运行时收窄：后端将来新增语言时不会让页面崩，只会认不出来
   isEpisodeLanguage,
+  VIDEO_ORIENTATIONS,
   // 组件里已经有一个 video 计算属性，这个请求函数换个名字，避免撞名
   rebuildVideo as requestVideoRebuild,
   resetShare,
@@ -28,6 +29,7 @@ import type {
   Figure,
   FigureRotateDirection,
   VideoInfo,
+  VideoOrientation,
 } from '../api'
 import AccountPrompt from '../components/AccountPrompt.vue'
 import AlbumPickerDialog from '../components/AlbumPickerDialog.vue'
@@ -231,6 +233,52 @@ const video = computed<VideoInfo | null>(() =>
  * 只改 src 属性在部分浏览器里会沿用旧的解码状态（尤其是切回来的时候），重建最干净。
  */
 const videoKey = ref(0)
+
+// ---------------------------------------------------------------------------
+// 画幅：竖版（默认）与横版可以同时存在
+//
+// 横版是**额外产出**的一份（1920×1080，适合投屏/B 站/X），不会顶掉竖版 ——
+// 所以这里是一个「看哪一版」的切换，加上一个「还没有横版就生成一份」的入口。
+// ---------------------------------------------------------------------------
+const landscapeVideo = computed<VideoInfo | null>(
+  () =>
+    fromVersion(
+      (version) => version.video_landscape,
+      episode.value?.video_landscape ?? null,
+    ) ?? null,
+)
+const activeOrientation = ref<VideoOrientation>('portrait')
+/** 当前这一版（播放器只认它） */
+const currentVideo = computed<VideoInfo | null>(() =>
+  activeOrientation.value === 'landscape' && landscapeVideo.value
+    ? landscapeVideo.value
+    : video.value,
+)
+/** 画面比例跟着画幅走：竖版是论文首页的比例，横版 16:9 */
+const stageAspect = computed(() => (activeOrientation.value === 'landscape' ? '16 / 9' : VIDEO_ASPECT))
+const buildingLandscape = ref(false)
+
+async function buildLandscape(): Promise<void> {
+  if (buildingLandscape.value) return
+  const targetId = id.value
+  buildingLandscape.value = true
+  try {
+    const updated = await requestVideoRebuild(
+      targetId,
+      activeLanguage.value ?? undefined,
+      'landscape',
+    )
+    if (id.value !== targetId) return
+    episode.value = updated
+    activeOrientation.value = 'landscape'
+    resetVideoState()
+    showToast('ok', '横版视频已生成（1920×1080）')
+  } catch (cause) {
+    showToast('error', errorMessage(cause, '横版生成失败'))
+  } finally {
+    buildingLandscape.value = false
+  }
+}
 /** 音频播放器的公开方法（pause），用于音视频互斥 */
 const audioRef = ref<InstanceType<typeof AudioPlayer> | null>(null)
 const videoEl = ref<HTMLVideoElement | null>(null)
@@ -804,6 +852,9 @@ watch(id, () => {
   figureBusyId.value = null
   figureAction.value = null
   figureError.value = null
+  // 画幅也要复位：横版是每集自己的产物，上一集切到横版不该影响这一集
+  activeOrientation.value = 'portrait'
+  buildingLandscape.value = false
   // 重新合成的状态同样不能跨集残留（在途请求由 rebuildVideoNow 里的 id 比对丢弃）
   rebuildError.value = null
   rebuildingVideo.value = false
@@ -1316,19 +1367,59 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="vplayer card card--pad">
+          <!--
+            画幅切换：竖版一直有；横版是额外产出的一份。
+            没有横版时不给「空的切换器」，而是给一个「生成横版」的按钮 ——
+            点了能出东西的按钮，比一个点了没反应的开关强。
+          -->
+          <div
+            v-if="currentVideo"
+            class="row row--between"
+            style="margin-bottom: 12px; flex-wrap: wrap; gap: 10px"
+          >
+            <div class="chips" role="group" aria-label="切换画幅">
+              <button
+                v-for="item in VIDEO_ORIENTATIONS"
+                :key="item.value"
+                type="button"
+                class="chip"
+                :class="{ 'is-active': activeOrientation === item.value }"
+                :aria-pressed="activeOrientation === item.value"
+                @click="activeOrientation = item.value"
+              >
+                {{ item.label }}
+                <template v-if="item.value === 'landscape' && !landscapeVideo">（未生成）</template>
+              </button>
+            </div>
+            <button
+              v-if="!landscapeVideo"
+              type="button"
+              class="btn btn--sm btn--ghost"
+              :disabled="buildingLandscape"
+              @click="buildLandscape"
+            >
+              <span v-if="buildingLandscape" class="spinner" aria-hidden="true" />
+              {{ buildingLandscape ? '正在生成横版…' : '生成横版（1920×1080）' }}
+            </button>
+            <span v-else class="section__hint">
+              横版 {{ formatDuration(landscapeVideo.duration_sec) }} ·
+              {{ formatBytes(landscapeVideo.bytes) }}
+            </span>
+          </div>
+
           <div class="vplayer__body">
             <!--
               竖版 936×1210（比例约 0.773）：用 aspect-ratio 按契约比例预留位置
               （加载前后不跳布局），max-height 兜住矮屏不至于把页面撑爆，
               object-fit: contain 保证画面不变形、不裁切。
             -->
-            <div class="vplayer__stage" :style="{ aspectRatio: VIDEO_ASPECT }">
+            <div class="vplayer__stage" :style="{ aspectRatio: stageAspect }">
               <video
-                v-if="!videoFailed"
+                v-if="!videoFailed && currentVideo"
                 ref="videoEl"
-                :key="videoKey"
+                :key="`${videoKey}-${activeOrientation}`"
                 class="vplayer__media"
-                :src="video.url"
+                :src="currentVideo.url"
                 :poster="coverSrc ?? undefined"
                 controls
                 playsinline

@@ -49,6 +49,7 @@ import type {
   UsagePayload,
   User,
   VideoInfo,
+  VideoOrientation,
 } from './types'
 import { isEpisodeLanguage } from './types'
 import { STAGES } from '../utils/stages'
@@ -860,7 +861,11 @@ async function blobFromUrl(url: string): Promise<Blob | null> {
  * 所以不重录，只复刻契约语义：等待 → 该语言版本的视频 URL 换新（内容/URL 一起变，缓存失效）
  * → video.stale 归位 false。没有视频时抛 409，语言版本不存在时抛 404，与真实后端一致。
  */
-export async function rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<Episode> {
+export async function rebuildVideo(
+  id: string,
+  lang?: EpisodeLanguage,
+  orientation: VideoOrientation = 'portrait',
+): Promise<Episode> {
   ensureLoaded()
   requireAccount()
   await delay(60)
@@ -881,7 +886,19 @@ export async function rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<
   // 拿不到内容（浏览器不支持 fetch blob: 之类）时沿用旧 URL：stale 仍然归位，
   // 只是「URL 变了」这条没兑现 —— 演示里看不到差别，但不该因此报错
   const url = blob ? trackObjectUrl(id, URL.createObjectURL(blob)) : currentVideo.url
-  const next: VideoInfo = { ...currentVideo, url, stale: false }
+  const next: VideoInfo = { ...currentVideo, url, stale: false, orientation }
+  if (orientation === 'landscape') {
+    // 演示版没有第二种真正渲染的画幅：复用同一段占位视频，只把「横版那一份存在」
+    // 这件事复刻出来 —— 否则演示里点「生成横版」永远只会看到「未生成」，
+    // 与真实后端的行为不一致（真实后端是额外产出 `<id>.landscape.mp4`）。
+    const landscape: VideoInfo = { ...next, orientation: 'landscape' }
+    if (version) version.video_landscape = landscape
+    else episode.video_landscape = landscape
+    if (target === primaryLanguage(episode)) episode.video_landscape = { ...landscape }
+    episode.updated_at = nowIso()
+    persist()
+    return copyEpisode(episode)
+  }
   if (version) version.video = next
   else episode.video = next
   // 顶层字段始终镜像主语言那一版（重新合成的正是主语言时，两边要同步）
