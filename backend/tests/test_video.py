@@ -14,6 +14,19 @@ import pytest
 
 from app.services.video import (
     CAPTION_FADE_SEC,
+    CAPTION_TOP,
+    FADE_IN_SEC,
+    IMAGE_BOX_H,
+    IMAGE_BOX_LEFT,
+    IMAGE_TOP,
+    TRANSITION_MAX_RATIO,
+    TRANSITION_MIN_SEC,
+    TRANSITION_SEC,
+    TITLE_BASELINE,
+    WAVEFORM_HEIGHT,
+    WAVEFORM_LEFT,
+    WAVEFORM_TOP,
+    WAVEFORM_WIDTH,
     POINT_BG,
     POINT_HEIGHT,
     POINT_LEFT,
@@ -49,8 +62,11 @@ from app.services.video import (
     merge_runs_to_cap,
     point_char_limit,
     progress_bar_svg,
+    plan_transitions,
     render_caption_band,
+    render_chrome,
     render_endcard,
+    render_image_card,
     render_point_row,
     render_slide,
     split_caption_beats,
@@ -1688,3 +1704,312 @@ class TestPointLengthByLanguage:
         chinese = "状态池显存占用超过模型权重本身，这个问题在高并发下更明显"
         points = _normalize_points([{"segment": 0, "point": chinese}], count=1)
         assert 0 < len(points[0]) <= POINT_MAX_CHARS
+
+
+class TestTransitionPlan:
+    """转场规则：有理由才动。
+
+    实测参考是一条 40 秒的论文宣传片：白底、**没有任何硬切**、每 9~10 秒整页换一次、
+    每次是约 0.25~0.5 秒的快速淡化。所以默认溶解，而不是花哨的擦除/翻页。
+    """
+
+    @staticmethod
+    def _scene(start, end, image="a.png", brand="", point=""):
+        return Scene(start=start, end=end, image=Path(image), kind="figure", brand=brand)
+
+    def test_first_scene_fades_in(self):
+        plan = plan_transitions([self._scene(0, 6)], ["cover"])
+        assert plan[0].kind == "fade_in"
+        assert plan[0].seconds == pytest.approx(FADE_IN_SEC)
+
+    def test_same_image_gets_no_transition(self):
+        scenes = [self._scene(0, 6, "a.png"), self._scene(6, 12, "a.png")]
+        plan = plan_transitions(scenes, ["cover", "cover"], cards=[Path("c0.png"), Path("c1.png")])
+        assert plan[1].kind == "none", "图没变就别动 —— 无意义的溶解只会让人以为卡了一下"
+
+    def test_changed_image_dissolves_with_previous_card(self):
+        scenes = [self._scene(0, 6, "a.png"), self._scene(6, 12, "b.png")]
+        plan = plan_transitions(scenes, ["cover", "f1"], cards=[Path("c0.png"), Path("c1.png")])
+        assert plan[1].kind == "dissolve"
+        assert plan[1].seconds == pytest.approx(TRANSITION_SEC)
+        assert plan[1].previous == Path("c0.png")
+
+    def test_push_style(self):
+        scenes = [self._scene(0, 6, "a.png"), self._scene(6, 12, "b.png")]
+        plan = plan_transitions(
+            scenes, ["cover", "f1"], style="push", cards=[Path("c0.png"), Path("c1.png")]
+        )
+        assert plan[1].kind == "push"
+
+    def test_none_style_disables(self):
+        scenes = [self._scene(0, 6, "a.png"), self._scene(6, 12, "b.png")]
+        plan = plan_transitions(
+            scenes, ["cover", "f1"], style="none", cards=[Path("c0.png"), Path("c1.png")]
+        )
+        assert plan[1].kind == "none"
+
+    def test_short_scene_skips_transition(self):
+        # 0.25 秒的片段：按比例压到 0.0875 秒，低于下限 TRANSITION_MIN_SEC 就干脆不做
+        scenes = [self._scene(0, 6, "a.png"), self._scene(6, 6.25, "b.png")]
+        assert 0.25 * TRANSITION_MAX_RATIO < TRANSITION_MIN_SEC
+        plan = plan_transitions(scenes, ["cover", "f1"], cards=[Path("c0.png"), Path("c1.png")])
+        assert plan[1].kind == "none"
+
+    def test_transition_is_clamped_to_a_fraction_of_the_scene(self):
+        scenes = [self._scene(0, 6, "a.png"), self._scene(6, 7.0, "b.png")]
+        plan = plan_transitions(scenes, ["cover", "f1"], cards=[Path("c0.png"), Path("c1.png")])
+        assert plan[1].kind == "dissolve"
+        assert 0 < plan[1].seconds <= 7.0 * TRANSITION_MAX_RATIO + 1e-6
+
+    def test_outro_dissolves_from_the_previous_slide(self):
+        scenes = [
+            self._scene(0, 6, "a.png"),
+            self._scene(6, 8, "a.png", brand="outro"),
+        ]
+        plan = plan_transitions(
+            scenes, ["cover", "cover"], cards=[Path("c0.png"), None], slides=[Path("s0.png"), Path("s1.png")]
+        )
+        assert plan[1].kind == "to_card"
+        assert plan[1].previous == Path("s0.png")
+
+
+@pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
+class TestTransitionsAreRendered:
+    """转场必须真的画出来：抽帧采像素，看两张图之间是不是「混合」而不是硬切。
+
+    顺带钉住最重要的一条：**只有图片在变，骨架一动不动**
+    （标题/图注/字幕带/进度条在过渡期间像素完全一致）。
+    """
+
+    @staticmethod
+    def _solid(path: Path, width: int, height: int, color) -> Path:
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, width, height), False)
+        pix.set_rect(pix.irect, color)
+        pix.save(str(path))
+        return path
+
+    def _pixels(self, path: Path):
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(path))
+        n, width = pix.n, pix.width
+        samples = pix.samples
+
+        def at(x: int, y: int):
+            index = (y * width + x) * n
+            return (samples[index], samples[index + 1], samples[index + 2])
+
+        return at
+
+    def _frame(self, video: Path, seconds: float, out: Path) -> Path:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(video), "-ss", f"{seconds:.3f}",
+             "-frames:v", "1", str(out)],
+            capture_output=True, text=True, check=True,
+        )
+        return out
+
+    def _encode(
+        self, tmp_path: Path, *, same_image: bool = False, seconds: float = 3.0
+    ) -> tuple[Path, Path]:
+        import wave
+
+        red = self._solid(tmp_path / "red.png", 700, 500, (220, 30, 30))
+        blue = self._solid(tmp_path / "blue.png", 700, 500, (30, 60, 220))
+        second = red if same_image else blue
+
+        scenes = [
+            Scene(start=0, end=seconds, image=red, kind="figure", text="第一段。"),
+            Scene(start=seconds, end=seconds * 2, image=second, kind="figure", text="第二段。"),
+        ]
+        chromes = [
+            render_chrome(scene, tmp_path / f"chrome{i}.png", title="测试标题")
+            for i, scene in enumerate(scenes)
+        ]
+        cards = [
+            render_image_card(scene, tmp_path / f"card{i}.png") for i, scene in enumerate(scenes)
+        ]
+        ids = [str(scene.image) for scene in scenes]
+        plan = plan_transitions(scenes, ids, cards=cards, slides=chromes)
+
+        audio = tmp_path / "audio.wav"
+        rate = 8000
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(b"\x00\x00" * int(rate * seconds * 2))
+
+        out = tmp_path / "transitions.mp4"
+        encode_video(
+            scenes,
+            chromes,
+            audio,
+            out,
+            target_duration=seconds * 2,
+            image_cards=cards,
+            transitions=plan,
+        )
+        return out, chromes[0]
+
+    def test_transition_blends_the_two_images(self, tmp_path):
+        video, _ = self._encode(tmp_path)
+        center = (VIDEO_W // 2, IMAGE_TOP + IMAGE_BOX_H // 2)
+        before = self._pixels(self._frame(video, 2.9, tmp_path / "before.png"))(*center)
+        middle = self._pixels(self._frame(video, 3.18, tmp_path / "middle.png"))(*center)
+        after = self._pixels(self._frame(video, 3.6, tmp_path / "after.png"))(*center)
+
+        assert before[0] > 150 and before[2] < 100, f"过渡前应是红图：{before}"
+        assert after[2] > 150 and after[0] < 100, f"过渡后应是蓝图：{after}"
+        # 混合：红蓝都有分量，且既不等于红也不等于蓝
+        assert 60 < middle[0] < 200 and 60 < middle[2] < 200, f"过渡中应是混合色：{middle}"
+        assert middle != before and middle != after
+
+    def test_chrome_does_not_move_during_the_transition(self, tmp_path):
+        """过渡期间只有图片在变，骨架（标题/图注/字幕带/进度条）不动。
+
+        判据是**平均值**而不是逐像素全等：两段画面是分开编码的，H.264 在
+        平坦区/文字边缘的量化噪声可以差十几个灰阶（实测踩到），
+        逐像素全等会把这种压缩噪声误判成「骨架动了」。
+        """
+        import pymupdf
+
+        video, _ = self._encode(tmp_path)
+        frames = [self._frame(video, t, tmp_path / f"g{t}.png") for t in (2.9, 3.18, 3.6)]
+        pixmaps = [pymupdf.Pixmap(str(frame)) for frame in frames]
+
+        def mean_diff(box):
+            x0, y0, x1, y1 = box
+            totals = []
+            for a, b in zip(pixmaps, pixmaps[1:]):
+                total = count = 0
+                for y in range(y0, y1, 3):
+                    for x in range(x0, x1, 3):
+                        i = (y * a.width + x) * a.n
+                        total += (
+                            abs(a.samples[i] - b.samples[i])
+                            + abs(a.samples[i + 1] - b.samples[i + 1])
+                            + abs(a.samples[i + 2] - b.samples[i + 2])
+                        )
+                        count += 3
+                totals.append(total / count)
+            return max(totals)
+
+        image_box = (IMAGE_BOX_LEFT + 40, IMAGE_TOP + 40, VIDEO_W - IMAGE_BOX_LEFT - 40, IMAGE_TOP + IMAGE_BOX_H - 40)
+        chrome_bands = [
+            (20, 8, VIDEO_W - 20, IMAGE_TOP - 8),                    # 顶部：标题 + 进度条
+            (20, SUBTITLE_TOP + 4, VIDEO_W - 20, VIDEO_H - 8),        # 底部：字幕带
+        ]
+        image_change = mean_diff(image_box)
+        chrome_change = max(mean_diff(band) for band in chrome_bands)
+        assert image_change > 15, f"图片区没怎么变（{image_change:.1f}）—— 转场没生效"
+        assert chrome_change < 3, f"骨架区动了（{chrome_change:.1f}）—— 应该是只有图片在变"
+
+    def test_no_transition_when_the_image_is_unchanged(self, tmp_path):
+        video, _ = self._encode(tmp_path, same_image=True)
+        center = (VIDEO_W // 2, IMAGE_TOP + IMAGE_BOX_H // 2)
+        early = self._pixels(self._frame(video, 3.05, tmp_path / "e.png"))(*center)
+        later = self._pixels(self._frame(video, 3.7, tmp_path / "l.png"))(*center)
+        assert early[0] > 150 and early[2] < 100, f"同图时不该有混合：{early}"
+        assert early == later
+
+    def test_length_still_matches_the_audio(self, tmp_path):
+        video, _ = self._encode(tmp_path, seconds=3.0)
+        duration = float(
+            subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(video)],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        )
+        assert duration == pytest.approx(6.0, abs=0.3), f"带转场后长度跑偏了：{duration}"
+
+
+@pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
+class TestWaveformStrip:
+    """声波条是「根据语音做动画」的可见落点：音量大的地方条上墨就多，安静的地方就少。
+
+    这一组真的编码一遍再抽帧采像素 —— 只看滤镜字符串无法证明它跟音量有关。
+    """
+
+    PAUSE_TEST_VOICE_TOP = (201, 161, 74)   # A 的麦金 #d3a24a
+
+    def _encode(self, tmp_path: Path, *, waveform: bool = True) -> Path:
+        import math
+        import struct
+        import wave
+
+        image = make_png(tmp_path / "img.png", 700, 500)
+        scene = Scene(
+            start=0, end=2.0, image=image, kind="figure", speaker="A", text="第一段。"
+        )
+        chrome = render_chrome(scene, tmp_path / "chrome.png", title="测试")
+        card = render_image_card(scene, tmp_path / "card.png")
+
+        # 前 1 秒大声、后 1 秒安静：声波条上的墨应当明显前多后少
+        rate = 8000
+        frames = bytearray()
+        for index in range(rate * 2):
+            amplitude = 0.75 if index < rate else 0.0
+            value = amplitude * math.sin(2 * math.pi * 220 * index / rate)
+            frames.extend(struct.pack("<h", int(max(-1.0, min(1.0, value)) * 32000)))
+        audio = tmp_path / "voice.wav"
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(bytes(frames))
+
+        out = tmp_path / "wave.mp4"
+        encode_video(
+            [scene],
+            [chrome],
+            audio,
+            out,
+            target_duration=2.0,
+            image_cards=[card],
+            transitions=plan_transitions([scene], ["x"], cards=[card]),
+            waveform=waveform,
+        )
+        return out
+
+    def _frame(self, video: Path, seconds: float, out: Path) -> Path:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(video), "-ss", f"{seconds:.3f}",
+             "-frames:v", "1", str(out)],
+            capture_output=True, text=True, check=True,
+        )
+        return out
+
+    def _strip_stats(self, frame: Path) -> tuple[int, int]:
+        """返回（条上的墨像素数, 条上的暗像素数）。"""
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(frame))
+        n, width = pix.n, pix.width
+        samples = pix.samples
+        ink = dark = 0
+        for y in range(WAVEFORM_TOP, WAVEFORM_TOP + WAVEFORM_HEIGHT):
+            for x in range(WAVEFORM_LEFT, WAVEFORM_LEFT + WAVEFORM_WIDTH):
+                index = (y * width + x) * n
+                r, g, b = samples[index], samples[index + 1], samples[index + 2]
+                if r > 150 and r > g + 20 and g > b + 20:
+                    ink += 1
+                if r < 120 and g < 120 and b < 120:
+                    dark += 1
+        return ink, dark
+
+    def test_strip_inks_more_when_the_voice_is_loud(self, tmp_path):
+        video = self._encode(tmp_path)
+        loud_ink, loud_dark = self._strip_stats(self._frame(video, 0.5, tmp_path / "loud.png"))
+        quiet_ink, quiet_dark = self._strip_stats(self._frame(video, 1.7, tmp_path / "quiet.png"))
+        assert loud_ink > 200, f"有声时声波条上应有明显墨迹，实际 {loud_ink}"
+        assert loud_ink > quiet_ink * 2, f"声波条没跟着音量走：响 {loud_ink} vs 静 {quiet_ink}"
+        # 底色必须干净：showwaves 画的是黑底彩线，直接叠会留一层黑
+        assert loud_dark == 0 and quiet_dark == 0, f"声波条残留暗像素：{(loud_dark, quiet_dark)}"
+
+    def test_strip_can_be_turned_off(self, tmp_path):
+        video = self._encode(tmp_path, waveform=False)
+        ink, _ = self._strip_stats(self._frame(video, 0.5, tmp_path / "off.png"))
+        assert ink == 0, "关掉之后不该再有声波条"

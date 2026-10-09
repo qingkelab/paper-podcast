@@ -37,6 +37,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .audio_track import Pause, align_boundaries, detect_pauses
+
 logger = logging.getLogger(__name__)
 
 # 社区品牌配色与素材（取自社区自己的视频合成项目 qingkelab/qingke-video）
@@ -71,6 +73,7 @@ TITLE_BASELINE = 46
 IMAGE_TOP = 74
 IMAGE_BOX_W = VIDEO_W - 40      # 896
 IMAGE_BOX_H = 742
+IMAGE_BOX_LEFT = (VIDEO_W - IMAGE_BOX_W) // 2   # 20：图片卡叠到骨架上的横坐标
 CAPTION_TOP = IMAGE_TOP + IMAGE_BOX_H + 6
 
 # 「本段要点」强调行：浅蓝底 + 左侧色条 + 大字，是画面上最抢眼的一行
@@ -149,6 +152,45 @@ CAPTION_BEAT_MIN_CHARS = 28   # 短于这个长度就别拆了：每句只剩几
 CAPTION_BAND_MAX_FONT = 38.0  # 字幕带单独渲染，字可以比整页大（观众主要在读它）
 _SENTENCE_END = "。！？!?；;…"
 
+# ---------------------------------------------------------------------------
+# 转场
+# ---------------------------------------------------------------------------
+#
+# 实测参考（一条 40 秒的论文宣传片，白底、16:9）：**没有任何硬切**，
+# 每 9~10 秒整页换一次，换的过程约 0.25~0.5 秒 —— 也就是「快速淡过去」。
+# 所以这里的默认是溶解（dissolve）、0.35 秒，而不是花哨的擦除/翻页。
+#
+# **长度对齐不能破**：过渡发生在**新片段内部**（用上一段的图片卡做底层），
+# 不跨片段 xfade —— xfade 会重叠、把总长缩短，画面就会比声音早。
+# 每段仍是 `-frames:v <整数帧>`，所以拼接总长逐帧不变（实测 45 帧片段仍是 45 帧）。
+TRANSITION_STYLE = "dissolve"     # none | dissolve | push
+TRANSITION_SEC = 0.35
+TRANSITION_MIN_SEC = 0.12         # 短于这个就别做了（短段整段都在过渡更难看）
+TRANSITION_MAX_RATIO = 0.35       # 过渡最长占这一段的比例
+FADE_IN_SEC = 0.30                # 首段从白底淡入
+
+# ---------------------------------------------------------------------------
+# 声波条（跟着语音起伏）
+# ---------------------------------------------------------------------------
+#
+# 用户要的是「根据语音增加一些动画效果」。声波条是这件事的可见落点：
+# 贴在字幕带底部，实时显示**当前说话人**的音量起伏，颜色也随说话人走
+# （A 麦金 / B 石板蓝，和脚本页的主播配色一致）。
+#
+# 实现用 ffmpeg 的 `showwaves`，但有两个坑都是实测出来的：
+# 1. **某些宽度下 showwaves 什么都不画**（`s=856x60/40/18` 输出全黑，`s=800x18` 正常）
+#    → 固定按 800 宽渲染，再用 `scale` 缩到目标尺寸。
+# 2. 它画的是「黑底上的彩色波形」，直接叠到浅色字幕带上会留一层黑底
+#    → 用 `format=gray` 当 alpha，和纯色源 `alphamerge`，得到干净的上色波形
+#    （实测残余暗像素 0，而这正是「够亮」判据看不出来的那种脏东西）。
+WAVEFORM_TOP = 1180               # 贴字幕带底部
+WAVEFORM_LEFT = SUBTITLE_LEFT     # 40：和字幕左对齐
+WAVEFORM_WIDTH = SUBTITLE_WIDTH   # 856
+WAVEFORM_HEIGHT = 18
+WAVEFORM_RENDER_SIZE = "800x60"   # 见上面第 1 条坑：别改这个宽度
+WAVEFORM_COLOR = "#2f6fb5"
+SPEAKER_WAVE_COLORS = {"A": "#d3a24a", "B": "#79a9c9"}
+
 # 伪 id：模型用它表示「这一段没有对应原图，需要现场生成一张」
 GENERATE_ID = "generate"
 
@@ -188,6 +230,24 @@ class CaptionBand:
 
     text: str
     image: Path
+
+
+@dataclass
+class Transition:
+    """一段画面开头的转场。
+
+    `kind`：
+    - `none`：直接切（图片没变、或片段太短）
+    - `fade_in`：整页从白底淡入（只在第一段）
+    - `dissolve`：上一张图淡出、这张淡入（默认）
+    - `push`：上一张往左推出去、这张从右推入
+    - `to_card`：上一整页淡出、露出底下的片尾品牌卡
+    """
+
+    kind: str = "none"
+    seconds: float = 0.0
+    # dissolve/push 需要上一段的**图片卡**；to_card 需要上一段的**整页**
+    previous: Path | None = None
 
 
 @dataclass
@@ -862,10 +922,89 @@ def render_slide(
     `include_subtitle=False` 时只画字幕区的底色和分隔线，不画文字 ——
     这一段的字幕会拆成几句、由 `render_caption_band` 单独渲染、再按时间叠上去
     （见 `CaptionBand`）。底图里若还留着一整段文字，第一句出现之前就会露馅。
+
+    这个函数现在等于「骨架 + 图片卡」两层叠在一起（见下面的
+    `render_chrome` / `render_image_card`）。保留它是为了两件事：
+    现有的测试与「一页到底」的简单用法，以及需要单张整页图时不必自己拼。
+    """
+    return _render_slide_layers(
+        scene,
+        output_path,
+        title=title,
+        include_subtitle=include_subtitle,
+        include_point=include_point,
+        include_image=True,
+    )
+
+
+def render_chrome(
+    scene: Scene,
+    output_path: Path,
+    *,
+    title: str = "",
+    include_subtitle: bool = True,
+    include_point: bool = True,
+) -> Path:
+    """只渲染**骨架**：白底 + 标题 + logo + 图注 + 强调行 + 字幕带（图片区留白）。
+
+    为什么要拆出骨架：转场要的是「图片在变、版面不动」。实测那条 40 秒的论文宣传片
+    就是这种观感 —— 白底、每 9~10 秒换一次画面、换的时候整页快速淡过去。
+    只有把图片单独成层，才能做到「图片溶解、标题/图注/字幕/进度条一动不动」。
+    """
+    return _render_slide_layers(
+        scene,
+        output_path,
+        title=title,
+        include_subtitle=include_subtitle,
+        include_point=include_point,
+        include_image=False,
+    )
+
+
+def render_image_card(scene: Scene, output_path: Path) -> Path:
+    """只渲染**图片卡**：图片 + 贴着图片的那圈浅灰细边框，其余透明。
+
+    画幅是图片区（`IMAGE_BOX_W × IMAGE_BOX_H`），叠在骨架的 `(20, IMAGE_TOP)`。
+    边框跟着图片走（它是贴着图片量的 2px 内缩），所以它属于这一层 ——
+    转场时「带框的图」整体淡入淡出，而不是框留在原地、图在里面换。
     """
     data_uri, img_w, img_h = _prepare_image(scene.image, IMAGE_BOX_W, IMAGE_BOX_H)
-    img_x = (VIDEO_W - img_w) / 2
-    img_y = IMAGE_TOP + (IMAGE_BOX_H - img_h) / 2
+    img_x = (VIDEO_W - img_w) / 2 - IMAGE_BOX_LEFT
+    img_y = (IMAGE_BOX_H - img_h) / 2
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{IMAGE_BOX_W}" height="{IMAGE_BOX_H}" '
+        f'viewBox="0 0 {IMAGE_BOX_W} {IMAGE_BOX_H}">',
+        f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
+        f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>',
+        f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" '
+        f'href="{data_uri}"/>',
+        "</svg>",
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _rasterize_custom(
+        "\n".join(parts), output_path, width=IMAGE_BOX_W, height=IMAGE_BOX_H
+    )
+    return output_path
+
+
+def _render_slide_layers(
+    scene: Scene,
+    output_path: Path,
+    *,
+    title: str,
+    include_subtitle: bool,
+    include_point: bool,
+    include_image: bool,
+) -> Path:
+    """骨架与整页共用的渲染实现（`include_image` 决定图片层要不要画进来）。"""
+    img_x = img_y = 0.0
+    img_w = img_h = 0.0
+    data_uri = ""
+    if include_image:
+        data_uri, img_w, img_h = _prepare_image(scene.image, IMAGE_BOX_W, IMAGE_BOX_H)
+        img_x = (VIDEO_W - img_w) / 2
+        img_y = IMAGE_TOP + (IMAGE_BOX_H - img_h) / 2
 
     font_size, lines = _fit_subtitle(scene.text)
 
@@ -899,15 +1038,16 @@ def render_slide(
             f'width="{lw}" height="{lh}" href="{uri}"/>'
         )
 
-    # 配图（浅灰细边框，白底上用来界定图片边界）
-    parts.append(
-        f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" height="{img_h + 4}" '
-        f'rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
-    )
-    parts.append(
-        f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" '
-        f'href="{data_uri}"/>'
-    )
+    # 配图（浅灰细边框，白底上用来界定图片边界）；骨架模式下这块留白，由图片卡叠上来
+    if include_image:
+        parts.append(
+            f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
+            f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
+        )
+        parts.append(
+            f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" '
+            f'href="{data_uri}"/>'
+        )
 
     # 图注
     if scene.caption:
@@ -1175,8 +1315,19 @@ def render_endcard(scene: Scene, output_path: Path, *, title: str = "") -> Path:
     return output_path
 
 
-def _rasterize_custom(svg_text: str, output_path: Path) -> None:
-    """按 SVG 自带的宽高渲染（illustration.rasterize_svg 会强制套用信息图的画布尺寸）。"""
+def _rasterize_custom(
+    svg_text: str,
+    output_path: Path,
+    *,
+    width: int = VIDEO_W,
+    height: int = VIDEO_H,
+) -> None:
+    """按给定尺寸渲染（illustration.rasterize_svg 会强制套用信息图的画布尺寸）。
+
+    ⚠️ resvg 在这里的行为是**按宽度缩放、高度按比例推**，不是拉伸到给定尺寸：
+    传 `width=936` 渲染一个 896×742 的 SVG，会得到 936×776（比例一样、但尺寸不对）。
+    「整页/字幕带/强调行/进度条」都是 936 宽，正好蒙对；**图片卡是 896 宽，必须显式传尺寸**。
+    """
     try:
         import resvg_py
     except ImportError as exc:  # pragma: no cover
@@ -1186,8 +1337,8 @@ def _rasterize_custom(svg_text: str, output_path: Path) -> None:
         png = bytes(
             resvg_py.svg_to_bytes(
                 svg_string=svg_text,
-                width=VIDEO_W,
-                height=VIDEO_H,
+                width=width,
+                height=height,
                 languages=["zh-Hans", "en"],
             )
         )
@@ -1241,6 +1392,35 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def beat_windows_aligned(
+    beats: list[str],
+    duration: float,
+    *,
+    start: float = 0.0,
+    pauses: list[Pause] | None = None,
+    fade: float = CAPTION_FADE_SEC,
+) -> list[tuple[float, float]]:
+    """字幕分句的时间窗：先按字数比例算，再**吸附到真实的说话停顿**。
+
+    为什么要吸附：语速不均匀，按字数算出来的换句点经常落在句子中间，
+    看起来就是「字幕换得莫名其妙」。音频里本来就有停顿，`silencedetect` 直接给出来
+    （实测 250 秒的音频 0.14 秒跑完，82 个停顿）。
+
+    `pauses` 为空（检测失败 / 没有停顿）时就是原来的比例切分 —— 这条路径必须永远可用。
+    """
+    windows = beat_windows(beats, duration, fade=fade)
+    if not pauses or len(windows) < 2:
+        return windows
+
+    # 内部边界（不含首尾）的绝对时间，吸附后再还原成窗口
+    boundaries = [start + end for _, end in windows[:-1]]
+    aligned = align_boundaries(
+        boundaries, pauses, start=start, end=start + duration
+    )
+    edges = [0.0, *[item - start for item in aligned], duration]
+    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+
+
 # --------------------------------------------------------------------------
 # 动效：推镜 / 字幕分句 / 进度条
 # --------------------------------------------------------------------------
@@ -1262,6 +1442,63 @@ def progress_bar_svg() -> str:
         f'<rect width="{VIDEO_W}" height="{PROGRESS_BAR_H}" fill="{PROGRESS_BAR_COLOR}"/>'
         f"</svg>"
     )
+
+
+def plan_transitions(
+    scenes: list[Scene],
+    image_ids: list[str] | None = None,
+    *,
+    style: str = TRANSITION_STYLE,
+    seconds: float = TRANSITION_SEC,
+    cards: list[Path | None] | None = None,
+    slides: list[Path] | None = None,
+) -> list[Transition]:
+    """算出每一段开头该做什么转场。
+
+    规则（都是「有理由才动」）：
+    - 第一段 → `fade_in`（从白底淡入，比「啪」地出现自然）；
+    - 与上一段**同一张图** → `none`：图没变就别动，无意义的溶解只会让人以为卡了一下；
+    - 换图 → `dissolve`（`style="push"` 时改成横推）；
+    - 片尾品牌卡 → `to_card`：上一整页淡出，露出底下的深色卡；
+    - 片段太短（`seconds` 被压到 `TRANSITION_MIN_SEC` 以下）→ `none`。
+    """
+    ids = image_ids or [str(scene.image) for scene in scenes]
+    plan: list[Transition] = []
+    for index, scene in enumerate(scenes):
+        if scene.brand == "outro":
+            plan.append(
+                Transition(
+                    kind="to_card",
+                    seconds=_clamp_transition(seconds, scene, minimum=0.0),
+                    previous=(slides[index - 1] if slides and index else None),
+                )
+            )
+            continue
+
+        if index == 0:
+            plan.append(
+                Transition(kind="fade_in", seconds=_clamp_transition(FADE_IN_SEC, scene))
+            )
+            continue
+
+        same_image = index < len(ids) and ids[index] == ids[index - 1]
+        previous_card = cards[index - 1] if cards and index - 1 < len(cards) else None
+        if same_image or style == "none" or previous_card is None:
+            plan.append(Transition())
+            continue
+
+        allowed = _clamp_transition(seconds, scene)
+        # 压到 0 就是「不做」：kind 也要跟着变成 none，否则日志和计划读起来自相矛盾
+        plan.append(
+            Transition(kind=style if allowed else "none", seconds=allowed, previous=previous_card)
+        )
+    return plan
+
+
+def _clamp_transition(seconds: float, scene: Scene, *, minimum: float = TRANSITION_MIN_SEC) -> float:
+    """过渡时长不能超过这一段的三分之一，太短就干脆不做。"""
+    allowed = min(seconds, scene.duration * TRANSITION_MAX_RATIO)
+    return allowed if allowed >= minimum else 0.0
 
 
 def split_caption_beats(text: str, *, max_beats: int = CAPTION_BEAT_MAX) -> list[str]:
@@ -1351,6 +1588,10 @@ def encode_video(
     target_duration: float | None = None,
     caption_bands: list[list[CaptionBand]] | None = None,
     point_rows: list[Path | None] | None = None,
+    pauses: list[Pause] | None = None,
+    image_cards: list[Path | None] | None = None,
+    transitions: list[Transition] | None = None,
+    waveform: bool = True,
 ) -> VideoResult:
     """把幻灯片序列和音频合成 MP4。
 
@@ -1401,6 +1642,8 @@ def encode_video(
 
     bands = caption_bands or [[] for _ in scenes]
     rows = point_rows or [None] * len(scenes)
+    cards = image_cards or [None] * len(scenes)
+    plan = transitions or [Transition() for _ in scenes]
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
     frame_counts = [max(int(round(scene.duration * FPS)), 1) for scene in scenes]
@@ -1417,25 +1660,130 @@ def encode_video(
         if result.returncode != 0:
             raise VideoError(f"{what}失败：{(result.stderr or '')[-400:]}")
 
+    transitions = plan or [Transition() for _ in scenes]
     clip_paths: list[Path] = []
     cursor_frames = 0
     try:
         for index, (scene, slide, frames) in enumerate(zip(scenes, slide_paths, frame_counts)):
             clip_path = clips_dir / f"clip-{index:04d}.mp4"
             start_sec = cursor_frames / FPS
-            inputs = [
-                "-loop", "1", "-framerate", str(FPS), "-i", str(slide),
-                "-loop", "1", "-framerate", str(FPS), "-i", str(bar_path),
-            ]
-            graph = [f"[0:v]scale={VIDEO_W}:{VIDEO_H}[v0]"]
+            transition = transitions[index] if index < len(transitions) else Transition()
+
+            # 输入序号是动态的（转场会多挂 1~2 路图），所以用计数器而不是写死 [0]/[1]/[2]
+            inputs: list[str] = []
+            counter = 0
+
+            def add_image(path: Path) -> int:
+                nonlocal counter
+                inputs.extend(["-loop", "1", "-framerate", str(FPS), "-i", str(path)])
+                position = counter
+                counter += 1
+                return position
+
+            def add_source(expression: str) -> int:
+                """挂一路 lavfi 源（比如纯色），返回输入序号。"""
+                nonlocal counter
+                inputs.extend(["-f", "lavfi", "-i", expression])
+                position = counter
+                counter += 1
+                return position
+
+            def add_audio(path: Path, start: float, duration: float) -> int:
+                """把音频裁到这一段的区间挂进来（声波条只画本段的波形）。"""
+                nonlocal counter
+                inputs.extend(
+                    ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(path)]
+                )
+                position = counter
+                counter += 1
+                return position
+
+            chrome_in = add_image(slide)
+            bar_in = add_image(bar_path)
+            graph = [f"[{chrome_in}:v]scale={VIDEO_W}:{VIDEO_H}[v0]"]
             last, node = "v0", 0
+
+            # ---- 转场：发生在这一段**内部**，所以总帧数一个都不变 ----
+            card = cards[index] if cards and index < len(cards) else None
+            if (
+                transition.kind in ("dissolve", "push")
+                and transition.seconds > 0
+                and transition.previous is not None
+                and card is not None
+            ):
+                prev_in = add_image(transition.previous)
+                cur_in = add_image(card)
+                span = f"min(1,t/{transition.seconds:.3f})"
+                node += 1
+                # 先把图片区从骨架里裁出来当「窗口」：这样两张卡在窗口内滑动/淡入淡出时
+                # 会被自动裁切在图片框里，不会糊到标题或字幕上
+                graph.append(
+                    f"[{chrome_in}:v]crop={IMAGE_BOX_W}:{IMAGE_BOX_H}:{IMAGE_BOX_LEFT}:"
+                    f"{IMAGE_TOP}[win{node}]"
+                )
+                if transition.kind == "push":
+                    # 横推：两张卡在窗口里左右滑动（窗口只有图片区那么大，超出部分自动裁掉）
+                    graph.append(f"[{prev_in}:v]format=rgba[pa{node}]")
+                    graph.append(f"[{cur_in}:v]format=rgba[ca{node}]")
+                    graph.append(
+                        f"[win{node}][pa{node}]overlay=x='-{IMAGE_BOX_W}*{span}':y=0[wm{node}]"
+                    )
+                    graph.append(
+                        f"[wm{node}][ca{node}]overlay=x='{IMAGE_BOX_W}*(1-{span})':y=0[wc{node}]"
+                    )
+                else:
+                    graph.append(
+                        f"[{prev_in}:v]format=rgba,fade=t=out:st=0:d={transition.seconds:.3f}:"
+                        f"alpha=1[po{node}]"
+                    )
+                    graph.append(
+                        f"[{cur_in}:v]format=rgba,fade=t=in:st=0:d={transition.seconds:.3f}:"
+                        f"alpha=1[co{node}]"
+                    )
+                    graph.append(f"[win{node}][po{node}]overlay=0:0[wm{node}]")
+                    graph.append(f"[wm{node}][co{node}]overlay=0:0[wc{node}]")
+                graph.append(
+                    f"[{last}][wc{node}]overlay={IMAGE_BOX_LEFT}:{IMAGE_TOP}[v{node}]"
+                )
+                last = f"v{node}"
+            elif card is not None:
+                cur_in = add_image(card)
+                node += 1
+                graph.append(f"[{cur_in}:v]format=rgba[ca{node}]")
+                graph.append(
+                    f"[{last}][ca{node}]overlay={IMAGE_BOX_LEFT}:{IMAGE_TOP}[v{node}]"
+                )
+                last = f"v{node}"
+
+            # ---- 首段：整页从白底淡入（「啪」地出现太硬） ----
+            if transition.kind == "fade_in" and transition.seconds > 0:
+                node += 1
+                graph.append(
+                    f"[{last}]fade=t=in:st=0:d={transition.seconds:.3f}:color=white[v{node}]"
+                )
+                last = f"v{node}"
+
+            # ---- 进片尾品牌卡：上一整页淡出，露出底下的深色卡 ----
+            if (
+                transition.kind == "to_card"
+                and transition.seconds > 0
+                and transition.previous is not None
+            ):
+                prev_in = add_image(transition.previous)
+                node += 1
+                graph.append(
+                    f"[{prev_in}:v]format=rgba,fade=t=out:st=0:d={transition.seconds:.3f}:"
+                    f"alpha=1[po{node}]"
+                )
+                graph.append(f"[{last}][po{node}]overlay=0:0[v{node}]")
+                last = f"v{node}"
 
             # ---- 本段要点：从左侧滑入（标记这一段的开始） ----
             row = rows[index] if index < len(rows) else None
             if row is not None:
-                inputs += ["-loop", "1", "-framerate", str(FPS), "-i", str(row)]
+                row_in = add_image(row)
                 node += 1
-                graph.append(f"[2:v]format=rgba[pt{node}]")
+                graph.append(f"[{row_in}:v]format=rgba[pt{node}]")
                 graph.append(
                     f"[{last}][pt{node}]overlay="
                     f"x='-(W)+W*min(1,t/{POINT_SLIDE_SEC:.2f})':y={POINT_TOP}[v{node}]"
@@ -1444,7 +1792,7 @@ def encode_video(
 
             # ---- 进度条：整条色带从左推进，用全局时间算，跨段连续 ----
             node += 1
-            graph.append(f"[1:v]format=rgba[bar{node}]")
+            graph.append(f"[{bar_in}:v]format=rgba[bar{node}]")
             graph.append(
                 f"[{last}][bar{node}]overlay=x='min(0,-(W)+W*({start_sec:.3f}+t)/{total_sec:.3f})'"
                 f":y=0[v{node}]"
@@ -1453,21 +1801,44 @@ def encode_video(
 
             # ---- 字幕：第 0 句从一开始就在，后面的按窗口淡入 ----
             scene_bands = bands[index] if index < len(bands) else []
-            windows = beat_windows([band.text for band in scene_bands], scene.duration)
-            first_band_input = 2 + (1 if row is not None else 0)
-            for beat_index, (band, (beat_start, _beat_end)) in enumerate(
-                zip(scene_bands, windows)
-            ):
-                inputs += ["-loop", "1", "-framerate", str(FPS), "-i", str(band.image)]
+            windows = beat_windows_aligned(
+                [band.text for band in scene_bands],
+                scene.duration,
+                start=scene.start,
+                pauses=pauses,
+            )
+            for band, (beat_start, _beat_end) in zip(scene_bands, windows):
+                band_in = add_image(band.image)
                 node += 1
-                source = first_band_input + beat_index
                 graph.append(
-                    f"[{source}:v]format=rgba,fade=t=in:st={beat_start:.3f}:"
+                    f"[{band_in}:v]format=rgba,fade=t=in:st={beat_start:.3f}:"
                     f"d={CAPTION_FADE_SEC}:alpha=1[cap{node}]"
                 )
                 graph.append(
                     f"[{last}][cap{node}]overlay=x=0:y={SUBTITLE_TOP}:"
                     f"enable='gte(t,{beat_start:.3f})'[v{node}]"
+                )
+                last = f"v{node}"
+
+            # ---- 声波条：跟着这一段的语音起伏（片尾品牌卡不加） ----
+            #
+            # **必须排在字幕带之后**：字幕带是一整条不透明的浅蓝底，先画声波条会被它整条盖住
+            # （实测：画面上什么都看不到，而单独跑滤镜链时墨迹有 793 个像素 —— 就是顺序问题）。
+            if waveform and scene.brand != "outro":
+                color = SPEAKER_WAVE_COLORS.get(scene.speaker or "A", WAVEFORM_COLOR)
+                color_in = add_source(f"color=c={color}:s={WAVEFORM_RENDER_SIZE}:r={FPS}")
+                audio_in = add_audio(audio_path, scene.start, scene.duration)
+                node += 1
+                graph.append(
+                    f"[{audio_in}:a]showwaves=s={WAVEFORM_RENDER_SIZE}:mode=cline:"
+                    f"colors={color}:rate={FPS},format=gray[msk{node}]"
+                )
+                graph.append(
+                    f"[{color_in}:v][msk{node}]alphamerge,"
+                    f"scale={WAVEFORM_WIDTH}:{WAVEFORM_HEIGHT},format=rgba[wave{node}]"
+                )
+                graph.append(
+                    f"[{last}][wave{node}]overlay=x={WAVEFORM_LEFT}:y={WAVEFORM_TOP}[v{node}]"
                 )
                 last = f"v{node}"
 
@@ -1864,37 +2235,51 @@ def compose_video(
     band_paths: list[Path] = []
     point_rows: list[Path | None] = []
     point_paths: list[Path] = []
+    image_cards: list[Path | None] = []
+    card_paths: list[Path] = []
+    image_ids: list[str] = []
     endcard_count = 0
     beat_count = 0
     for index, scene in enumerate(scenes):
         slide_path = work_dir / f"slide-{index:04d}.png"
         beats = split_caption_beats(scene.text)
         bands: list[CaptionBand] = []
+        card_path: Path | None = None
+
         if scene.brand == "outro":
             # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
             # 品牌卡上的字是大号引导语，不参与「字幕逐句出现」——那会把它切碎。
+            # 它整页都是牌子，没有「图片层」，转场用 to_card（上一整页淡出）代替。
             render_endcard(scene, slide_path, title=title)
             endcard_count += 1
-        elif len(beats) > 1:
-            # 字幕拆成两句 → 底图不画字幕，两句各自成图层按时叠上去；
-            # 强调行也交给独立图层（要滑入）
-            render_slide(
+        else:
+            # 正文：**骨架 + 图片卡** 两层。骨架（标题/图注/强调行/字幕带）全程不动，
+            # 只有图片卡在换 —— 这就是「连贯」的来源（见 render_chrome 的说明）。
+            render_chrome(
                 scene,
                 slide_path,
                 title=title,
-                include_subtitle=False,
+                include_subtitle=len(beats) <= 1,
                 include_point=False,
             )
-            for beat_index, beat in enumerate(beats):
-                band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
-                render_caption_band(beat, band_path)
-                bands.append(CaptionBand(text=beat, image=band_path))
-                band_paths.append(band_path)
-            beat_count += 1
-        else:
-            render_slide(scene, slide_path, title=title, include_point=False)
+            card_path = work_dir / f"card-{index:04d}.png"
+            render_image_card(scene, card_path)
+            card_paths.append(card_path)
+            if len(beats) > 1:
+                for beat_index, beat in enumerate(beats):
+                    band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
+                    render_caption_band(beat, band_path)
+                    bands.append(CaptionBand(text=beat, image=band_path))
+                    band_paths.append(band_path)
+                beat_count += 1
+
         slide_paths.append(slide_path)
         caption_bands.append(bands)
+        image_cards.append(card_path)
+        # 「换了没有」按图片素材判断，而不是按渲染出来的文件：同一张图连着讲两段时
+        # 不该做无意义的溶解（观众只会觉得画面卡了一下）
+        image_ids.append(str(scene.image))
+
         if scene.point and scene.brand != "outro":
             point_path = work_dir / f"point-{index:04d}.png"
             render_point_row(scene.point, point_path)
@@ -1902,10 +2287,18 @@ def compose_video(
             point_paths.append(point_path)
         else:
             point_rows.append(None)
+
+    transitions = plan_transitions(scenes, image_ids, cards=image_cards, slides=slide_paths)
+    moved = sum(1 for item in transitions if item.kind not in ("", "none"))
     logger.info(
-        "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧，字幕分句 %d 段）",
-        len(slide_paths), endcard_count, beat_count,
+        "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧，字幕分句 %d 段，转场 %d 处）",
+        len(slide_paths), endcard_count, beat_count, moved,
     )
+
+    # 说话停顿：用来把字幕换句对准真实的停顿（检测失败就是空列表 → 退回按字数）
+    pauses = detect_pauses(audio_path)
+    if pauses:
+        logger.info("检测到 %d 处说话停顿，字幕换句将对齐到停顿", len(pauses))
 
     result = encode_video(
         scenes,
@@ -1915,6 +2308,9 @@ def compose_video(
         target_duration=audio_duration,
         caption_bands=caption_bands,
         point_rows=point_rows,
+        pauses=pauses,
+        image_cards=image_cards,
+        transitions=transitions,
     )
     result.assignment = strategy
     result.scenes = [
@@ -1931,7 +2327,7 @@ def compose_video(
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
     }
 
-    for temp_path in [*slide_paths, *band_paths, *point_paths]:
+    for temp_path in [*slide_paths, *band_paths, *point_paths, *card_paths]:
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
