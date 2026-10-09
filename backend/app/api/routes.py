@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 import mimetypes
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -1535,37 +1536,70 @@ async def get_episode(request: Request, episode_id: str):
     return to_episode(_require_episode(request, episode_id))
 
 
+def _remove_quietly(path_value: Any) -> None:
+    if not path_value:
+        return
+    try:
+        Path(path_value).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("删除文件失败 %s：%s", path_value, exc)
+
+
+def _remove_tree_quietly(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        logger.warning("删除目录失败 %s：%s", path, exc)
+
+
 @router.delete("/episodes/{episode_id}", status_code=204)
 async def delete_episode(request: Request, episode_id: str) -> Response:
+    """删掉这一集以及它的全部产物。
+
+    ⚠️ 必须覆盖**每一个语言版本**，不能只看顶层字段：
+    双语集每个语言各有一份信息图、音频、视频，只看顶层会漏掉非主语言那份，
+    那些文件就永远留在磁盘上了。
+    """
     record = _require_episode(request, episode_id)
 
+    # 收集所有语言的产物路径（顶层字段只镜像主语言）
+    versions = record.get("versions") or {}
+    if not versions:
+        versions = {
+            "zh": {
+                "illustration": record.get("illustration"),
+                "audio_path": record.get("audio_path"),
+                "video_path": record.get("video_path"),
+            }
+        }
+
     for key in ("audio_path", "cover_path", "video_path"):
-        path_value = record.get(key)
-        if path_value:
-            try:
-                Path(path_value).unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning("删除文件失败 %s：%s", path_value, exc)
+        _remove_quietly(record.get(key))
+
+    for version in versions.values():
+        _remove_quietly(version.get("audio_path"))
+        _remove_quietly(version.get("video_path"))
+        for key in ("svg_path", "png_path"):
+            _remove_quietly((version.get("illustration") or {}).get(key))
+        # 视频用到的段落配图（现场生成的 topic 图）也在 video.assets 里
+        for asset_path in (version.get("video") or {}).get("assets", {}).values():
+            _remove_quietly(asset_path)
 
     for figure in record.get("figures") or []:
-        try:
-            Path(figure.get("path") or "").unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_quietly(figure.get("path"))
 
     for key in ("svg_path", "png_path"):
-        path_value = (record.get("illustration") or {}).get(key)
-        if path_value:
-            try:
-                Path(path_value).unlink(missing_ok=True)
-            except OSError:
-                pass
+        _remove_quietly((record.get("illustration") or {}).get(key))
 
     if record.get("source_type") == "pdf" and record.get("source_ref"):
-        try:
-            Path(record["source_ref"]).unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_quietly(record["source_ref"])
+
+    # 渲染中间产物（每帧 SVG、段落配图）整个目录一起删。
+    # 这些文件不在数据库里，只能按目录名（= episode id）找 —— 实测漏了这一步，
+    # 删过的单集会在 data/video-frames/ 下留一整套帧文件，永远没人回收。
+    _remove_tree_quietly(_settings(request).video_work_dir / episode_id)
 
     _db(request).delete_episode(episode_id)
     return Response(status_code=204)

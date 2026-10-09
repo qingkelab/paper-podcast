@@ -182,6 +182,26 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **视频画面是白底**。论文配图多数本身就是白底图表，深色画布会把它们衬得像贴图；
   白底更接近读论文的观感，也方便投屏和截图。**不要显示「主播A / 主播B」标签** ——
   谁在说话听声音就知道，画面上多一行标签既分散注意力又占掉字幕空间。
+- **生成的配图也必须是白底**（信息图 + 视频里的段落示意图 + 本地兜底图），
+  三处共用 `illustration.ILLUSTRATION_PALETTE`。理由：这些图最后要**贴进白底的视频画面**，
+  自己做成深色就是一大块黑斑 —— 正好是「白底论文图贴在深色画布上」那个问题的镜像。
+  实测同一条视频里一半白底一半深色，比全深色还难看。
+  **白底要铺满整张画布、不要加 `rx` 圆角** —— 圆角会切出透明角，落到深色预览底上就露黑边
+  （测试里会真的渲染出来采样四角像素，光看字符串不够）。
+- **双语集每个语言各有一份信息图和一组段落配图**。改配色、重画、清理时都必须
+  **逐语言版本**处理：只处理主语言的话，`.en` 那份会原地留着旧样式。
+- **「重画段落配图」要沿用原有的分组与文件名**。`video.scenes` 记着「第几段用哪张图」、
+  `video.assets` 记着 id → 路径，照着反推出每组包含哪些段落，再用**同一个 stem** 重画 ——
+  覆盖同一个文件，画面分配一个字都不变，只是图从深色变白底。
+  这样就不必重新问模型选图（那会导致「我只想换个配色，怎么画面全变了」）。
+- **删单集要删干净，而且必须覆盖每个语言版本**。只清顶层字段会漏掉非主语言那份
+  （信息图 / 音频 / 视频），`data/video-frames/{id}/` 整个渲染中间目录也没人管 ——
+  实测库里只剩 4 集，磁盘上却躺着 14 个已删单集的目录 + 28 个孤儿文件（50MB）。
+  这些文件不在数据库里，只能按目录名 / 文件名前缀（= episode id）去找。
+- **老数据没有真正的 `versions`，就不要给它写一个残缺的 `versions`**。
+  顶层字段兜底的前提是 `versions` **为空**；写进一个只有 `language/analysis/illustration`
+  的残缺版本，`resolve_version()` 会认它，于是顶层那份 `timings`/`video_path` 再也取不到，
+  表现为「缺少脚本或时间轴，无法重新合成」。实测被这个坑到过一次（维护脚本写的）。
 - **视频是把配图烘焙进 MP4 的**，所以人工校正配图后，已生成的视频里还是旧画面。
   为此存了 `video.scenes`（每段用哪张图）、`video.assets`（id→路径）、
   `video.asset_versions`（合成时的素材版本号）。前两个让 `POST /video/rebuild`
@@ -291,7 +311,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            401 项，改完必须全绿
+backend/tests/            406 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

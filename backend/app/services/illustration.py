@@ -82,13 +82,44 @@ class Illustration:
 # Prompt
 # --------------------------------------------------------------------------
 
+# 配图统一**白底**，和视频画面、详情页正文一个底色。三个理由：
+#
+# 1) 视频画面是白底（论文配图本身多是白底图表，深色画布会把它们衬得像贴纸）。
+#    信息图与段落示意图最后是要**贴进那个白底画面**的 —— 自己做成深色，
+#    在视频里就是一大块黑斑，正好是「白底论文图贴在深色画布上」那个问题的镜像。
+# 2) 视频层对所有图都套了一圈浅灰细边框（`video.FRAME_STROKE`），白底图不会糊成一片。
+# 3) 读论文本来就是白纸。生成的信息图摆在白底上更像「论文里的一页」。
+#
+# 这套色值给模型当具体参考用（prompt 里只讲「浅色」它仍会飘），
+# fallback_svg 也直接用同一套，保证「模型成功」与「退回本地兜底」两种结果观感一致。
+ILLUSTRATION_PALETTE = {
+    "bg": "#ffffff",
+    "title": "#1a2233",
+    "body": "#33415a",
+    "muted": "#6b7a8f",
+    "card": "#f4f7fa",
+    "card_border": "#dde5ee",
+    "accent": "#2f6fb5",
+    "accent_soft": "#e8f0fa",
+    "warn": "#c8871f",
+}
+
+_PALETTE_FOR_PROMPT = (
+    "白底（#ffffff），正文文字深灰蓝（#1a2233 / #33415a），"
+    "卡片浅灰（#f4f7fa）配浅灰描边（#dde5ee），强调色蓝（#2f6fb5）与琥珀（#c8871f），"
+    "次要说明用中灰（#6b7a8f）"
+)
+
 ILLUSTRATION_SYSTEM = """你是信息图设计师，专门把论文的核心机制画成一张 SVG 信息图。\
-你的作品风格克制、学术、深色底，信息密度高但不拥挤。
+你的作品风格克制、学术、**白底**，信息密度高但不拥挤。
 
 【输出要求】
 - 只输出一个完整的 `<svg>` 元素，不要 markdown 代码围栏，不要任何解释文字。
 - 必须有 `xmlns="http://www.w3.org/2000/svg"` 和 `viewBox="0 0 1280 720"`。
-- 画布 1280x720，深色底（例如 #101a2b），四角圆润。
+- 画布 1280x720，**白底**：整张图的最底层必须是一个铺满画布的 `<rect fill="#ffffff"/>`
+  （不要给这个底加 rx 圆角 —— 圆角会切出透明角，落到深色预览底上就露黑边）。
+  配色用：""" + _PALETTE_FOR_PROMPT + """。
+  **不要用深色背景**（深色画布贴在白底视频里就是一块黑斑），也不要渐变底。
 - 所有样式写成**元素属性**（fill / stroke / font-size / font-family / opacity），\
 不要用 <style> 标签，不要用 class。
 - 字体统一写 `font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"`。
@@ -381,16 +412,17 @@ def fallback_svg(
     innovations = [str(x) for x in (analysis.get("innovations") or [])][:3]
     keywords = [str(k) for k in (meta.get("keywords") or [])][:4]
 
+    p = ILLUSTRATION_PALETTE
     parts: list[str] = [
         f'<svg xmlns="{SVG_NS}" viewBox="0 0 {CANVAS_W} {CANVAS_H}" '
         f'width="{CANVAS_W}" height="{CANVAS_H}">',
-        "<defs>",
-        '<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">',
-        '<stop offset="0%" stop-color="#0e1729"/><stop offset="100%" stop-color="#1d3a63"/>',
-        "</linearGradient>",
-        "</defs>",
-        f'<rect width="{CANVAS_W}" height="{CANVAS_H}" fill="url(#bg)" rx="24"/>',
-        '<rect x="48" y="48" width="6" height="120" fill="#5b9bd5" rx="3"/>',
+        # 白底铺满整张画布（**不切圆角**）：留透明角的话，放在深色预览底上
+        # 四角会露黑边，而且「白底」这件事就变得不彻底。圆角交给外面的容器去做
+        # （详情页的 .illus__stage 有 border-radius + overflow:hidden，视频层也自己套了框）。
+        f'<rect width="{CANVAS_W}" height="{CANVAS_H}" fill="{p["bg"]}"/>',
+        f'<rect x="1" y="1" width="{CANVAS_W - 2}" height="{CANVAS_H - 2}" '
+        f'fill="none" stroke="{p["card_border"]}" stroke-width="2"/>',
+        f'<rect x="48" y="48" width="6" height="120" fill="{p["accent"]}" rx="3"/>',
     ]
 
     font = (
@@ -403,12 +435,12 @@ def fallback_svg(
     for line in _wrap_cjk(title, 22, 3):
         parts.append(
             f'<text x="76" y="{y}" font-family="{font}" font-size="42" '
-            f'fill="#eaf1ff" font-weight="600">{html.escape(line)}</text>'
+            f'fill="{p["title"]}" font-weight="600">{html.escape(line)}</text>'
         )
         y += 54
     parts.append(
         f'<text x="76" y="{y + 6}" font-family="{font}" font-size="22" '
-        f'fill="#8fb3e0">{html.escape(subtitle)}</text>'
+        f'fill="{p["muted"]}">{html.escape(subtitle)}</text>'
     )
 
     # 创新点卡片
@@ -418,20 +450,20 @@ def fallback_svg(
         height = 74
         parts.append(
             f'<rect x="76" y="{card_y}" width="1128" height="{height}" rx="12" '
-            f'fill="#16243d" stroke="#2f4d7a" stroke-width="1.5"/>'
+            f'fill="{p["card"]}" stroke="{p["card_border"]}" stroke-width="1.5"/>'
         )
         parts.append(
-            f'<circle cx="112" cy="{card_y + height // 2}" r="15" fill="#5b9bd5"/>'
+            f'<circle cx="112" cy="{card_y + height // 2}" r="15" fill="{p["accent"]}"/>'
         )
         parts.append(
             f'<text x="112" y="{card_y + height // 2 + 7}" text-anchor="middle" '
-            f'font-family="{font}" font-size="19" fill="#0e1729" font-weight="700">{index + 1}</text>'
+            f'font-family="{font}" font-size="19" fill="#ffffff" font-weight="700">{index + 1}</text>'
         )
         ly = card_y + 30
         for line in lines:
             parts.append(
                 f'<text x="146" y="{ly}" font-family="{font}" font-size="21" '
-                f'fill="#d6e4f7">{html.escape(line)}</text>'
+                f'fill="{p["body"]}">{html.escape(line)}</text>'
             )
             ly += 28
         card_y += height + 14
@@ -444,17 +476,17 @@ def fallback_svg(
                 break
             parts.append(
                 f'<rect x="{kx}" y="636" width="{width}" height="38" rx="19" '
-                f'fill="#1f3a63" stroke="#3d6ca6" stroke-width="1"/>'
+                f'fill="{p["accent_soft"]}" stroke="{p["card_border"]}" stroke-width="1"/>'
             )
             parts.append(
                 f'<text x="{kx + width // 2}" y="661" text-anchor="middle" '
-                f'font-family="{font}" font-size="17" fill="#9ec4ea">{html.escape(word)}</text>'
+                f'font-family="{font}" font-size="17" fill="{p["accent"]}">{html.escape(word)}</text>'
             )
             kx += width + 12
 
     parts.append(
         f'<text x="{CANVAS_W - 48}" y="664" text-anchor="end" font-family="{font}" '
-        f'font-size="17" fill="#5d7ba3">{footer}</text>'
+        f'font-size="17" fill="{p["muted"]}">{footer}</text>'
     )
     parts.append("</svg>")
     return "".join(parts)
@@ -542,7 +574,10 @@ TOPIC_SYSTEM = """你在为学术播客的视频画一张示意图，画的是�
 【输出要求】
 - 只输出一个完整的 `<svg>` 元素，不要 markdown 围栏，不要任何解释文字。
 - 必须带 `xmlns="http://www.w3.org/2000/svg"` 和 `viewBox="0 0 1280 720"`。
-- 深色底（例如 #101a2b），四角圆润，风格克制、学术。
+- **白底**：最底层是一个铺满画布的 `<rect fill="#ffffff"/>`（**不加 rx 圆角**，
+  否则会切出透明角），风格克制、学术。
+  配色用：""" + _PALETTE_FOR_PROMPT + """。
+  **不要用深色背景** —— 这张图会贴进白底的视频画面里。
 - 样式写成**元素属性**（fill / stroke / font-size / font-family），不要 <style>、不要 class。
 - 字体统一 `font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"`。
 - 文字用简体中文，字号：标题 38-46，正文 20-26，注释 16-18。

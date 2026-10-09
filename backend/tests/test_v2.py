@@ -904,3 +904,68 @@ class TestGenerationQuota:
             pass
         with as_user(tmp_path) as (anon, _):
             assert anon.get("/api/usage").status_code == 401
+
+
+class TestDeleteCleansEverything:
+    """删单集必须把产物删干净。
+
+    踩过：删单集只清了**顶层字段**指向的文件 ——
+      - 双语集的**非主语言**那一份（信息图 / 音频 / 视频）原地留下；
+      - `video-frames/{id}/` 整个渲染中间目录没人管（每帧 SVG + 段落配图）。
+    实测库里只剩 4 集，`data/video-frames/` 下却躺着十几个已删单集的目录。
+    """
+
+    def test_delete_removes_all_language_assets_and_workdir(self, tmp_path):
+        """造一个假的双语集（产物文件自己写），删掉后所有文件与工作目录都该消失。"""
+        from app.services.video import compose_video  # noqa: F401  (确保模块可导入)
+
+        app = make_app(tmp_path)
+        settings = app.state.settings if False else None  # noqa: F841
+
+        with TestClient(app) as client:
+            register(client, "guo")
+            episode = make_episode(client)
+            episode_id = episode["id"]
+
+            data_dir = tmp_path / "data"
+            work_dir = data_dir / "video-frames" / episode_id
+            work_dir.mkdir(parents=True, exist_ok=True)
+            frame = work_dir / "frame-000.svg"
+            frame.write_text("<svg/>", encoding="utf-8")
+
+            # 造一份非主语言的产物，模拟双语集
+            extra_illustration = data_dir / "illustrations" / f"{episode_id}.en.png"
+            extra_illustration.parent.mkdir(parents=True, exist_ok=True)
+            extra_illustration.write_bytes(b"png")
+            extra_audio = data_dir / "audio" / f"{episode_id}.en.mp3"
+            extra_audio.parent.mkdir(parents=True, exist_ok=True)
+            extra_audio.write_bytes(b"mp3")
+            topic = work_dir / "topics" / f"{episode_id}.en-topic1.png"
+            topic.parent.mkdir(parents=True, exist_ok=True)
+            topic.write_bytes(b"png")
+
+            db = client.app.state.db
+            record = db.get_episode(episode_id)
+            versions = dict(record.get("versions") or {})
+            versions["en"] = {
+                "language": "en",
+                "audio_path": str(extra_audio),
+                "illustration": {
+                    "png_path": str(extra_illustration),
+                    "svg_path": None,
+                    "width": 1,
+                    "height": 1,
+                    "source": "model",
+                },
+                "video": {"assets": {"topic1": str(topic)}},
+            }
+            db.update_episode(episode_id, versions=versions)
+
+            assert extra_audio.exists() and extra_illustration.exists() and work_dir.exists()
+
+            assert client.delete(f"/api/episodes/{episode_id}").status_code == 204
+
+            assert not extra_audio.exists(), "非主语言的音频没删掉"
+            assert not extra_illustration.exists(), "非主语言的信息图没删掉"
+            assert not topic.exists(), "视频用的段落配图没删掉"
+            assert not work_dir.exists(), "video-frames 工作目录没删掉"

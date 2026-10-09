@@ -559,3 +559,71 @@ class TestTextDirection:
         assert len(figures) == 1
         pix = pymupdf.Pixmap(figures[0].path)
         assert pix.width > pix.height, "无文字的图不该被旋转"
+
+
+class TestIllustrationIsWhite:
+    """配图统一白底（与视频画面、详情页正文一个底色）。
+
+    以前是深色底（#101a2b 之类）。问题在于：信息图和段落示意图最后是要**贴进
+    白底的视频画面**的，自己做成深色就是一大块黑斑 —— 正好是「白底论文图贴在
+    深色画布上」那个问题的镜像。
+    """
+
+    ANALYSIS = {"innovations": ["创新点一：把串行改成并行", "创新点二：多头表示"]}
+    META = {"title": "Attention Is All You Need", "year": 2017, "keywords": ["Transformer"]}
+
+    # 老调色板里的深色值，出现任何一个都说明没改干净
+    DARK_LEGACY = ("#0e1729", "#101a2b", "#1d3a63", "#16243d", "#1f3a63")
+
+    def test_fallback_svg_has_no_dark_canvas(self):
+        svg = fallback_svg(self.ANALYSIS, self.META)
+        lowered = svg.lower()
+        for colour in self.DARK_LEGACY:
+            assert colour not in lowered, f"兜底图里还有深色 {colour}"
+
+    def test_fallback_svg_actually_renders_white(self, tmp_path):
+        """光看字符串不够 —— 得真渲染出来，看四角到底是不是白的。
+
+        用 pymupdf 读像素：项目已经依赖它，而本环境没有 Pillow
+        （`tests/test_video.py` 也是这么采样画面像素的）。
+        """
+        import pymupdf
+
+        svg = sanitize_svg(fallback_svg(self.ANALYSIS, self.META))
+        path, _, _ = rasterize_svg(svg, tmp_path / "white.png")
+
+        pix = pymupdf.Pixmap(str(path))
+        channels, width, height, samples = pix.n, pix.width, pix.height, pix.samples
+
+        def at(x: int, y: int) -> tuple[int, int, int]:
+            i = (y * width + x) * channels
+            return (samples[i], samples[i + 1], samples[i + 2])
+
+        for x, y in ((6, 6), (width - 7, 6), (6, height - 7), (width - 7, height - 7)):
+            r, g, b = at(x, y)
+            assert (r + g + b) / 3 > 240, f"({x},{y}) 不是白底：{(r, g, b)}"
+
+        # 中段也该是浅色（卡片是 #f4f7fa），不能只有四角白、中间一块深色
+        r, g, b = at(width // 2, height // 2)
+        assert (r + g + b) / 3 > 200, f"画面中段过了深色：{(r, g, b)}"
+
+    def test_prompts_ask_for_white_not_dark(self):
+        """prompt 里必须明确要求白底，并且**不能再出现「深色底」这种说法**。"""
+        from app.services.illustration import ILLUSTRATION_SYSTEM, TOPIC_SYSTEM
+
+        for name, prompt in (("信息图", ILLUSTRATION_SYSTEM), ("段落配图", TOPIC_SYSTEM)):
+            assert "白底" in prompt, f"{name} prompt 没说白底"
+            assert "#ffffff" in prompt, f"{name} prompt 没给具体白色值"
+            assert "不要用深色背景" in prompt, f"{name} prompt 没明确禁止深色底"
+            for colour in self.DARK_LEGACY:
+                assert colour not in prompt, f"{name} prompt 里还留着深色 {colour}"
+
+    def test_both_paths_share_one_palette(self):
+        """「模型画成功」和「退回本地兜底」两种结果必须同一套色 ——
+        否则同一期播客里会一半白底一半深色，比全深色还难看。"""
+        from app.services.illustration import ILLUSTRATION_PALETTE
+
+        assert ILLUSTRATION_PALETTE["bg"] == "#ffffff"
+        svg = fallback_svg(self.ANALYSIS, self.META)
+        assert ILLUSTRATION_PALETTE["bg"] in svg
+        assert ILLUSTRATION_PALETTE["card_border"] in svg
