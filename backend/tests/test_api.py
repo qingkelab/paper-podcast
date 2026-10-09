@@ -359,6 +359,81 @@ class TestManagement:
     def test_list_rejects_unknown_status(self, client):
         assert client.get("/api/episodes", params={"status": "乱写"}).status_code == 400
 
+    def test_status_running_is_an_aggregate(self, client):
+        """`status=running` = 所有非终态。
+
+        用户脑子里的分类是「在跑的 / 完成的 / 失败的」，所以「看看还在跑什么」
+        必须能一次筛出来，而不是让人点五个状态各看一遍。
+        """
+        done = create_text_episode(client, title="已经跑完的那一篇")
+        wait_for_completion(client, done["id"])
+
+        running = client.get("/api/episodes", params={"status": "running"}).json()
+        # Mock 流水线跑得很快，这里不断言「一定有在跑的」，
+        # 只断言**它绝不含终态**，且各终态筛选与它互补。
+        ids = {item["id"] for item in running["items"]}
+        assert done["id"] not in ids
+        for item in running["items"]:
+            assert item["status"] not in ("completed", "failed")
+
+        completed = client.get("/api/episodes", params={"status": "completed"}).json()
+        failed = client.get("/api/episodes", params={"status": "failed"}).json()
+        all_ids = {item["id"] for item in client.get("/api/episodes", params={"limit": 100}).json()["items"]}
+        assert ids | {i["id"] for i in completed["items"]} | {i["id"] for i in failed["items"]} == all_ids
+
+
+        """未知排序要 400。
+
+        不能静默退回默认排序 —— 那样前端「按标题排」写错了也只是顺序没变，
+        用户和我们都很难发现。
+        """
+        response = client.get("/api/episodes", params={"sort": "price_asc"})
+        assert response.status_code == 400
+        assert "未知排序" in response.json()["detail"]
+        # 提示里要带上可选值，省一次翻文档
+        assert "created_desc" in response.json()["detail"]
+
+    def test_sort_orders_and_paginates_stably(self, client):
+        """五种排序都要真的改变顺序，且翻页不重不漏。
+
+        翻页那条是关键：批量导入时几集常常同一秒落库，
+        没有稳定的次级排序键就会出现「第 1 页和第 2 页都有同一条」。
+        """
+        titles = ["Charlie", "alpha", "Bravo"]
+        created = [create_text_episode(client, title=name) for name in titles]
+        for episode in created:
+            wait_for_completion(client, episode["id"])
+
+        def listed(sort: str, **extra) -> list[str]:
+            params = {"sort": sort, "limit": 100, **extra}
+            body = client.get("/api/episodes", params=params).json()
+            return [item["title"] for item in body["items"]]
+
+        default_order = listed("created_desc")
+        assert default_order == list(reversed(titles)), "默认仍是新的在前"
+        assert listed("created_asc") == titles
+        # NOCASE：小写 alpha 要排在大写 Bravo 前面，而不是被 ASCII 码挤到最后
+        assert listed("title_asc") == ["alpha", "Bravo", "Charlie"]
+        assert set(listed("updated_desc")) == set(titles)
+
+        # 时长倒序：本用例里三集时长可能相同，只要求「有音频的排在没音频的前面」
+        durations = client.get("/api/episodes", params={"sort": "duration_desc"}).json()["items"]
+        seen_null = False
+        for item in durations:
+            if item["audio_duration_sec"] is None:
+                seen_null = True
+            else:
+                assert not seen_null, "有音频的条目排到了没有音频的后面"
+
+        # 翻页：两次 limit=2 拿到的 id 不重复，合起来正好是全集（按 title_asc 的稳定序）
+        first = client.get("/api/episodes", params={"sort": "title_asc", "limit": 2, "offset": 0}).json()
+        second = client.get("/api/episodes", params={"sort": "title_asc", "limit": 2, "offset": 2}).json()
+        ids = [item["id"] for item in first["items"] + second["items"]]
+        assert len(ids) == len(set(ids)), "翻页出现了重复条目"
+        assert ids == [item["id"] for item in client.get(
+            "/api/episodes", params={"sort": "title_asc", "limit": 100}
+        ).json()["items"]]
+
     def test_detail_returns_large_fields(self, client):
         created = create_text_episode(client)
         wait_for_completion(client, created["id"])

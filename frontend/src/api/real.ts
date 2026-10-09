@@ -199,6 +199,7 @@ export function listEpisodes(params: ListEpisodesParams = {}): Promise<ListEpiso
   query.set('offset', String(params.offset ?? 0))
   if (params.status) query.set('status', params.status)
   if (params.q) query.set('q', params.q)
+  if (params.sort) query.set('sort', params.sort)
   return request<ListEpisodesResult>(`/episodes?${query.toString()}`)
 }
 

@@ -259,7 +259,7 @@ onMounted(() => {
 
       <div v-else class="episode-grid">
         <div v-for="episode in episodes" :key="episode.id" class="album-episode">
-          <EpisodeCard :episode="episode" />
+          <EpisodeCard :episode="episode" :show-album-action="false" />
           <div class="album-episode__bar">
             <span class="section__hint">属于本专辑</span>
             <span class="spacer" />

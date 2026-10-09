@@ -17,7 +17,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .. import auth as auth_lib
 from ..config import Settings
-from ..db import Database
+from ..db import DEFAULT_EPISODE_SORT, EPISODE_ORDER, RUNNING_STATUS, Database
 from ..models import (
     Album,
     AlbumAssignRequest,
@@ -1502,14 +1502,24 @@ async def list_episodes(
     q: str | None = Query(None),
     album: str | None = Query(None),
     album_id: str | None = Query(None),
+    sort: str = Query(DEFAULT_EPISODE_SORT),
 ):
     """**只返回自己的单集**。开放模式下没有 user，返回全部（那时也没别人）。
 
     `album=` 传专辑 id 只看那一辑；传 `none` 看没归辑的。
+    `status=running` 是伪状态：所有**还没跑完的**（排队/解析/解读/脚本/合成）。
+    `sort=` 见 `db.EPISODE_ORDER` 的白名单；未知取值直接 400，
+    不静默退回默认排序 —— 前端写错了排序应当场知道，
+    而不是变成「点了按标题排，顺序没变」这种要盯半天才发现的问题。
     """
     valid_status = {"queued", "parsing", "analyzing", "scripting", "synthesizing", "completed", "failed"}
-    if status and status not in valid_status:
+    if status and status not in valid_status and status != RUNNING_STATUS:
         raise HTTPException(status_code=400, detail=f"未知状态：{status}")
+    if sort not in EPISODE_ORDER:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知排序：{sort}（可选：{', '.join(EPISODE_ORDER)}）",
+        )
 
     user = auth_lib.user_or_401(request)
     wants_album = album_id or album
@@ -1527,6 +1537,7 @@ async def list_episodes(
         user_id=user["id"] if user else None,
         album_id=None if wants_album in (None, "none") else wants_album,
         unassigned_only=wants_album == "none",
+        sort=sort,
     )
     return {"items": [to_episode(r, include_large=False) for r in records], "total": total}
 

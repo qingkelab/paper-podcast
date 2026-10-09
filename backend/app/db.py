@@ -14,6 +14,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# 列表排序（契约 §2.5 `sort` 参数）
+# ---------------------------------------------------------------------------
+#
+# 值是**直接拼进 SQL 的**，所以这里必须是一张封闭的白名单：新加排序方式时
+# 只能往这张表里加，绝不允许把请求里的字符串直接交给 SQL。
+#
+# 每一档都补一个 `rowid` 作为最后的 tie-breaker：同一秒里建的两集
+# （批量导入时很常见）若没有稳定的次级键，翻页会出现「同一条出现两次、
+# 另一条再也不出现」的经典分页错位。
+EPISODE_ORDER: dict[str, str] = {
+    "created_desc": "created_at DESC, rowid DESC",
+    "created_asc": "created_at ASC, rowid ASC",
+    "updated_desc": "updated_at DESC, rowid DESC",
+    # 标题按中文/英文混排，用 NOCASE 让英文大小写不敏感；CJK 没有大小写概念，
+    # 不受影响。不用 COLLATE 的话「Apple」会排到所有小写字母后面。
+    "title_asc": "title COLLATE NOCASE ASC, rowid DESC",
+    # `IS NULL` 参与排序：SQLite 里 NULL 默认排在最小值位置，
+    # 直接 DESC 会让「没有音频的失败/进行中任务」全冒到最前面。
+    "duration_desc": "audio_duration_sec IS NULL, audio_duration_sec DESC, rowid DESC",
+}
+
+DEFAULT_EPISODE_SORT = "created_desc"
+
+# 终态 / 伪状态：契约 §2.5 里 `status=running` 表示「还没跑完的那些」。
+# 把它放在存储层是因为「哪些算跑完」是数据定义，搜索条件、统计、清理
+# 迟早都要用同一份定义，写两遍就会有一处忘了改。
+TERMINAL_STATUSES = frozenset({"completed", "failed"})
+RUNNING_STATUS = "running"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS episodes (
     id                 TEXT PRIMARY KEY,
@@ -260,10 +290,17 @@ class Database:
         user_id: str | None = None,
         album_id: str | None = None,
         unassigned_only: bool = False,
+        sort: str = DEFAULT_EPISODE_SORT,
     ) -> tuple[list[dict[str, Any]], int]:
         where: list[str] = []
         params: list[Any] = []
-        if status:
+        if status == RUNNING_STATUS:
+            # 聚合筛选：用户脑子里的分类是「在跑的 / 完成的 / 失败的」，
+            # 不是「正在合成音频的」。让他为了「看看还在跑什么」去点五个
+            # 状态各看一遍，是把这个心智负担推给了用户。
+            where.append(f"status NOT IN ({', '.join('?' * len(TERMINAL_STATUSES))})")
+            params.extend(sorted(TERMINAL_STATUSES))
+        elif status:
             where.append("status = ?")
             params.append(status)
         if q:
@@ -285,7 +322,7 @@ class Database:
         total = int(total_row["n"]) if total_row else 0
 
         rows = self._query(
-            f"SELECT * FROM episodes {clause} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM episodes {clause} ORDER BY {EPISODE_ORDER[sort]} LIMIT ? OFFSET ?",
             (*params, limit, offset),
         )
         return [self._row_to_record(r) for r in rows], total

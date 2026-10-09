@@ -221,6 +221,10 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   前端轮询拿不到响应，看起来像服务挂了。
 - **精简脚本时要检查实际缩减量**：只判「比原来短」不够，
   实测出现过 1175 → 1171 这种「改了等于没改」，白花一次调用。要求至少减 3%。
+- **本地那个常驻 uvicorn 没有 `--reload`**。改完后端不重启就会拿旧行为去判断前端对不对 ——
+  实测白查一轮：前端 `sort=` 参数明明发出去了、顺序就是不变，看着像前端漏传，
+  其实是服务端还在跑改动前的代码（`curl "/api/episodes?sort=nope"` 返回 200 而不是 400，
+  一眼就能确认）。**查接口行为前先看一眼进程是什么时候起的。**
 
 ### 双语（zh + en）
 
@@ -309,6 +313,33 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **批量生成要「单项失败不影响其他项」**。一个链接写错就让整批白等，比慢一点糟糕得多。
   抓不到的进 `failed` 并给出原因，能用的照常入队。
 
+### 播客库的展示
+
+- **标题必须截断**。实测没截断时一条 100 字符的论文标题在 340px 宽的卡片里排到 **8 行**，
+  卡片从 318px 涨到 401px，三张卡片挤在一屏里还长得一模一样 ——
+  列表页要的是「扫一眼找得到」，不是「在卡片里读完标题」。
+  卡片 clamp 2 行、**列表行 clamp 1 行**（多一行就多 21px，那就不叫列表了），
+  同时留 `title` 属性供悬停看全。
+- **`source_ref` 不许原样铺到界面上**。PDF 上传时后端存的是**磁盘绝对路径**
+  （`.../data/uploads/{id}.pdf`），链接导入时是一整条 URL。界面上要么变成
+  `arXiv:2609.38169` / 域名，要么不显示 —— 服务器路径既没信息量又泄漏目录结构。
+  转换逻辑统一在 `utils/episodeDisplay.ts::sourceRefText()`。
+- **卡片和列表行共用派生文案**（`utils/episodeDisplay.ts`）。两处各写一遍必然漂移：
+  会出现「卡片上是 arXiv 号、列表里是长 URL」这种不一致，而改的人以为改全了。
+- **已完成不挂状态角标**。库里绝大多数是「已完成」，每条都喊一遍等于没有信息；
+  只有进行中 / 失败才需要一眼看见。
+- **视图模式与排序记在 localStorage**（`utils/libraryView.ts`）。这是「我看东西的习惯」
+  而不是数据，存后端要多一张表 + 一个接口；不存的话每次进来都要重新点一遍。
+  读出来的值要**校验后再用** —— 认不出的排序串发给后端就是一个 400。
+- **改筛选 / 搜索 / 排序都要回到第一页**。停在第二页看新条件的结果，用户会以为数据丢了。
+- **`sort` 是封闭白名单**（`db.EPISODE_ORDER`），未知取值 400 而不是静默退回默认排序 ——
+  否则前端把 `sort` 拼错时表现为「点了排序、顺序没变」，要盯很久才发现。
+  **每一档都必须带稳定的次级排序键**（`rowid`）：批量导入时几集常落在同一秒，
+  没有次级键的排序在翻页时会出现「同一条出现两次、另一条再也不出现」。
+- **`status=running` 是伪状态**（所有非终态）。用户脑子里的分类是
+  「在跑的 / 完成的 / 失败的」，不该让他点五个状态各看一遍。
+  「哪些算跑完」在后端只有一份定义（`db.TERMINAL_STATUSES`）。
+
 ## 结构
 
 ```
@@ -317,7 +348,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            406 项，改完必须全绿
+backend/tests/            408 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

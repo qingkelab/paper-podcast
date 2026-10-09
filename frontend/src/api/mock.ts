@@ -30,6 +30,7 @@ import type {
   EpisodeOptionsInput,
   EpisodeStatus,
   EpisodeSummary,
+  EpisodeSort,
   EpisodeVersion,
   FigureRotateDirection,
   HealthPayload,
@@ -2024,13 +2025,46 @@ export async function listEpisodes(params: ListEpisodesParams = {}): Promise<Lis
   const keyword = params.q?.trim().toLowerCase() ?? ''
 
   let items = episodes.slice()
-  if (params.status) items = items.filter((episode) => episode.status === params.status)
+  if (params.status === 'running') {
+    // 伪状态，与真后端一致（契约 §2.5）：所有非终态
+    items = items.filter((episode) => episode.status !== 'completed' && episode.status !== 'failed')
+  } else if (params.status) {
+    items = items.filter((episode) => episode.status === params.status)
+  }
   if (keyword) items = items.filter((episode) => episode.title.toLowerCase().includes(keyword))
-  items.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+  items.sort(mockComparator(params.sort))
 
   const total = items.length
   const page = items.slice(offset, offset + limit).map(toSummary)
   return { items: page, total }
+}
+
+/**
+ * 演示版的排序：必须和真后端逐档对齐（契约 §2.5），否则演示页
+ * 「按标题排」和真实环境排出来的顺序不一样，演示就失去意义了。
+ */
+function mockComparator(sort: EpisodeSort | undefined): (a: Episode, b: Episode) => number {
+  // 后端用 rowid 兜底保证稳定序；演示版用 id 当那个「稳定的次级键」
+  const tie = (a: Episode, b: Episode) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0)
+  switch (sort) {
+    case 'created_asc':
+      return (a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || -tie(a, b)
+    case 'updated_desc':
+      return (a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || tie(a, b)
+    case 'title_asc':
+      return (a, b) => a.title.localeCompare(b.title, 'en', { sensitivity: 'base' }) || tie(a, b)
+    case 'duration_desc':
+      return (a, b) => {
+        const left = a.audio_duration_sec
+        const right = b.audio_duration_sec
+        if (left === null && right === null) return tie(a, b)
+        if (left === null) return 1
+        if (right === null) return -1
+        return right - left || tie(a, b)
+      }
+    default:
+      return (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || tie(a, b)
+  }
 }
 
 export async function getEpisode(id: string): Promise<Episode> {

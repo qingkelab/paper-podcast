@@ -1339,8 +1339,9 @@ pre {
 .episode-card {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 22px 24px;
+  gap: 12px;
+  /* 22/24 的留白配上被截断的标题会显得空，收到 18/20 后一屏能多露出一行卡片 */
+  padding: 18px 20px;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.01));
@@ -2103,7 +2104,9 @@ pre {
 
 .episode-card__thumb {
   flex-shrink: 0;
-  width: 76px;
+  /* 76px 时论文首页缩到只剩一团灰，标题/作者全看不清；
+     88px 是「看得出这是哪篇论文」的下限，再大就挤掉卡片里的元信息了 */
+  width: 88px;
   aspect-ratio: 3 / 4;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
@@ -2136,10 +2139,320 @@ pre {
 }
 
 .skeleton--thumb {
-  width: 76px;
-  height: 101px;
+  width: 88px;
+  height: 117px;
   flex-shrink: 0;
   border-radius: var(--radius-sm);
+}
+
+/* ---------------------------------------------------------------- 播客库：工具栏与卡片 */
+
+/*
+ * 标题必须**截断**。
+ * 实测没截断时一条 100 字符的论文标题在 340px 宽的卡片里排到 8 行，
+ * 卡片高度从 250px 涨到 401px，三张卡片挤在一屏里还长得一模一样 ——
+ * 列表页要的是「扫一眼找得到」，不是「在卡片里读完标题」。
+ * 同时保留 `title` 属性，悬停能看全。
+ *
+ * 列表行只给**一行**：多一行就多 21px，那就失去「一屏看十几条」的意义了。
+ */
+.episode-card__title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.episode-row__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-bottom: 22px;
+}
+
+.library-head .page-title {
+  margin-bottom: 6px;
+}
+
+.library-head .page-subtitle {
+  margin: 0;
+}
+
+.library-head__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  margin-bottom: 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.toolbar__search {
+  position: relative;
+  flex: 1 1 240px;
+  min-width: 200px;
+}
+
+.toolbar__search .input {
+  padding-left: 34px;
+}
+
+.toolbar__search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  font-size: 15px;
+  pointer-events: none;
+}
+
+.toolbar__select {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.select--sm {
+  padding: 8px 30px 8px 12px;
+  font-size: 13.5px;
+}
+
+/* 关键词芯片也不能让长词把行撑开 */
+.chip--quiet {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 工具栏里的胶囊比设置页那几个小一号，免得一条工具栏就占掉半屏 */
+.toolbar .chip {
+  padding: 6px 13px;
+  font-size: 13px;
+}
+
+/* 只读关键词：比状态胶囊更轻，纯装饰性的信息提示 */
+.chip--quiet {
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-style: dashed;
+  cursor: default;
+  background: transparent;
+}
+
+.chip--quiet:hover {
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
+.episode-card__kicker {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.episode-card__when {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.episode-card__paper {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.episode-card__keywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.episode-card__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.episode-card__error,
+.episode-row__error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 正在生成的卡片给一点侧边提示，扫一眼就知道「哪几条在动」 */
+.episode-card.is-running {
+  border-color: rgba(211, 162, 74, 0.28);
+}
+
+/* ---------------------------------------------------------------- 播客库：列表视图 */
+
+.episode-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.episode-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  /* 列表视图要的是密度：一屏十几条，每条都得压扁 */
+  padding: 9px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.018);
+  transition: border-color 0.18s var(--ease), background 0.18s var(--ease);
+}
+
+.episode-row:hover {
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.episode-row.is-running {
+  border-color: rgba(211, 162, 74, 0.28);
+}
+
+.episode-row__thumb {
+  flex-shrink: 0;
+  width: 44px;
+  aspect-ratio: 3 / 4;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface-3);
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+}
+
+.episode-row__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top center;
+  display: block;
+}
+
+.episode-row__thumb.is-empty {
+  border-style: dashed;
+  border-color: var(--border-strong);
+  background: linear-gradient(160deg, var(--surface-3), var(--bg-soft));
+}
+
+.episode-row__thumb-glyph {
+  font-size: 15px;
+  color: var(--text-muted);
+  opacity: 0.55;
+  line-height: 1;
+}
+
+.episode-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.episode-row__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.episode-row__title {
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--text);
+  min-width: 0;
+}
+
+.episode-row__title:hover {
+  color: var(--accent-strong);
+}
+
+.episode-row__meta {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.episode-row__side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+}
+
+.episode-row__when {
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.episode-row__actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* 窄屏：列表行改成上下两段，操作按钮换行，不再挤成一条 */
+@media (max-width: 720px) {
+  .episode-row {
+    flex-wrap: wrap;
+  }
+
+  .episode-row__side {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .library-head__actions {
+    width: 100%;
+  }
+
+  .toolbar__search {
+    flex: 1 1 100%;
+  }
 }
 
 /* ---------------------------------------------------------------- 动画 */

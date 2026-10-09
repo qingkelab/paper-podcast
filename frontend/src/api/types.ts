@@ -239,11 +239,30 @@ export type EpisodeSummary = Omit<
   'analysis' | 'script' | 'figures' | 'illustration' | 'video' | 'versions'
 >
 
+/**
+ * 播客库的排序方式（契约 §2.5 `sort` 参数）。
+ * 后端是**封闭白名单**，传别的值会 400，所以这里也用联合类型把它钉住。
+ */
+export type EpisodeSort =
+  | 'created_desc'
+  | 'created_asc'
+  | 'updated_desc'
+  | 'title_asc'
+  | 'duration_desc'
+
+/**
+ * 列表筛选用的状态：7 个真实状态，外加伪状态 `running`（所有非终态）。
+ * 见契约 §2.5 —— 用户脑子里的分类是「在跑的 / 完成的 / 失败的」。
+ */
+export type EpisodeStatusFilter = EpisodeStatus | 'running'
+
 export interface ListEpisodesParams {
   limit?: number
   offset?: number
-  status?: EpisodeStatus
+  status?: EpisodeStatusFilter
   q?: string
+  /** 缺省时后端按 `created_desc` 排（新的在前） */
+  sort?: EpisodeSort
 }
 
 export interface ListEpisodesResult {

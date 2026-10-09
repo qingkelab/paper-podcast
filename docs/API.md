@@ -263,13 +263,29 @@ V2 起每集属于一个用户，并且可以对外分享。三个字段：
 
 ### `GET /api/episodes`
 
-查询参数：`limit`（默认 20，最大 100）、`offset`（默认 0）、`status`（可选）、`q`（可选，按标题模糊搜索）。
+查询参数：`limit`（默认 20，最大 100）、`offset`（默认 0）、`status`（可选）、`q`（可选，按标题模糊搜索）、
+`sort`（可选，默认 `created_desc`）。
 
 ```json
 { "items": [ /* Episode，省略 analysis/script */ ], "total": 42 }
 ```
 
-按 `created_at` 倒序。
+`status` 除 7 个真实状态外还接受一个**伪状态 `running`**：所有非终态
+（`queued` / `parsing` / `analyzing` / `scripting` / `synthesizing`）。
+用户脑子里的分类是「在跑的 / 完成的 / 失败的」，不该让他点五个状态各看一遍。
+
+`sort` 的取值是**封闭白名单**，传别的值一律 `400`（不静默退回默认排序）：
+
+| 取值 | 含义 |
+|---|---|
+| `created_desc` | 新建时间倒序（默认，新的在前） |
+| `created_asc` | 新建时间正序（老的在前） |
+| `updated_desc` | 最近更新在前（任务在跑时，跑得最勤的那集浮到最上面） |
+| `title_asc` | 标题字母序（大小写不敏感，`apple` 排在 `Banana` 前） |
+| `duration_desc` | 音频时长从长到短；**还没有音频的条目（进行中 / 失败）排在最后**，不会被 `NULL` 顶到最前 |
+
+每一档都带一个稳定的次级排序键（`rowid`）。这不是洁癖：批量导入时几集常常落在
+同一秒，没有次级键的排序在翻页时会出现「同一条出现两次、另一条再也不出现」。
 
 ### `GET /api/episodes/{id}`
 

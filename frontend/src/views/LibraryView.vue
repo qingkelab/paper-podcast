@@ -2,16 +2,41 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { deleteEpisode, errorMessage, listAlbums, listEpisodes, retryEpisode } from '../api'
-import type { Album, EpisodeStatus, EpisodeSummary } from '../api'
+import type { Album, EpisodeSummary } from '../api'
 import AccountPrompt from '../components/AccountPrompt.vue'
 import AlbumPickerDialog from '../components/AlbumPickerDialog.vue'
 import EpisodeCard from '../components/EpisodeCard.vue'
+import EpisodeRow from '../components/EpisodeRow.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { useSessionStore } from '../stores/session'
-import { FILTERABLE_STATUSES, STATUS_LABELS } from '../utils/stages'
+import {
+  LIBRARY_VIEWS,
+  SORT_OPTIONS,
+  readLibrarySort,
+  readLibraryView,
+  saveLibrarySort,
+  saveLibraryView,
+  type LibraryViewMode,
+} from '../utils/libraryView'
 
 const PAGE_SIZE = 12
 const AUTO_REFRESH_MS = 5000
+
+/**
+ * 状态筛选用**胶囊**而不是下拉框。
+ *
+ * 下拉框里排着 7 个状态，但用户实际只会问三个问题：还在跑的是哪些、
+ * 哪些已经好了、哪些挂了。「生成中」是后端支持的伪状态（契约 §2.5），
+ * 一次请求就能拿到，不必点五次。
+ */
+type StatusFilter = 'all' | 'running' | 'completed' | 'failed'
+
+const STATUS_FILTERS: ReadonlyArray<{ value: StatusFilter; label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: 'running', label: '生成中' },
+  { value: 'completed', label: '已完成' },
+  { value: 'failed', label: '失败' },
+]
 
 const session = useSessionStore()
 
@@ -23,7 +48,9 @@ const loadingMore = ref(false)
 const error = ref<string | null>(null)
 const notice = ref<string | null>(null)
 const keyword = ref('')
-const status = ref<EpisodeStatus | 'all'>('all')
+const status = ref<StatusFilter>('all')
+const sort = ref(readLibrarySort())
+const view = ref<LibraryViewMode>(readLibraryView())
 const confirmTarget = ref<EpisodeSummary | null>(null)
 const deleting = ref(false)
 const refreshing = ref(false)
@@ -89,6 +116,7 @@ const hasMore = computed(() => items.value.length < total.value)
 const hasActiveTask = computed(() =>
   items.value.some((episode) => episode.status !== 'completed' && episode.status !== 'failed'),
 )
+const hasFilter = computed(() => Boolean(keyword.value.trim()) || status.value !== 'all')
 
 function params(offset: number, limit: number) {
   return {
@@ -96,6 +124,7 @@ function params(offset: number, limit: number) {
     limit,
     status: status.value === 'all' ? undefined : status.value,
     q: keyword.value.trim() || undefined,
+    sort: sort.value,
   }
 }
 
@@ -193,12 +222,20 @@ function clearFilters(): void {
   status.value = 'all'
 }
 
-watch([keyword, status], () => {
+function pickView(next: LibraryViewMode): void {
+  view.value = next
+  saveLibraryView(next)
+}
+
+/** 筛选/搜索/排序任一变化都回到第一页 —— 停在第二页看新条件的结果会让人以为丢了数据 */
+watch([keyword, status, sort], () => {
   if (debounceTimer !== undefined) window.clearTimeout(debounceTimer)
   debounceTimer = window.setTimeout(() => {
     void fetchPage(0, PAGE_SIZE)
   }, 320)
 })
+
+watch(sort, (value) => saveLibrarySort(value))
 
 onMounted(() => {
   void fetchPage(0, PAGE_SIZE)
@@ -213,15 +250,15 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="container page">
-    <header class="row row--between" style="align-items: flex-end; margin-bottom: 26px">
+    <header class="library-head">
       <div>
         <p class="eyebrow">Library · 播客库</p>
-        <h1 class="page-title" style="margin-bottom: 6px">已生成的播客</h1>
-        <p class="page-subtitle" style="margin: 0">
+        <h1 class="page-title">已生成的播客</h1>
+        <p class="page-subtitle">
           共 {{ total }} 条<template v-if="items.length">，当前显示 {{ items.length }} 条</template>
         </p>
       </div>
-      <div class="row">
+      <div class="library-head__actions">
         <button type="button" class="btn btn--ghost" :disabled="refreshing" @click="manualRefresh">
           <span v-if="refreshing" class="spinner" aria-hidden="true" />
           {{ refreshing ? '刷新中…' : '刷新' }}
@@ -231,32 +268,62 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div class="card card--pad" style="margin-bottom: 24px">
-      <div class="form-grid">
-        <div class="field">
-          <label class="field__label" for="search">按标题搜索</label>
-          <input
-            id="search"
-            v-model="keyword"
-            class="input"
-            type="search"
-            placeholder="例如：Attention / LoRA"
-          />
-        </div>
-        <div class="field">
-          <label class="field__label" for="status-filter">按状态筛选</label>
-          <select id="status-filter" v-model="status" class="select">
-            <option value="all">全部状态</option>
-            <option v-for="item in FILTERABLE_STATUSES" :key="item" :value="item">
-              {{ STATUS_LABELS[item] }}
-            </option>
-          </select>
-        </div>
+    <!-- 工具栏：搜索 / 状态 / 排序 / 视图。四个都是「看的方式」，
+         所以收在一条里，不再占一张大卡片 -->
+    <div class="toolbar">
+      <div class="toolbar__search">
+        <span class="toolbar__search-icon" aria-hidden="true">⌕</span>
+        <input
+          id="search"
+          v-model="keyword"
+          class="input"
+          type="search"
+          placeholder="按标题搜索，例如：Attention / LoRA"
+          aria-label="按标题搜索"
+        />
       </div>
-      <p v-if="hasActiveTask" class="section__hint" style="margin: 14px 0 0">
-        有任务正在生成，页面每 5 秒会自动刷新一次状态。
-      </p>
+
+      <div class="chips" role="group" aria-label="按状态筛选">
+        <button
+          v-for="item in STATUS_FILTERS"
+          :key="item.value"
+          type="button"
+          class="chip"
+          :class="{ 'is-active': status === item.value }"
+          :aria-pressed="status === item.value"
+          @click="status = item.value"
+        >
+          {{ item.label }}
+        </button>
+      </div>
+
+      <label class="toolbar__select">
+        <span class="toolbar__select-label">排序</span>
+        <select v-model="sort" class="select select--sm" aria-label="排序方式">
+          <option v-for="option in SORT_OPTIONS" :key="option.value" :value="option.value">
+            {{ option.label }}
+          </option>
+        </select>
+      </label>
+
+      <div class="chips" role="group" aria-label="切换视图">
+        <button
+          v-for="option in LIBRARY_VIEWS"
+          :key="option.value"
+          type="button"
+          class="chip"
+          :class="{ 'is-active': view === option.value }"
+          :aria-pressed="view === option.value"
+          @click="pickView(option.value)"
+        >
+          {{ option.label }}
+        </button>
+      </div>
     </div>
+
+    <p v-if="hasActiveTask" class="section__hint" style="margin: -8px 0 20px">
+      有任务正在生成，页面每 5 秒会自动刷新一次状态。
+    </p>
 
     <AccountPrompt />
 
@@ -277,21 +344,22 @@ onBeforeUnmount(() => {
 
     <div v-if="loading" class="episode-grid">
       <div v-for="index in 3" :key="index" class="episode-card">
-        <div class="row" style="align-items: flex-start; flex-wrap: nowrap; gap: 14px">
+        <div class="episode-card__top">
           <div class="skeleton skeleton--thumb" />
           <div style="min-width: 0; flex: 1">
-            <div class="skeleton" style="width: 74%; height: 20px; margin-bottom: 10px" />
-            <div class="skeleton" style="width: 52%" />
+            <div class="skeleton" style="width: 34%; height: 14px; margin-bottom: 12px" />
+            <div class="skeleton" style="width: 88%; height: 20px; margin-bottom: 10px" />
+            <div class="skeleton" style="width: 62%" />
           </div>
         </div>
-        <div class="skeleton" style="width: 88%" />
+        <div class="skeleton" style="width: 78%" />
       </div>
     </div>
 
     <div v-else-if="!items.length" class="empty">
-      <template v-if="keyword || status !== 'all'">
+      <template v-if="hasFilter">
         <p class="empty__title">没有符合条件的播客</p>
-        <p style="margin-bottom: 18px">换个关键词，或把状态筛选改回「全部状态」。</p>
+        <p style="margin-bottom: 18px">换个关键词，或把状态筛选改回「全部」。</p>
         <button type="button" class="btn btn--ghost" @click="clearFilters">清除筛选</button>
       </template>
       <template v-else>
@@ -302,12 +370,24 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-else>
-      <div class="episode-grid">
+      <div v-if="view === 'grid'" class="episode-grid">
         <EpisodeCard
           v-for="(episode, index) in items"
           :key="episode.id"
           :episode="episode"
           :priority="index < 3"
+          :album-title="albumTitleFor(episode)"
+          @delete="onConfirmDelete"
+          @retry="onRetry"
+          @album="openAlbumPicker"
+        />
+      </div>
+
+      <div v-else class="episode-list">
+        <EpisodeRow
+          v-for="episode in items"
+          :key="episode.id"
+          :episode="episode"
           :album-title="albumTitleFor(episode)"
           @delete="onConfirmDelete"
           @retry="onRetry"
@@ -342,7 +422,7 @@ onBeforeUnmount(() => {
     <ConfirmDialog
       :open="confirmTarget !== null"
       title="删除这条播客？"
-      :text="`《${confirmTarget?.title ?? ''}》的脚本、解读与音频都会被一起删掉，且无法恢复。`"
+      :text="`《${confirmTarget?.title ?? ''}》的脚本、解读、音频与视频都会被一起删掉，且无法恢复。`"
       confirm-text="删除"
       danger
       :busy="deleting"
