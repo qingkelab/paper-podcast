@@ -516,8 +516,17 @@ class Pipeline:
                 if first:
                     title_locked = bool(options.get("title_locked"))
                     if paper_meta.get("title") and not title_locked:
+                        previous = title_hint
                         title_hint = paper_meta["title"]
+                        # ⚠️ 必须写回数据库。`guess_title` 只是从正文里猜第一行，
+                        # 猜错是常事（arXiv PDF 的首页常把授权声明排在标题前面，
+                        # 实测抓到过「Provided proper attribution is provided…」当标题）。
+                        # 双语改造时这里漏了写回，等于让启发式猜测永久盖住模型认出的
+                        # 正式标题 —— 而且只在「猜错」时才看得出来。
+                        if title_hint != previous:
+                            logger.info("标题改用模型认出的：%s → %s", previous, title_hint)
                     title = title_hint or "未命名论文"
+                    self.db.update_episode(episode_id, title=title)
                 else:
                     # 非主语言版本沿用主语言的标题，避免列表/分享链接出现两个名字
                     paper_meta = {**paper_meta, "title": title_hint or paper_meta.get("title")}

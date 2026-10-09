@@ -1084,3 +1084,57 @@ def _cjk_ratio(text: str) -> float:
         return 0.0
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
     return cjk / len(text)
+
+
+class TestTitleFromModel:
+    """模型认出的正式标题要盖掉 `guess_title` 的启发式猜测。
+
+    踩过的坑：双语改造时漏了这一步的写回，等于让启发式猜测永久生效。
+    只在「猜错」时才看得出来 —— arXiv PDF 首页常把授权声明排在标题前面，
+    实测抓到过一集标题是「Provided proper attribution is provided, Google hereby
+    grants permission to」。
+    """
+
+    LICENSE_FIRST = (
+        "Provided proper attribution is provided, Google hereby grants permission to "
+        "reproduce the tables and figures in this paper solely for use in journalistic "
+        "or scholarly works. The dominant sequence transduction models are based on complex "
+        "recurrent or convolutional neural networks that include an encoder and a decoder. "
+        "We propose a new simple network architecture, the Transformer, based solely on "
+        "attention mechanisms, dispensing with recurrence and convolutions entirely."
+    )
+
+    def test_model_title_overrides_guess(self, client):
+        response = client.post(
+            "/api/episodes",
+            json={
+                "source_type": "text",
+                "text": self.LICENSE_FIRST,
+                "options": {"duration_min": 3, "level": "intro"},
+            },
+        )
+        assert response.status_code == 201, response.text
+        created = response.json()
+        # 建任务那一刻用的还是启发式猜测 —— 关键是它**不等于**模型认出的正式标题，
+        # 所以「写回」这一步是有意义的（不写回就永远停在这个猜测上）
+        assert created["title"] != "Attention Is All You Need"
+
+        finished = wait_for_completion(client, created["id"])
+        assert finished["paper_meta"]["title"] == "Attention Is All You Need"
+        # 跑完之后标题必须是模型认出的那个
+        assert finished["title"] == "Attention Is All You Need"
+
+    def test_user_supplied_title_is_respected(self, client):
+        """用户自己填了标题就不许被模型改掉。"""
+        response = client.post(
+            "/api/episodes",
+            json={
+                "source_type": "text",
+                "text": self.LICENSE_FIRST,
+                "title": "我自己起的名字",
+                "options": {"duration_min": 3, "level": "intro"},
+            },
+        )
+        assert response.status_code == 201
+        finished = wait_for_completion(client, response.json()["id"])
+        assert finished["title"] == "我自己起的名字"

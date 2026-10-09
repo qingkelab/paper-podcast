@@ -187,7 +187,7 @@ paper-podcast/
 │   │       ├── illustration.py    生成信息图（SVG）+ 清洗 + 栅格化
 │   │       ├── video.py           视频合成（时间轴 / 配图分配 / 字幕 / 编码）
 │   │       └── pipeline.py        流水线编排 + 产物导出
-│   └── tests/                     389 项测试
+│   └── tests/                     391 项测试
 └── frontend/
     └── src/                       Vue3 应用，含浏览器端 Mock 适配器
 ```
@@ -223,7 +223,7 @@ Chrome headless 在本机会挂死，Playwright 装浏览器超时，且截图�
 
 ```bash
 cd backend
-../.venv/bin/python -m pytest          # 389 passed
+../.venv/bin/python -m pytest          # 391 passed
 ```
 
 覆盖范围：

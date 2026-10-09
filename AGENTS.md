@@ -102,6 +102,12 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **豆包返回的是 24000Hz 的 MPEG2 MP3**。做时长估算必须区分 MPEG1/2/2.5 与
   Layer I/II/III 的比特率表——按 MPEG1 表算会把 58.52 秒算成 35.11 秒。
   现在用逐帧累计采样数，对 CBR/VBR 都精确。
+- **模型认出的正式标题必须写回数据库**。`guess_title` 只是从正文里猜第一行，
+  猜错是常事 —— arXiv PDF 首页常把授权声明排在最前面，实测抓到过一集标题是
+  「Provided proper attribution is provided, Google hereby grants permission to」。
+  正确做法是：建任务时先用猜测值（列表里立刻有东西显示），
+  解读完成后用 `paper_meta.title` 覆盖（用户显式填了标题则跳过）。
+  **双语改造时这里漏了写回**，等于让启发式猜测永久生效，而且只在「猜错」时才看得出来。
 - **时长靠字数控制，而模型不守字数预算**。语速常量（350 字/分钟）和音乐时长
   （17 秒）是从真实结果反推的，别凭「中文播客常识」改。光靠 prompt 约束字数
   不可靠（实测欠过 35%），所以有 `_repair_length_if_needed` 做生成后兜底。
@@ -275,7 +281,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            389 项，改完必须全绿
+backend/tests/            391 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言
