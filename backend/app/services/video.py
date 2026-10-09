@@ -87,6 +87,37 @@ SUBTITLE_BG = "#f4f7fa"
 SUBTITLE_RULE = "#dde5ee"
 SUBTITLE_TEXT = "#16202f"
 
+# ---------------------------------------------------------------------------
+# 动效
+# ---------------------------------------------------------------------------
+#
+# 目标是「别像在翻 PPT」。三件事，都是**先渲染出帧、采过像素确认真在动**才留下的：
+#
+# 1. **缓慢推近/拉远 + 轻微平移**（Ken Burns）。一张静止画面撑 4 秒以上，
+#    观众就会觉得「卡住了」；持续的运动能让同一张图撑得更久。
+# 2. **字幕逐句出现**。一段话一次性糊上去，信息密度最低；拆成两句先后浮现，
+#    观众跟得上节奏，画面也在段中间变化一次。
+# 3. **顶部进度条**。长内容需要「还剩多少」的锚点。
+#
+# 三条都靠 ffmpeg 滤镜完成，**不额外渲染帧**（渲染成本不变）：
+# 推拉用 `zoompan`，字幕用 `overlay` + `fade`，进度条用 `overlay` 的逐帧 x 表达式。
+MOTION_UPSCALE = 2        # 推镜前先放大：zoompan 按整数像素取窗口，放大 2 倍后步进更细、不抖
+MOTION_MIN_ZOOM = 1.02    # 起始缩放
+MOTION_ZOOM_SPAN = 0.07   # 一段之内推拉多少（再大就像在晃镜头）
+MOTION_PAN_RATIO = 0.3    # 平移幅度：占「可平移余量」的比例
+PROGRESS_BAR_H = 5
+PROGRESS_BAR_COLOR = "#2f6fb5"
+# 编码质量。**加了动效之后不能再用 23**：静止幻灯片一帧能顶几秒、压缩率极高，
+# 而逐帧都在动的画面每一帧都要花比特。实测同一个 250 秒的片子，CRF 23 从 6.4MB
+# 涨到 26.4MB（4 倍）；CRF 26 约 14MB，白底图表 + 大字幕在这个码率下看不出差别，
+# 而 6.4MB → 14MB 是「有真实运动」应付的代价。
+VIDEO_CRF = 26
+CAPTION_FADE_SEC = 0.35   # 一句字幕的淡入时长
+CAPTION_BEAT_MAX = 2      # 一段最多拆成几句字幕
+CAPTION_BEAT_MIN_CHARS = 28   # 短于这个长度就别拆了：每句只剩几个字，闪得更难看
+CAPTION_BAND_MAX_FONT = 38.0  # 字幕带单独渲染，字可以比整页大（观众主要在读它）
+_SENTENCE_END = "。！？!?；;…"
+
 # 伪 id：模型用它表示「这一段没有对应原图，需要现场生成一张」
 GENERATE_ID = "generate"
 
@@ -112,6 +143,18 @@ class Scene:
     @property
     def duration(self) -> float:
         return max(self.end - self.start, 0.05)
+
+
+@dataclass
+class CaptionBand:
+    """一句字幕：文字（用来按字数分配时长）+ 渲染好的底部字幕带图片。
+
+    字幕带是**独立图层**：底图不画字幕，字幕按句做成带子，用 overlay 按时序叠上去。
+    这样同一张静止画面在段中间有一次内容变化 —— 这是「字幕逐句出现」的全部目的。
+    """
+
+    text: str
+    image: Path
 
 
 @dataclass
@@ -503,7 +546,9 @@ def _wrap(text: str, max_units: float) -> list[str]:
     return lines
 
 
-def _fit_subtitle(text: str, *, max_lines: int = 6) -> tuple[float, list[str]]:
+def _fit_subtitle(
+    text: str, *, max_lines: int = 6, max_size: float = 30.0
+) -> tuple[float, list[str]]:
     """选一个既能放下、又不至于太小的字号。
 
     竖版画幅只有 896px 宽，比横版窄很多，所以必须**同时**检查行数和总高度：
@@ -534,13 +579,13 @@ def _fit_subtitle(text: str, *, max_lines: int = 6) -> tuple[float, list[str]]:
             lines.append(current.strip())
         return lines
 
-    for size in (30.0, 28.0, 26.0, 24.0, 22.0, 20.0):
+    for size in (max_size - 2 * step for step in range(6)):
         lines = wrap_at(size)
         if len(lines) <= max_lines and len(lines) * size * 1.36 <= SUBTITLE_MAX_HEIGHT:
             return size, lines
 
     # 还是放不下：用最小字号，超出部分截断加省略号
-    size = 20.0
+    size = min(20.0, max_size)
     lines = wrap_at(size)
     if len(lines) > max_lines:
         lines = lines[:max_lines]
@@ -548,8 +593,15 @@ def _fit_subtitle(text: str, *, max_lines: int = 6) -> tuple[float, list[str]]:
     return size, lines
 
 
-def render_slide(scene: Scene, output_path: Path, *, title: str = "") -> Path:
-    """渲染一帧画面：配图 + 图注 + 字幕（白底竖版，与论文首页同尺寸）。"""
+def render_slide(
+    scene: Scene, output_path: Path, *, title: str = "", include_subtitle: bool = True
+) -> Path:
+    """渲染一帧画面：配图 + 图注 + 字幕（白底竖版，与论文首页同尺寸）。
+
+    `include_subtitle=False` 时只画字幕区的底色和分隔线，不画文字 ——
+    这一段的字幕会拆成几句、由 `render_caption_band` 单独渲染、再按时间叠上去
+    （见 `CaptionBand`）。底图里若还留着一整段文字，第一句出现之前就会露馅。
+    """
     data_uri, img_w, img_h = _prepare_image(scene.image, IMAGE_BOX_W, IMAGE_BOX_H)
     img_x = (VIDEO_W - img_w) / 2
     img_y = IMAGE_TOP + (IMAGE_BOX_H - img_h) / 2
@@ -617,16 +669,55 @@ def render_slide(scene: Scene, output_path: Path, *, title: str = "") -> Path:
         f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" height="2" fill="{SUBTITLE_RULE}"/>'
     )
 
-    line_height = font_size * 1.36
-    for offset, line in enumerate(lines):
-        parts.append(
-            f'<text x="{SUBTITLE_LEFT}" y="{SUBTITLE_TEXT_TOP + offset * line_height:.0f}" '
-            f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
-            f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
-        )
+    if include_subtitle:
+        line_height = font_size * 1.36
+        for offset, line in enumerate(lines):
+            parts.append(
+                f'<text x="{SUBTITLE_LEFT}" y="{SUBTITLE_TEXT_TOP + offset * line_height:.0f}" '
+                f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
+                f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
+            )
 
     parts.append("</svg>")
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _rasterize_custom("\n".join(parts), output_path)
+    return output_path
+
+
+def render_caption_band(text: str, output_path: Path) -> Path:
+    """只渲染底部那条字幕带，用于「字幕逐句出现」。
+
+    画幅是 `VIDEO_W × (VIDEO_H - SUBTITLE_TOP)`，位置固定叠在 `y=SUBTITLE_TOP`，
+    所以它盖住的就是底图那一条空字幕区。
+
+    字号比整页字幕放大到 38：观众真正在读的是这两行，而一句比一整段短得多，
+    放得下更大的字（放不下会自动往小退，见 `_fit_subtitle`）。
+    """
+    band_h = VIDEO_H - SUBTITLE_TOP
+    font_size, lines = _fit_subtitle(text, max_lines=3, max_size=CAPTION_BAND_MAX_FONT)
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{band_h}" '
+        f'viewBox="0 0 {VIDEO_W} {band_h}">',
+        f'<rect width="{VIDEO_W}" height="{band_h}" fill="{SUBTITLE_BG}"/>',
+        f'<rect width="{VIDEO_W}" height="2" fill="{SUBTITLE_RULE}"/>',
+    ]
+
+    if lines:
+        line_height = font_size * 1.36
+        block_h = line_height * len(lines)
+        # 竖直居中：整页字幕是从固定基线往下排的，这里只有一两行，
+        # 照搬那个基线会让文字顶在上沿、下面空一大片
+        first_baseline = (band_h - block_h) / 2 + font_size * 0.95
+        for offset, line in enumerate(lines):
+            parts.append(
+                f'<text x="{SUBTITLE_LEFT}" y="{first_baseline + offset * line_height:.0f}" '
+                f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
+                f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
+            )
+
+    parts.append("</svg>")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _rasterize_custom("\n".join(parts), output_path)
     return output_path
@@ -787,6 +878,151 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+# --------------------------------------------------------------------------
+# 动效：推镜 / 字幕分句 / 进度条
+# --------------------------------------------------------------------------
+
+
+def motion_filter(index: int, frames: int, *, still: bool = False) -> str:
+    """给第 index 段画面生成 ffmpeg 滤镜：缓慢推近或拉远 + 轻微平移。
+
+    几个刻意的选择：
+
+    - **缩放用 `on`（输出帧序号）算，不用累加式 `zoom+delta`**。累加式依赖上一帧状态，
+      分段编码时每段都从 1.0 重新开始，段与段之间的节奏会不齐；而且浮点累加在不同
+      ffmpeg 版本上落点不同。`on` 是确定的：同一段无论怎么编都是同一条曲线。
+    - **先 `scale` 放大 `MOTION_UPSCALE` 倍再 `zoompan`**。zoompan 在整数像素上取窗口，
+      1.02~1.09 的变化在原始尺寸上只有几个像素的步进，肉眼能看到一顿一顿的抖动；
+      放大 2 倍后步进细一倍，实测顺滑。
+    - **推近/拉远交替、平移方向按段号轮换**。整片都朝一个方向推，看久了像镜头坏了。
+    - **片尾品牌卡不推镜**（`still=True`）：那上面是关注引导的大字，动了反而难读。
+    """
+    if still or frames <= 1:
+        return f"scale={VIDEO_W}:{VIDEO_H}"
+
+    up_w, up_h = VIDEO_W * MOTION_UPSCALE, VIDEO_H * MOTION_UPSCALE
+    low = MOTION_MIN_ZOOM
+    high = MOTION_MIN_ZOOM + MOTION_ZOOM_SPAN
+    if index % 2 == 0:
+        zoom = f"{low}+{MOTION_ZOOM_SPAN}*on/{frames}"      # 推近
+    else:
+        zoom = f"{high}-{MOTION_ZOOM_SPAN}*on/{frames}"      # 拉远
+
+    # 平移方向：0 = 居中；1 = 左右；2 = 上下。乘以 on/frames 让它和缩放同步走完全程。
+    drift = f"({MOTION_PAN_RATIO}*on/{frames})"
+    center_x, center_y = "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+    variant = index % 3
+    if variant == 1:
+        pos_x = f"(iw-iw/zoom)*{drift}"
+        pos_y = center_y
+    elif variant == 2:
+        pos_x = center_x
+        pos_y = f"(ih-ih/zoom)*{drift}"
+    else:
+        pos_x, pos_y = center_x, center_y
+
+    return (
+        f"scale={up_w}:{up_h},"
+        f"zoompan=z='{zoom}':x='{pos_x}':y='{pos_y}':d=1:s={VIDEO_W}x{VIDEO_H}:fps={FPS}"
+    )
+
+
+def progress_bar_svg() -> str:
+    """进度条素材：一条**全宽**的色带。
+
+    用法不是「把它截短」，而是整条叠上去、用 overlay 的逐帧 `x` 把它从左往右推进画面。
+
+    为什么不用 `drawbox` 直接画：`drawbox` 的 `w` 只在初始化时求值一次，
+    写 `w='iw*t/duration'` 实测每一帧都是满宽（`t` 在那个上下文里取不到值，被钳到了 iw）。
+    overlay 的 `x`/`y` 是**逐帧**求值的，所以能拿到平滑增长的进度。
+    这不是猜的：实测 2 秒进度条在 0.2s / 1.0s / 1.8s 处量到 96 / 468 / 842 像素
+    （理论值 93 / 468 / 842）。
+    """
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{PROGRESS_BAR_H}">'
+        f'<rect width="{VIDEO_W}" height="{PROGRESS_BAR_H}" fill="{PROGRESS_BAR_COLOR}"/>'
+        f"</svg>"
+    )
+
+
+def split_caption_beats(text: str, *, max_beats: int = CAPTION_BEAT_MAX) -> list[str]:
+    """把一段字幕按句子切成最多 `max_beats` 句（字幕逐句出现）。
+
+    不切的情况：太短（< `CAPTION_BEAT_MIN_CHARS`）就原样返回一句 ——
+    二十来字再切成两半，每句剩几个字，闪来闪去比不切更难看。
+
+    句末标点优先；没有标点（模型偶尔会写成一长串）就在中间最近的逗号处切；
+    超过 `max_beats` 句时**按字数均衡合并**（不是丢弃后面的内容）。
+    """
+    clean = " ".join((text or "").split())
+    if not clean:
+        return []
+    if len(clean) < CAPTION_BEAT_MIN_CHARS:
+        return [clean]
+
+    chunks: list[str] = []
+    current = ""
+    for char in clean:
+        current += char
+        if char in _SENTENCE_END:
+            chunks.append(current.strip())
+            current = ""
+    if current.strip():
+        chunks.append(current.strip())
+
+    if len(chunks) <= 1:
+        # 没有句末标点：优先在中点附近的逗号处切；连逗号都没有（模型偶尔会写成一长串）
+        # 就按中点切一刀 —— 一整段糊上去比切得略生硬更糟。
+        mid = len(clean) // 2
+        candidates = [i for i, ch in enumerate(clean) if ch in "，,、"]
+        if candidates:
+            cut = min(candidates, key=lambda i: abs(i - mid))
+        else:
+            spaces = [i for i, ch in enumerate(clean) if ch == " "]
+            cut = min(spaces, key=lambda i: abs(i - mid)) if spaces else mid
+        left, right = clean[: cut + 1].strip(), clean[cut + 1 :].strip()
+        if not left or not right:
+            return [clean]
+        return [left, right]
+
+    if len(chunks) <= max_beats:
+        return chunks
+
+    # 合并到 max_beats 份：按总字数均分目标，逐句累加到接近目标就断一份
+    total = sum(len(chunk) for chunk in chunks)
+    target = total / max_beats
+    merged: list[str] = []
+    buffer = ""
+    for chunk in chunks:
+        buffer += chunk
+        if len(buffer) >= target and len(merged) < max_beats - 1:
+            merged.append(buffer.strip())
+            buffer = ""
+    if buffer.strip():
+        merged.append(buffer.strip())
+    return merged
+
+
+def beat_windows(
+    beats: list[str], duration: float, *, fade: float = CAPTION_FADE_SEC
+) -> list[tuple[float, float]]:
+    """按**字数占比**把这一段时长分给每句字幕，返回每句的 [起, 止)。
+
+    为什么按字数：我们只有整段的音频时间轴（TTS 是按段合成的），没有逐句时间戳。
+    按字数分是这里能做到的最好近似 —— 同一段里语速基本恒定。
+    """
+    if not beats:
+        return []
+    total = sum(len(beat) for beat in beats) or 1
+    windows: list[tuple[float, float]] = []
+    cursor = 0.0
+    for beat in beats:
+        span = duration * len(beat) / total
+        windows.append((cursor, cursor + span))
+        cursor += span
+    return windows
+
+
 def encode_video(
     scenes: list[Scene],
     slide_paths: list[Path],
@@ -794,6 +1030,7 @@ def encode_video(
     output_path: Path,
     *,
     target_duration: float | None = None,
+    caption_bands: list[list[CaptionBand]] | None = None,
 ) -> VideoResult:
     """把幻灯片序列和音频合成 MP4。
 
@@ -807,14 +1044,24 @@ def encode_video(
     | 不加 `-r`（单步） | 194.60s | 短 12 秒，结尾画面提前冻住 |
     | 输入端 `-r 30` | 0.80s | concat 会忽略每段 duration，直接崩掉 |
 
-    原因是 concat demuxer 的时间戳与输出帧率不匹配，且**逐文件都有舍入累积**
-    （23 个文件累积出 12 秒偏差），`-shortest` 在单步编码里也裁不掉。
-
     拆成两步就干净了：先出纯视频轨（不关心它多长），再用 `-c:v copy` 只封装
     音频，此时 `-shortest` 能正确把总长裁到音频长度。实测视频 206.77s /
     音频 206.86s，误差 0.09 秒。
 
     注意：**不要**用 `-t` 去钳总长。实测 `-t 4.000` 会把 4 秒的片子砍成 2.03 秒。
+
+    ## 动效怎么加进来的（同样不破坏上面那条长度对齐）
+
+    现在是**每段先单独编成一个小片段**（`-frames:v` 精确控帧数），再 `-c copy`
+    拼接，具体做法：
+
+    - 每段的底图过 `motion_filter`（缓慢推近/拉远 + 平移）；
+    - 字幕分句后各做成一张图，用 `overlay` + `fade` 按时间叠上去；
+    - 顶部进度条是一张全宽色带，用 overlay 的**逐帧 x 表达式**推进画面，
+      段与段之间靠「全局起始时间」接续，所以拼起来是一条连续推进的进度。
+
+    片段内部用 `-frames:v <帧数>` 边界，每段帧数是整数，所以拼接总长与原来
+    按 `duration` 拼幻灯片时完全一致 —— 长度对齐这条不能动。
     """
     if not ffmpeg_available():
         raise VideoError("系统未安装 ffmpeg，无法合成视频")
@@ -824,19 +1071,19 @@ def encode_video(
         raise VideoError("没有可用的画面")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    list_path = output_path.parent / f"{output_path.stem}-slides.txt"
+    clips_dir = output_path.parent / f"{output_path.stem}-clips"
+    list_path = output_path.parent / f"{output_path.stem}-clips.txt"
     silent_path = output_path.parent / f"{output_path.stem}-video-only.mp4"
+    bar_path = clips_dir / "progress.png"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    _rasterize_custom(progress_bar_svg(), bar_path)
+
+    bands = caption_bands or [[] for _ in scenes]
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
     frame_counts = [max(int(round(scene.duration * FPS)), 1) for scene in scenes]
-
-    # concat demuxer 要求重复最后一个文件，否则最后一帧时长会丢
-    lines: list[str] = []
-    for slide, frames in zip(slide_paths, frame_counts):
-        lines.append(f"file '{slide.resolve()}'")
-        lines.append(f"duration {frames / FPS:.6f}")
-    lines.append(f"file '{slide_paths[-1].resolve()}'")
-    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    total_frames = sum(frame_counts)
+    total_sec = total_frames / FPS
 
     def run(command: list[str], what: str) -> None:
         try:
@@ -848,18 +1095,78 @@ def encode_video(
         if result.returncode != 0:
             raise VideoError(f"{what}失败：{(result.stderr or '')[-400:]}")
 
+    clip_paths: list[Path] = []
+    cursor_frames = 0
     try:
-        # ---- 第一步：纯视频轨 ----
+        for index, (scene, slide, frames) in enumerate(zip(scenes, slide_paths, frame_counts)):
+            clip_path = clips_dir / f"clip-{index:04d}.mp4"
+            start_sec = cursor_frames / FPS
+            inputs = [
+                "-loop", "1", "-framerate", str(FPS), "-i", str(slide),
+                "-loop", "1", "-framerate", str(FPS), "-i", str(bar_path),
+            ]
+            graph = [f"[0:v]{motion_filter(index, frames, still=scene.brand == 'outro')}[v0]"]
+            last, node = "v0", 0
+
+            # ---- 进度条：整条色带从左推进，用全局时间算，跨段连续 ----
+            node += 1
+            graph.append(f"[1:v]format=rgba[bar{node}]")
+            graph.append(
+                f"[{last}][bar{node}]overlay=x='min(0,-(W)+W*({start_sec:.3f}+t)/{total_sec:.3f})'"
+                f":y=0[v{node}]"
+            )
+            last = f"v{node}"
+
+            # ---- 字幕：第 0 句从一开始就在，后面的按窗口淡入 ----
+            scene_bands = bands[index] if index < len(bands) else []
+            windows = beat_windows([band.text for band in scene_bands], scene.duration)
+            for beat_index, (band, (beat_start, _beat_end)) in enumerate(
+                zip(scene_bands, windows)
+            ):
+                inputs += ["-loop", "1", "-framerate", str(FPS), "-i", str(band.image)]
+                node += 1
+                source = 2 + beat_index
+                graph.append(
+                    f"[{source}:v]format=rgba,fade=t=in:st={beat_start:.3f}:"
+                    f"d={CAPTION_FADE_SEC}:alpha=1[cap{node}]"
+                )
+                graph.append(
+                    f"[{last}][cap{node}]overlay=x=0:y={SUBTITLE_TOP}:"
+                    f"enable='gte(t,{beat_start:.3f})'[v{node}]"
+                )
+                last = f"v{node}"
+
+            graph.append(f"[{last}]format=yuv420p[out]")
+            run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    *inputs,
+                    "-filter_complex", ";".join(graph),
+                    "-map", "[out]", "-an",
+                    "-frames:v", str(frames),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", str(VIDEO_CRF),
+                    "-pix_fmt", "yuv420p", "-r", str(FPS),
+                    str(clip_path),
+                ],
+                f"第 {index + 1} 段画面编码",
+            )
+            clip_paths.append(clip_path)
+            cursor_frames += frames
+
+        # ---- 第一步：纯视频轨（片段拼接走 stream copy，不重编码） ----
+        list_path.write_text(
+            "\n".join(f"file '{clip.resolve()}'" for clip in clip_paths) + "\n",
+            encoding="utf-8",
+        )
         run(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "concat", "-safe", "0", "-i", str(list_path),
                 "-an",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-r", str(FPS),
+                "-c:v", "copy",
                 str(silent_path),
             ],
-            "视频轨编码",
+            "视频轨拼接",
         )
 
         # ---- 第二步：只封装音频，视频流直接 copy ----
@@ -880,6 +1187,7 @@ def encode_video(
                 temp.unlink(missing_ok=True)
             except OSError:
                 pass
+        shutil.rmtree(clips_dir, ignore_errors=True)
 
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise VideoError("ffmpeg 没有产出视频文件")
@@ -1135,22 +1443,44 @@ def compose_video(
 
     work_dir.mkdir(parents=True, exist_ok=True)
     slide_paths: list[Path] = []
+    caption_bands: list[list[CaptionBand]] = []
+    band_paths: list[Path] = []
     endcard_count = 0
+    beat_count = 0
     for index, scene in enumerate(scenes):
         slide_path = work_dir / f"slide-{index:04d}.png"
+        beats = split_caption_beats(scene.text)
+        bands: list[CaptionBand] = []
         if scene.brand == "outro":
-            # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页
+            # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
+            # 品牌卡上的字是大号引导语，不参与「字幕逐句出现」——那会把它切碎。
             render_endcard(scene, slide_path, title=title)
             endcard_count += 1
+        elif len(beats) > 1:
+            # 字幕拆成两句 → 底图不画字幕，两句各自成图层按时叠上去
+            render_slide(scene, slide_path, title=title, include_subtitle=False)
+            for beat_index, beat in enumerate(beats):
+                band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
+                render_caption_band(beat, band_path)
+                bands.append(CaptionBand(text=beat, image=band_path))
+                band_paths.append(band_path)
+            beat_count += 1
         else:
             render_slide(scene, slide_path, title=title)
         slide_paths.append(slide_path)
+        caption_bands.append(bands)
     logger.info(
-        "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧）", len(slide_paths), endcard_count
+        "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧，字幕分句 %d 段）",
+        len(slide_paths), endcard_count, beat_count,
     )
 
     result = encode_video(
-        scenes, slide_paths, audio_path, output_path, target_duration=audio_duration
+        scenes,
+        slide_paths,
+        audio_path,
+        output_path,
+        target_duration=audio_duration,
+        caption_bands=caption_bands,
     )
     result.assignment = strategy
     result.scenes = [
@@ -1162,9 +1492,9 @@ def compose_video(
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
     }
 
-    for slide_path in slide_paths:
+    for temp_path in [*slide_paths, *band_paths]:
         try:
-            slide_path.unlink(missing_ok=True)
+            temp_path.unlink(missing_ok=True)
         except OSError:
             pass
 

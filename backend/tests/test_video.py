@@ -13,13 +13,20 @@ from pathlib import Path
 import pytest
 
 from app.services.video import (
+    CAPTION_FADE_SEC,
+    MOTION_MIN_ZOOM,
+    MOTION_UPSCALE,
+    PROGRESS_BAR_COLOR,
+    SUBTITLE_TOP,
     VIDEO_H,
     VIDEO_W,
+    CaptionBand,
     ImageAsset,
     Scene,
     VideoError,
     _fit_subtitle,
     _normalize_per_segment,
+    beat_windows,
     build_asset_pool,
     build_assign_messages,
     build_scenes,
@@ -31,8 +38,12 @@ from app.services.video import (
     heuristic_assignment,
     heuristic_per_segment,
     merge_runs_to_cap,
+    motion_filter,
+    progress_bar_svg,
+    render_caption_band,
     render_endcard,
     render_slide,
+    split_caption_beats,
 )
 
 
@@ -1153,3 +1164,231 @@ class TestEndCardRouting:
 
         assert "endcard" in rendered, "片尾段没有走品牌卡渲染"
         assert rendered.count("endcard") == 1, f"品牌卡帧数不对：{rendered}"
+
+
+# --------------------------------------------------------------------------
+# 动效：推镜 / 字幕逐句 / 进度条
+# --------------------------------------------------------------------------
+
+
+class TestCaptionBeats:
+    """字幕分句是纯逻辑，先把边界钉住，再去测画面真的在动。"""
+
+    def test_short_text_is_not_split(self):
+        # 十几个字再切成两半，每句剩几个字，闪得更难看
+        assert split_caption_beats("这一段很短，不拆。") == ["这一段很短，不拆。"]
+
+    def test_two_sentences_split_at_punctuation(self):
+        text = "仿真能批量造数据，但任务经常做不成。失败之后没有人回头改场景，误差就一直累积下去。"
+        beats = split_caption_beats(text)
+        assert len(beats) == 2
+        assert beats[0].endswith("。")
+        assert beats[1].endswith("。")
+        # 不能丢内容：拼起来必须还是原文（只差空白）
+        assert "".join(beats).replace(" ", "") == text.replace(" ", "")
+
+    def test_long_text_without_punctuation_splits_at_comma(self):
+        text = "先造场景再规划任务的老流水线里桌子太高杂物挡住夹爪任务做不成也没有人回头改场景所以数据质量一直上不去"
+        beats = split_caption_beats(text)
+        assert len(beats) == 2
+        assert "".join(beats) == text
+
+    def test_many_sentences_merge_into_two_without_losing_text(self):
+        text = "".join(f"第{index}句话讲的是同一个机制的某一步。" for index in range(5))
+        beats = split_caption_beats(text)
+        assert len(beats) == 2, f"最多两句，实际 {len(beats)}"
+        assert "".join(beats) == text, "合并时不能丢掉后面的句子"
+
+    def test_empty_text(self):
+        assert split_caption_beats("") == []
+        assert split_caption_beats("   ") == []
+
+    def test_beat_windows_cover_the_whole_scene(self):
+        beats = ["第一句比较长，要占更多时间。", "第二句短。"]
+        windows = beat_windows(beats, 10.0)
+        assert windows[0][0] == 0.0
+        assert windows[-1][1] == pytest.approx(10.0)
+        # 相邻窗口首尾相接（中间不能有「谁都不显示」的空档）
+        assert windows[0][1] == pytest.approx(windows[1][0])
+        # 长句分到的时间更多
+        assert windows[0][1] - windows[0][0] > windows[1][1] - windows[1][0]
+
+    def test_beat_windows_empty(self):
+        assert beat_windows([], 5.0) == []
+
+
+class TestMotionFilter:
+    def test_zoom_direction_alternates(self):
+        near = motion_filter(0, 60)
+        far = motion_filter(1, 60)
+        assert "zoompan" in near and "zoompan" in far
+        assert near != far, "相邻两段必须是不同的运动，否则整片像镜头坏了"
+        # 推近是从小到大，拉远是从大到小：看表达式的符号
+        assert f"{MOTION_MIN_ZOOM}+" in near
+        assert "-" in far.split("z='")[1].split("'")[0]
+
+    def test_zoom_is_deterministic_per_frame_index(self):
+        """缩放必须用 `on` 算，不能写成累加式 `zoom+delta`。
+
+        累加式依赖上一帧状态：分段编码时每段都从 1.0 重来，段间节奏不齐；
+        而且 `on` 是可复现的 —— 同一个 (index, frames) 永远给同一条曲线。
+        """
+        expr = motion_filter(0, 120)
+        assert "on/120" in expr
+        assert "zoom+" not in expr, "别用累加式缩放"
+        assert motion_filter(0, 120) == expr
+
+    def test_upscale_before_zoompan_to_kill_jitter(self):
+        expr = motion_filter(0, 60)
+        assert f"scale={VIDEO_W * MOTION_UPSCALE}:{VIDEO_H * MOTION_UPSCALE}" in expr
+        assert f"s={VIDEO_W}x{VIDEO_H}" in expr
+
+    def test_endcard_stays_still(self):
+        """片尾是关注引导的大字，推镜会让它难读。"""
+        expr = motion_filter(3, 60, still=True)
+        assert "zoompan" not in expr
+        assert expr == f"scale={VIDEO_W}:{VIDEO_H}"
+
+    def test_progress_bar_svg_is_full_width(self):
+        svg = progress_bar_svg()
+        assert f'width="{VIDEO_W}"' in svg
+        assert PROGRESS_BAR_COLOR in svg
+
+
+@pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
+class TestMotionIsActuallyRendered:
+    """上面那些都是字符串断言，证明不了画面上真的有动。
+
+    这一组**真的编码一段视频、再抽帧采像素**：推镜要么让画面变化，字幕要么在
+    段中间换过一次，进度条要么是长的。字符串对了但画面没动，这一组会红。
+    """
+
+    @staticmethod
+    def _frame(video: Path, seconds: float, out: Path) -> Path:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-ss", f"{seconds:.3f}", "-i", str(video),
+             "-frames:v", "1", str(out)],
+            capture_output=True, text=True, check=True,
+        )
+        return out
+
+    @staticmethod
+    def _pixels(path: Path):
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(path))
+        n, width = pix.n, pix.width
+        samples = pix.samples
+
+        def at(x: int, y: int):
+            index = (y * width + x) * n
+            return (samples[index], samples[index + 1], samples[index + 2])
+
+        return at, width, pix.height
+
+    @staticmethod
+    def _striped_png(path: Path, w: int = 700, h: int = 500) -> Path:
+        """有花纹的测试图。
+
+        纯色块无论怎么缩放，采出来的像素都一模一样 —— 用它测「画面有没有动」
+        会永远得到「没动」这个假结论（第一版就是这么写的，实测红了一次）。
+        """
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, w, h), False)
+        pix.set_rect(pix.irect, (255, 255, 255))
+        for x in range(0, w, 40):
+            pix.set_rect(pymupdf.IRect(x, 0, x + 20, h), (20, 20, 20))
+        for y in range(0, h, 60):
+            pix.set_rect(pymupdf.IRect(0, y, w, y + 10), (200, 30, 30))
+        pix.save(str(path))
+        return path
+
+    def _encode(self, tmp_path: Path, text: str, *, seconds: float = 4.0) -> Path:
+        import wave
+
+        image = self._striped_png(tmp_path / "img.png")
+        scene = Scene(start=0, end=seconds, image=image, kind="figure", speaker="A", text=text)
+        beats = split_caption_beats(text)
+        bands = []
+        band_paths = []
+        if len(beats) > 1:
+            slide = render_slide(scene, tmp_path / "slide.png", include_subtitle=False)
+            for index, beat in enumerate(beats):
+                band_path = render_caption_band(beat, tmp_path / f"band{index}.png")
+                bands.append(CaptionBand(text=beat, image=band_path))
+                band_paths.append(band_path)
+        else:
+            slide = render_slide(scene, tmp_path / "slide.png")
+
+        audio = tmp_path / "audio.wav"
+        rate = 8000
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(b"\x00\x00" * int(rate * seconds))
+
+        out = tmp_path / "motion.mp4"
+        encode_video([scene], [slide], audio, out, caption_bands=[bands])
+        for path in band_paths:
+            path.unlink(missing_ok=True)
+        return out
+
+    def test_picture_actually_moves(self, tmp_path):
+        video = self._encode(tmp_path, "第一段话。", seconds=4.0)
+        first = self._pixels(self._frame(video, 0.2, tmp_path / "a.png"))[0]
+        last = self._pixels(self._frame(video, 3.8, tmp_path / "b.png"))[0]
+        # 在整个画面区域撒一张网格采点，看有多少点从 0.2s 到 3.8s 变了色
+        sampled = changed = 0
+        for x in range(60, VIDEO_W - 60, 40):
+            for y in range(120, 900, 40):
+                sampled += 1
+                if first(x, y) != last(x, y):
+                    changed += 1
+        ratio = changed / sampled
+        assert ratio > 0.1, f"同一段画面 0.2s→3.8s 只有 {ratio:.1%} 的采样点在变 —— 推镜没生效"
+
+    def test_caption_switches_mid_scene(self, tmp_path):
+        text = "仿真能批量造数据，但任务经常做不成。失败之后没有人回头改场景，误差就一直累积下去。"
+        video = self._encode(tmp_path, text, seconds=6.0)
+        windows = beat_windows(split_caption_beats(text), 6.0)
+        before = self._pixels(self._frame(video, max(0.2, windows[1][0] - 1.2), tmp_path / "c1.png"))[0]
+        after = self._pixels(self._frame(video, windows[1][0] + 0.9, tmp_path / "c2.png"))[0]
+        # 字幕带里随便挑几行像素，第二句出现后必须不一样
+        diffs = sum(
+            1
+            for x in range(60, 880, 40)
+            for y in (1040, 1080, 1120)
+            if before(x, y) != after(x, y)
+        )
+        assert diffs >= 3, "第二句字幕出现前后，字幕带像素没有变化 —— 分句没生效"
+
+    def test_progress_bar_grows(self, tmp_path):
+        video = self._encode(tmp_path, "第一段话。", seconds=4.0)
+        early = self._pixels(self._frame(video, 0.5, tmp_path / "p1.png"))
+        late = self._pixels(self._frame(video, 3.5, tmp_path / "p2.png"))
+
+        def bar_width(at, width):
+            # 顶部 5px 是进度条（#2f6fb5 蓝），数一行里蓝色像素的个数
+            count = 0
+            for x in range(width):
+                r, g, b = at(x, 2)
+                if b > 100 and b > r + 40:
+                    count += 1
+            return count
+
+        early_w = bar_width(early[0], early[1])
+        late_w = bar_width(late[0], late[1])
+        assert late_w > early_w + 50, f"进度条没变长：0.5s={early_w}px，3.5s={late_w}px"
+        assert late_w <= VIDEO_W
+
+    def test_caption_band_covers_the_whole_caption_area(self, tmp_path):
+        """字幕带必须是不透明的、整整一条 —— 否则底图上的空白会透出来。"""
+        band = render_caption_band("这是一句测试字幕。", tmp_path / "band.png")
+        at, width, height = self._pixels(band)
+        assert width == VIDEO_W
+        assert height == VIDEO_H - SUBTITLE_TOP
+        # 左上角是字幕底色（#f4f7fa），不是透明（透明会读成黑）
+        r, g, b = at(4, 4)
+        assert r > 230 and g > 230 and b > 230, f"字幕带底色不对：{(r, g, b)}"
