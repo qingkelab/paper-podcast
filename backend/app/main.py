@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .api.routes import router
+from .auth import LoginThrottle
 from .config import PROJECT_ROOT, Settings, get_settings
 from .db import Database
 from .worker import TaskQueue
@@ -49,6 +50,12 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 62)
 
     app.state.queue = TaskQueue(settings, app.state.db)
+    # 登录限流：内存实现，单进程够用（多实例部署要换成 Redis / 数据库表，
+    # 否则每个进程各记各的，实际阈值会被放大好几倍）
+    app.state.login_throttle = LoginThrottle(
+        max_attempts=settings.login_max_attempts,
+        lockout_minutes=settings.login_lockout_minutes,
+    )
     await app.state.queue.start()
     try:
         yield

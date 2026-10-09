@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     # 单次批量生成的论文数上限
     max_batch_size: int = 20
+    # 登录失败多少次后暂时锁住（按「用户名 + 来源 IP」计）
+    login_max_attempts: int = 8
+    # 锁多久（分钟）
+    login_lockout_minutes: int = 15
 
     # ---- 存储 ----
     data_dir: Path = PROJECT_ROOT / "data"

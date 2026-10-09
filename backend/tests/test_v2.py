@@ -729,3 +729,89 @@ class TestChangePassword:
                 json={"current_password": PASSWORD, "new_password": "brand-new-pass"},
             )
             assert response.status_code == 401
+
+
+class TestLoginThrottle:
+    """登录限流：没有它，登录接口就是可以无限次尝试的口令爆破入口。"""
+
+    def test_locks_out_after_repeated_failures(self, tmp_path):
+        with TestClient(make_app(tmp_path, login_max_attempts=3)) as client:
+            register(client, "guo")
+            client.post("/api/auth/logout")
+
+            for _ in range(3):
+                bad = client.post(
+                    "/api/auth/login", json={"username": "guo", "password": "nope"}
+                )
+                assert bad.status_code == 401
+
+            blocked = client.post(
+                "/api/auth/login", json={"username": "guo", "password": "nope"}
+            )
+            assert blocked.status_code == 429
+            assert "Retry-After" in blocked.headers
+            # 锁住之后**正确口令也进不来** —— 否则限流形同虚设
+            still = client.post(
+                "/api/auth/login", json={"username": "guo", "password": PASSWORD}
+            )
+            assert still.status_code == 429
+
+    def test_successful_login_resets_the_counter(self, tmp_path):
+        with TestClient(make_app(tmp_path, login_max_attempts=3)) as client:
+            register(client, "guo")
+            client.post("/api/auth/logout")
+            for _ in range(2):
+                client.post("/api/auth/login", json={"username": "guo", "password": "nope"})
+            # 一次成功就把记录清掉
+            assert client.post(
+                "/api/auth/login", json={"username": "guo", "password": PASSWORD}
+            ).status_code == 200
+            client.post("/api/auth/logout")
+            for _ in range(2):
+                assert client.post(
+                    "/api/auth/login", json={"username": "guo", "password": "nope"}
+                ).status_code == 401
+            # 计数被清零，所以还没到阈值
+            assert client.post(
+                "/api/auth/login", json={"username": "guo", "password": "nope"}
+            ).status_code == 401
+
+    def test_throttle_is_per_username_and_source(self, tmp_path):
+        """锁住的只是「这个用户名 + 这个来源」，不能把别人一起锁了。
+
+        只按用户名计：别人故意打错就能把真实用户锁在门外。
+        只按来源计：同一个出口 IP 后面的所有人共享额度。
+        """
+        throttle_max = 3
+        with TestClient(make_app(tmp_path, login_max_attempts=throttle_max)) as client:
+            register(client, "guo")
+            client.post("/api/auth/logout")
+            for _ in range(throttle_max):
+                client.post("/api/auth/login", json={"username": "guo", "password": "nope"})
+            assert client.post(
+                "/api/auth/login", json={"username": "guo", "password": PASSWORD}
+            ).status_code == 429
+            # 换一个用户名不受影响（同一个来源 IP）
+            assert client.post(
+                "/api/auth/login", json={"username": "someone-else", "password": "nope"}
+            ).status_code == 401
+
+    def test_throttle_unit(self):
+        throttle = auth_lib.LoginThrottle(max_attempts=2, lockout_minutes=15)
+        key = throttle.key("guo", "10.0.0.1")
+        assert throttle.retry_after(key) == 0
+        throttle.record_failure(key)
+        assert throttle.retry_after(key) == 0
+        throttle.record_failure(key)
+        assert throttle.retry_after(key) > 0
+        throttle.reset(key)
+        assert throttle.retry_after(key) == 0
+
+    def test_throttle_window_expires(self):
+        throttle = auth_lib.LoginThrottle(max_attempts=1, lockout_minutes=15)
+        throttle.lockout_seconds = 1  # 缩短窗口，避免测试真的等 15 分钟
+        key = throttle.key("guo", "10.0.0.1")
+        throttle.record_failure(key)
+        assert throttle.retry_after(key) > 0
+        time.sleep(1.1)
+        assert throttle.retry_after(key) == 0

@@ -20,6 +20,8 @@ import hashlib
 import hmac
 import logging
 import secrets
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -141,6 +143,76 @@ def new_user_id() -> str:
 
 def new_album_id() -> str:
     return "al_" + secrets.token_hex(3)
+
+
+# --------------------------------------------------------------------------
+# 登录限流
+# --------------------------------------------------------------------------
+
+
+class LoginThrottle:
+    """按「用户名 + 来源」记失败次数，超限后暂时拒绝。
+
+    **为什么必须有**：没有它，登录接口就是一个可以无限次尝试的口令爆破入口 ——
+    scrypt 只能让每次尝试变贵，挡不住「一直试」。这是加了账号体系之后
+    必须同时补上的一环。
+
+    **内存实现**：单进程 uvicorn 下够用（本项目 worker 也是串行单进程）。
+    多进程 / 多实例部署要换成 Redis 或一张 `login_attempts` 表 ——
+    否则每个进程各记各的，实际阈值会被放大好几倍。
+    """
+
+    def __init__(self, *, max_attempts: int, lockout_minutes: int):
+        self.max_attempts = max(1, max_attempts)
+        self.lockout_seconds = max(1, lockout_minutes) * 60
+        self._failures: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def key(username: str, client: str) -> str:
+        """按「用户名 + 来源」分开计数。
+
+        只按用户名计：一个人被锁会连带把真实用户锁在门外（别人故意打错就行）。
+        只按来源计：同一个出口 IP 后面的所有人共享额度（公司/学校网络会互相影响）。
+        两个一起放松了，但比只用一个好。
+        """
+        return f"{username}\x00{client}"
+
+    def retry_after(self, key: str) -> int:
+        """还能不能登。返回 0 = 可以；正数 = 还要等几秒。"""
+        now = time.monotonic()
+        with self._lock:
+            stamps = [t for t in self._failures.get(key, []) if now - t < self.lockout_seconds]
+            if not stamps:
+                self._failures.pop(key, None)
+                return 0
+            self._failures[key] = stamps
+            if len(stamps) < self.max_attempts:
+                return 0
+            return max(int(self.lockout_seconds - (now - stamps[0])) + 1, 1)
+
+    def record_failure(self, key: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            stamps = [t for t in self._failures.get(key, []) if now - t < self.lockout_seconds]
+            stamps.append(now)
+            self._failures[key] = stamps
+
+    def reset(self, key: str) -> None:
+        """登录成功后清掉记录，免得之前的失败把之后的正常登录也锁住。"""
+        with self._lock:
+            self._failures.pop(key, None)
+
+
+def client_key(request: Request) -> str:
+    """来源标识。
+
+    只看 `request.client.host`，**刻意不读 X-Forwarded-For** ——
+    那个头是客户端可以随便伪造的，拿它当限流依据等于给了绕过办法。
+    真要放在反代后面，得在这个头可信的前提下由运维显式打开。
+    """
+    client = getattr(request, "client", None)
+    return getattr(client, "host", "") or "unknown"
 
 
 # --------------------------------------------------------------------------

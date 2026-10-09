@@ -688,9 +688,24 @@ async def register(request: Request, payload: RegisterRequest, response: Respons
 
 @router.post("/auth/login", response_model=User)
 async def login(request: Request, payload: LoginRequest, response: Response):
-    """登录。用户名不存在与口令错误返回**同一个**提示，别告诉对方哪个错了。"""
+    """登录。用户名不存在与口令错误返回**同一个**提示，别告诉对方哪个错了。
+
+    失败次数超限会先被限流挡住（429）—— 否则这个接口就是个可以无限尝试的爆破入口。
+    """
     settings = _settings(request)
     db = _db(request)
+    throttle: auth_lib.LoginThrottle = request.app.state.login_throttle
+    attempt_key = throttle.key(
+        (payload.username or "").strip().lower(), auth_lib.client_key(request)
+    )
+
+    wait = throttle.retry_after(attempt_key)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail=f"登录尝试过于频繁，请 {max(wait // 60, 1)} 分钟后再试",
+            headers={"Retry-After": str(wait)},
+        )
 
     try:
         username = auth_lib.normalize_username(payload.username)
@@ -703,7 +718,13 @@ async def login(request: Request, payload: LoginRequest, response: Response):
     stored = user["password_hash"] if user else auth_lib.hash_password("dummy-password")
     ok = auth_lib.verify_password(payload.password or "", stored)
     if not user or not ok:
+        throttle.record_failure(attempt_key)
         raise HTTPException(status_code=401, detail="用户名或口令不正确")
+
+    # 登录成功清掉失败记录：否则之前攒的失败会把之后的正常登录也一起锁住
+    throttle.reset(attempt_key)
+    # 顺手清过期会话（省一个定时任务）
+    db.purge_expired_sessions()
 
     token = auth_lib.new_session_token()
     db.create_session(

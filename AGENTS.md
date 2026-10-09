@@ -246,6 +246,11 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   而缓存需要一个必须手动维护的失效逻辑 —— 那才是真正容易出错的地方。
 - **改口令只能删「其他」会话**（`delete_other_sessions`）。第一版写成「先全删再补回当前这条」，
   结果漏了补回那步，用户改完口令自己就被踢出去了 —— 被测试逮住。
+- **登录接口必须限流**（`LoginThrottle`）。没有它，登录就是一个可以无限次尝试的
+  口令爆破入口 —— scrypt 只让每次尝试变贵，挡不住「一直试」。按「用户名 + 来源 IP」
+  计数，超限返回 429。锁住期间**正确口令也进不来**（否则限流形同虚设），
+  登录成功清零。**内存实现**，多进程/多实例部署必须换成 Redis 或数据库表。
+- **限流不看 `X-Forwarded-For`**：那个头客户端可以随便伪造，拿它当依据等于给了绕过办法。
 - **分享链接是「开关 + 可重置的 token」**：`visibility` 决定看不看得到，
   `share_token` 是地址。取单集时必须**同时**匹配 `visibility='public'`，
   不能只看 token 在不在 —— 否则取消分享那一刻旧链接还是通的。
@@ -267,7 +272,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            384 项，改完必须全绿
+backend/tests/            389 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言
