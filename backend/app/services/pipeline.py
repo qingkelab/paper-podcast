@@ -222,6 +222,7 @@ class Pipeline:
                 llm=self.llm,
                 analysis=analysis,
                 max_topic_images=self.settings.max_topic_images,
+                language=language,
             )
         except VideoError as exc:
             logger.warning("视频合成失败（音频不受影响）：%s", exc)
@@ -361,16 +362,28 @@ class Pipeline:
             work_dir=self.settings.video_work_dir / episode_id / lang,
             output_path=output_path,
             title=record.get("title") or "论文解读",
+            # 复用画面时不给模型（那条规则见 TestPresetReuse）；强调行文案在
+            # `video.scenes[i].point` 里，缺了才由维护脚本单独补一次（见 AGENTS.md）
             llm=None,
             analysis=version.get("analysis") or {},
             preset_scenes=stored.get("scenes") or None,
             preset_assets=stored.get("assets") or None,
+            language=lang,
         )
 
         video = {**result.to_dict(), "url": f"/api/episodes/{episode_id}/video"}
-        fields: dict[str, Any] = {"video": video}
 
-        # 回写：双语集写进对应语言那一版；主语言同时镜像到顶层字段
+        # 回写：双语集写进对应语言那一版；**只有主语言**才镜像到顶层字段。
+        #
+        # 顶层字段代表「主语言那一版」（契约 §1）。第一版这里无条件写 `fields["video"]`，
+        # 于是重新合成英文版会把中文那一版从顶层挤掉 —— 实测把英文的强调行
+        # 写进了中文集的顶层 `video`，列表/播放器读顶层字段时看到的就是英文那版。
+        mirrored = lang == primary or not self._version_records(record)
+        fields: dict[str, Any] = {}
+        if mirrored:
+            fields["video"] = video
+            fields["video_path"] = str(result.video_path)
+
         if self._version_records(record) or lang != primary:
             versions = self._version_records(record)
             entry = dict(versions.get(lang) or {})
@@ -379,10 +392,9 @@ class Pipeline:
             entry["video"] = video
             versions[lang] = entry
             fields["versions"] = versions
-        if lang == primary or not self._version_records(record):
-            fields["video_path"] = str(result.video_path)
 
-        self.db.update_episode(episode_id, **fields)
+        if fields:
+            self.db.update_episode(episode_id, **fields)
         logger.info(
             "视频已重新合成（%s）：%d 帧 / %.1f 秒（复用画面分配：%s）",
             lang,

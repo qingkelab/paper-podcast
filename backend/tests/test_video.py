@@ -14,8 +14,14 @@ import pytest
 
 from app.services.video import (
     CAPTION_FADE_SEC,
-    MOTION_MIN_ZOOM,
-    MOTION_UPSCALE,
+    POINT_BG,
+    POINT_HEIGHT,
+    POINT_LEFT,
+    POINT_MAX_CHARS,
+    POINT_MAX_CHARS_EN,
+    POINT_SLIDE_SEC,
+    POINT_TEXT,
+    POINT_TOP,
     PROGRESS_BAR_COLOR,
     SUBTITLE_TOP,
     VIDEO_H,
@@ -37,11 +43,15 @@ from app.services.video import (
     group_generate_runs,
     heuristic_assignment,
     heuristic_per_segment,
+    _normalize_points,
+    build_points_messages,
+    local_point,
     merge_runs_to_cap,
-    motion_filter,
+    point_char_limit,
     progress_bar_svg,
     render_caption_band,
     render_endcard,
+    render_point_row,
     render_slide,
     split_caption_beats,
 )
@@ -1217,42 +1227,119 @@ class TestCaptionBeats:
         assert beat_windows([], 5.0) == []
 
 
-class TestMotionFilter:
-    def test_zoom_direction_alternates(self):
-        near = motion_filter(0, 60)
-        far = motion_filter(1, 60)
-        assert "zoompan" in near and "zoompan" in far
-        assert near != far, "相邻两段必须是不同的运动，否则整片像镜头坏了"
-        # 推近是从小到大，拉远是从大到小：看表达式的符号
-        assert f"{MOTION_MIN_ZOOM}+" in near
-        assert "-" in far.split("z='")[1].split("'")[0]
+class TestPointEmphasis:
+    """「突出解读内容」靠的是要点强调行与字幕里的数字，不是镜头运动。
 
-    def test_zoom_is_deterministic_per_frame_index(self):
-        """缩放必须用 `on` 算，不能写成累加式 `zoom+delta`。
+    第一版做的是缓慢推拉镜头，被否掉了 —— 那种运动跟正在讲的内容无关。
+    这一组盯着现在留下的三件事里跟内容直接相关的两件。
+    """
 
-        累加式依赖上一帧状态：分段编码时每段都从 1.0 重来，段间节奏不齐；
-        而且 `on` 是可复现的 —— 同一个 (index, frames) 永远给同一条曲线。
+    def test_local_point_picks_the_number_with_context(self):
+        point = local_point("在 16 个任务上平均成功率 67%，两个基线分别是 17% 和 21%。")
+        # 一句里多个数字时，要拎出信息量最大的那个：百分比 > 带单位 > 光秃秃的整数
+        assert "67%" in point
+        assert len(point) <= POINT_MAX_CHARS
+
+    def test_local_point_clips_to_clause(self):
+        point = local_point("仿真能批量造数据，但以往的流水线先造场景、再规划任务，任务做不成也没人回头改场景。")
+        assert point == "", "没有数字就不硬凑 —— 空着比给一句废话好"
+
+    def test_local_point_handles_empty_and_long_numbers(self):
+        assert local_point("") == ""
+        long_point = local_point("混入随机布局数据后成功率从 7% 提升到 40% 这个提升非常可观")
+        assert 0 < len(long_point) <= POINT_MAX_CHARS
+
+    def test_points_prompt_asks_for_short_lines_and_no_fabrication(self):
+        messages = build_points_messages(
+            [{"text": "第一段"}, {"text": "第二段"}], title="测试论文"
+        )
+        system = messages[0]["content"]
+        assert "14 个字" in system
+        assert "不要编造" in system
+        # 每一段都必须有一句（第一版允许留空，结果整条视频只有 18% 的时间有强调行）
+        assert "每一段都要有一句" in system
+
+    def test_normalize_points_always_returns_one_per_segment(self):
+        points = _normalize_points(
+            [{"segment": 0, "point": "成功率 67%"}, {"segment": 5, "point": "越界了"}],
+            count=3,
+        )
+        assert points == ["成功率 67%", "", ""], "缺项补空串、越界的丢掉"
+
+    def test_normalize_points_shortens_at_boundary_not_mid_word(self):
+        """超长时要按标点/空格收短 —— 按字符硬切会切出「at 4 and 6 bi」这种半截话。
+
+        画面上最抢眼的一行出现半截英文，比不显示这一行还糟（实测踩到过）。
         """
-        expr = motion_filter(0, 120)
-        assert "on/120" in expr
-        assert "zoom+" not in expr, "别用累加式缩放"
-        assert motion_filter(0, 120) == expr
+        points = _normalize_points(
+            [{"segment": 1, "point": "at 4 and 6 bits precision the errors are small"}],
+            count=2,
+        )
+        assert points[1].endswith("bits"), f"应当在词边界断开：{points[1]!r}"
+        assert len(points[1]) <= POINT_MAX_CHARS
+        assert not points[1].rstrip().endswith(("a", "bi", "th")), "不能是半截词"
 
-    def test_upscale_before_zoompan_to_kill_jitter(self):
-        expr = motion_filter(0, 60)
-        assert f"scale={VIDEO_W * MOTION_UPSCALE}:{VIDEO_H * MOTION_UPSCALE}" in expr
-        assert f"s={VIDEO_W}x{VIDEO_H}" in expr
+        chinese = _normalize_points(
+            [{"segment": 0, "point": "这是一句被模型写超长的强调文案，后面还有很多内容"}], count=1
+        )
+        # 在逗号处断开，并丢掉结尾那个逗号（留一个逗号在末尾像话没说完）
+        assert chinese[0] == "这是一句被模型写超长的强调文案", f"中文要在标点处断开：{chinese[0]!r}"
 
-    def test_endcard_stays_still(self):
-        """片尾是关注引导的大字，推镜会让它难读。"""
-        expr = motion_filter(3, 60, still=True)
-        assert "zoompan" not in expr
-        assert expr == f"scale={VIDEO_W}:{VIDEO_H}"
+    def test_normalize_points_tolerates_garbage(self):
+        points = _normalize_points([{"segment": 0, "point": ""}, "闲聊", None], count=2)
+        assert points == ["", ""]
 
-    def test_progress_bar_svg_is_full_width(self):
-        svg = progress_bar_svg()
-        assert f'width="{VIDEO_W}"' in svg
-        assert PROGRESS_BAR_COLOR in svg
+    def test_point_row_is_rendered_with_accent_bar(self, tmp_path):
+        row = render_point_row("成功率 67%", tmp_path / "point.png")
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(row))
+        assert (pix.width, pix.height) == (VIDEO_W, POINT_HEIGHT)
+        n, W = pix.n, pix.width
+        samples = pix.samples
+
+        def at(x, y):
+            index = (y * W + x) * n
+            return (samples[index], samples[index + 1], samples[index + 2])
+
+        # 左侧色条是强调蓝，整行的底色是浅蓝
+        # 强调行的色条从 POINT_LEFT 开始，左边那 40px 是透明的（图层叠在画面上）
+        bar_r, bar_g, bar_b = at(POINT_LEFT + 2, POINT_HEIGHT // 2)
+        assert bar_b > 150 and bar_b > bar_r + 40, f"左侧色条不是强调蓝：{(bar_r, bar_g, bar_b)}"
+        bg_r, bg_g, bg_b = at(VIDEO_W // 2, 6)
+        assert bg_b >= bg_r and bg_r > 200, f"强调行底色不对：{(bg_r, bg_g, bg_b)}"
+
+    def test_slide_without_point_leaves_the_row_empty(self, tmp_path):
+        """没有要点时不画强调行 —— 不能留一个空色块让人以为坏了。"""
+        image = make_png(tmp_path / "img.png", 700, 500)
+        scene = Scene(start=0, end=2, image=image, kind="figure", text="第一段。")
+        out = render_slide(scene, tmp_path / "slide.png", title="标题")
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(out))
+        n, W = pix.n, pix.width
+        index = ((POINT_TOP + 20) * W + 20) * n
+        r, g, b = pix.samples[index], pix.samples[index + 1], pix.samples[index + 2]
+        assert r > 240 and g > 240 and b > 240, f"没有要点时那一行应该是白的：{(r, g, b)}"
+
+    def test_slide_with_point_draws_it(self, tmp_path):
+        image = make_png(tmp_path / "img.png", 700, 500)
+        scene = Scene(
+            start=0, end=2, image=image, kind="figure", text="第一段。", point="成功率 67%"
+        )
+        out = render_slide(scene, tmp_path / "slide.png", title="标题")
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(out))
+        n, W = pix.n, pix.width
+        # 沿着强调行扫一遍，应该能找到强调蓝的像素（色条或文字）
+        found = 0
+        for x in range(0, W, 3):
+            index = ((POINT_TOP + POINT_HEIGHT // 2) * W + x) * n
+            r, g, b = pix.samples[index], pix.samples[index + 1], pix.samples[index + 2]
+            if b > 120 and b > r + 30:
+                found += 1
+        assert found > 0, "强调行没画出来"
 
 
 @pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
@@ -1304,11 +1391,21 @@ class TestMotionIsActuallyRendered:
         pix.save(str(path))
         return path
 
-    def _encode(self, tmp_path: Path, text: str, *, seconds: float = 4.0) -> Path:
+    def _encode(
+        self, tmp_path: Path, text: str, *, seconds: float = 4.0, point: str = ""
+    ) -> Path:
         import wave
 
         image = self._striped_png(tmp_path / "img.png")
-        scene = Scene(start=0, end=seconds, image=image, kind="figure", speaker="A", text=text)
+        scene = Scene(
+            start=0,
+            end=seconds,
+            image=image,
+            kind="figure",
+            speaker="A",
+            text=text,
+            point=point,
+        )
         beats = split_caption_beats(text)
         bands = []
         band_paths = []
@@ -1329,25 +1426,55 @@ class TestMotionIsActuallyRendered:
             handle.setframerate(rate)
             handle.writeframes(b"\x00\x00" * int(rate * seconds))
 
+        point_rows: list[Path | None] = []
+        if point:
+            slide = render_slide(
+                scene, tmp_path / "slide.png", include_subtitle=False, include_point=False
+            )
+            for index, beat in enumerate(beats):
+                band_path = tmp_path / f"band{index}.png"
+                render_caption_band(beat, band_path)
+                bands.append(CaptionBand(text=beat, image=band_path))
+                band_paths.append(band_path)
+            point_path = render_point_row(point, tmp_path / "point.png")
+            point_rows.append(point_path)
+            band_paths.append(point_path)
+
         out = tmp_path / "motion.mp4"
-        encode_video([scene], [slide], audio, out, caption_bands=[bands])
+        encode_video(
+            [scene], [slide], audio, out, caption_bands=[bands], point_rows=point_rows
+        )
         for path in band_paths:
             path.unlink(missing_ok=True)
         return out
 
-    def test_picture_actually_moves(self, tmp_path):
-        video = self._encode(tmp_path, "第一段话。", seconds=4.0)
-        first = self._pixels(self._frame(video, 0.2, tmp_path / "a.png"))[0]
-        last = self._pixels(self._frame(video, 3.8, tmp_path / "b.png"))[0]
-        # 在整个画面区域撒一张网格采点，看有多少点从 0.2s 到 3.8s 变了色
-        sampled = changed = 0
-        for x in range(60, VIDEO_W - 60, 40):
-            for y in range(120, 900, 40):
-                sampled += 1
-                if first(x, y) != last(x, y):
-                    changed += 1
-        ratio = changed / sampled
-        assert ratio > 0.1, f"同一段画面 0.2s→3.8s 只有 {ratio:.1%} 的采样点在变 —— 推镜没生效"
+    def test_point_row_slides_in(self, tmp_path):
+        """要点强调行开头是从左边滑进来的：滑到一半时左侧还在画面外。
+
+        这是**内容驱动的动效**（标记这一段换了新内容），和「整张图慢慢放大」
+        那种被否掉的运动不是一回事。做法是量强调行里「浅蓝底」的像素数。
+        """
+        video = self._encode(tmp_path, "第一段话。", seconds=4.0, point="成功率 67%")
+        early = self._pixels(self._frame(video, 0.08, tmp_path / "pt1.png"))
+        late = self._pixels(self._frame(video, 1.5, tmp_path / "pt2.png"))
+
+        def row_pixels(at, width):
+            # 只数强调行那条**浅蓝底**（#eef4fb）。判据是「偏蓝」而不是「够亮」——
+            # 底图那一行本来就是白的，用「亮」当判据会把白底也算进去（第一版就这么误判了）
+            count = 0
+            for x in range(0, width, 2):
+                r, g, b = at(x, POINT_TOP + 10)
+                if b - r >= 8 and b > 230:
+                    count += 1
+            return count
+
+        early_count = row_pixels(early[0], early[1])
+        late_count = row_pixels(late[0], late[1])
+        assert late_count > early_count, (
+            f"强调行没有滑入：0.08s 时已可见 {early_count} 个像素，"
+            f"1.5s 时 {late_count} 个（应当变多）"
+        )
+        assert late_count > VIDEO_W * 0.3, "滑入结束后强调行应当铺满整行"
 
     def test_caption_switches_mid_scene(self, tmp_path):
         text = "仿真能批量造数据，但任务经常做不成。失败之后没有人回头改场景，误差就一直累积下去。"
@@ -1392,3 +1519,172 @@ class TestMotionIsActuallyRendered:
         # 左上角是字幕底色（#f4f7fa），不是透明（透明会读成黑）
         r, g, b = at(4, 4)
         assert r > 230 and g > 230 and b > 230, f"字幕带底色不对：{(r, g, b)}"
+
+
+class TestPointGenerationRules:
+    """强调行文案「什么时候可以问模型」。
+
+    复用画面时**默认不问模型**（那条规则由 TestPresetReuse 钉着：用户只是转了个配图，
+    画面和文案都不该跟着变）。但旧视频里没有强调行文案，需要能单独补一次 ——
+    所以有一个显式的开关，而不是默默每次都调。
+    """
+
+    def _compose(self, tmp_path, llm, **extra):
+        from app.services.video import compose_video
+
+        pool_dir = tmp_path / "assets"
+        pool_dir.mkdir(exist_ok=True)
+        cover = make_png(pool_dir / "cover.png")
+        illu = make_png(pool_dir / "illu.png")
+        audio = tmp_path / "a.wav"
+        import wave
+
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 2)
+
+        return compose_video(
+            segments=[{"speaker": "A", "text": "第一段"}, {"speaker": "B", "text": "第二段"}],
+            timings=[FakeTiming(0, "A", 0.0, 1.0), FakeTiming(1, "B", 1.0, 2.0)],
+            audio_path=audio,
+            audio_duration=2.0,
+            cover_path=str(cover),
+            figures=[],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "work",
+            output_path=tmp_path / "out.mp4",
+            title="t",
+            llm=llm,
+            preset_scenes=[{"index": 0, "image": "cover"}, {"index": 1, "image": "illustration"}],
+            preset_assets={"cover": str(cover), "illustration": str(illu)},
+            **extra,
+        )
+
+    def test_reuse_mode_does_not_ask_the_model_by_default(self, tmp_path):
+        class ExplodingLLM:
+            mock = False
+
+            def _chat_json(self, *a, **k):
+                raise AssertionError("复用模式下默认不该调用模型")
+
+        result = self._compose(tmp_path, ExplodingLLM())
+        assert result.assignment == "reused"
+
+    def test_point_llm_runs_when_opted_in_and_is_stored(self, tmp_path):
+        class PointsLLM:
+            mock = False
+
+            def __init__(self):
+                self.calls = 0
+
+            def _chat_json(self, messages, **kwargs):
+                self.calls += 1
+                assert "14 个字" in messages[0]["content"]
+                return {"points": [{"segment": 0, "point": "成功率 67%"}, {"segment": 1, "point": ""}]}
+
+        llm = PointsLLM()
+        result = self._compose(tmp_path, llm, allow_point_llm=True)
+        assert llm.calls == 1
+        # 强调文案要**存进 scenes**，下次重新合成才能复用（不然每次重建都烧一次调用）
+        assert [s.get("point") for s in result.scenes] == ["成功率 67%", ""]
+
+    def test_stored_points_win_over_a_fresh_model_call(self, tmp_path):
+        class CountingLLM:
+            mock = False
+
+            def __init__(self):
+                self.calls = 0
+
+            def _chat_json(self, *a, **k):
+                self.calls += 1
+                return {"points": [{"segment": 0, "point": "新写的"}]}
+
+        llm = CountingLLM()
+        result = {}
+        from app.services.video import compose_video
+
+        pool_dir = tmp_path / "assets3"
+        pool_dir.mkdir()
+        cover = make_png(pool_dir / "cover.png")
+        illu = make_png(pool_dir / "illu.png")
+        import wave
+
+        audio = tmp_path / "a.wav"
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 2)
+
+        result = compose_video(
+            segments=[{"speaker": "A", "text": "第一段"}],
+            timings=[FakeTiming(0, "A", 0.0, 2.0)],
+            audio_path=audio,
+            audio_duration=2.0,
+            cover_path=str(cover),
+            figures=[],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "work",
+            output_path=tmp_path / "out.mp4",
+            title="t",
+            llm=llm,
+            allow_point_llm=True,
+            preset_scenes=[{"index": 0, "image": "cover", "point": "上次存下来的要点"}],
+            preset_assets={"cover": str(cover), "illustration": str(illu)},
+        )
+        assert llm.calls == 0, "已经有存下来的强调文案，不该再问模型"
+        assert result.scenes[0]["point"] == "上次存下来的要点"
+
+
+class TestPointsPromptLanguage:
+    """英文版的强调 prompt 必须**整段英文**。
+
+    实测踩到过：中文 system 里写着「语言与原文一致」，模型给英文脚本写的强调行
+    仍然是中文 —— 英文那一版的画面上整行中文。跟当初解读/脚本 prompt 同样的坑：
+    中文指令混在英文输出任务里，模型会跟着中文语感走。
+    """
+
+    SEGMENTS = [{"text": "It reaches 67% success on 16 tasks."}]
+
+    def test_english_prompt_has_no_chinese(self):
+        messages = build_points_messages(self.SEGMENTS, title="T", language="en")
+        for message in messages:
+            cjk = sum(1 for char in message["content"] if "\u4e00" <= char <= "\u9fff")
+            assert cjk == 0, f"英文版 prompt 里还有中文：{message['content'][:120]}"
+
+    def test_english_prompt_states_the_language_and_the_word_limit(self):
+        system = build_points_messages(self.SEGMENTS, title="T", language="en")[0]["content"]
+        assert "8 words" in system
+        assert "English" in system
+        assert "Every segment gets a line" in system
+
+    def test_chinese_prompt_still_chinese(self):
+        messages = build_points_messages(self.SEGMENTS, title="T", language="zh")
+        assert "14 个字" in messages[0]["content"]
+        assert "【脚本分段】" in messages[1]["content"]
+
+
+class TestPointLengthByLanguage:
+    """中英文的强调行长度上限必须分开定。
+
+    卡成一个数（20 字符）时，英文被切得只剩三四个词，实测出现过
+    「State pool outgrows」「Memory problem is」这种断在半句的强调行 ——
+    而 prompt 对英文的要求是「8 个词」（≈40 字符），两边必须对齐。
+    """
+
+    def test_limits_differ(self):
+        assert point_char_limit("zh") == POINT_MAX_CHARS
+        assert point_char_limit("en") == POINT_MAX_CHARS_EN
+        assert POINT_MAX_CHARS_EN > POINT_MAX_CHARS
+
+    def test_english_point_of_eight_words_survives(self):
+        line = "State pool outgrows the model weights"   # 38 字符 ≈ 6 个词
+        points = _normalize_points([{"segment": 0, "point": line}], count=1, max_chars=POINT_MAX_CHARS_EN)
+        assert points[0] == line, "英文 8 词以内的强调行不该被切断"
+
+    def test_chinese_point_still_shortens(self):
+        chinese = "状态池显存占用超过模型权重本身，这个问题在高并发下更明显"
+        points = _normalize_points([{"segment": 0, "point": chinese}], count=1)
+        assert 0 < len(points[0]) <= POINT_MAX_CHARS

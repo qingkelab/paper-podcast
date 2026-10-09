@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import html
+import re
 import logging
 import shutil
 import subprocess
@@ -61,12 +62,41 @@ VIDEO_W = 936
 VIDEO_H = 1210
 FPS = 30
 
-# 竖版布局：标题条 → 图片区 → 图注 → 字幕面板
+# 竖版布局：标题条 → 图片区 → 图注 → **强调行** → 字幕面板
+#
+# 图片区从 812 收到 742：腾出来的 70px 给「本段要点」那一行大字。
+# 这是刻意的取舍 —— 观众要的是「这段在讲什么」，论文配图是佐证。
+# 图注、强调行、字幕三者的位置必须互不重叠，改任何一个都要一起看。
 TITLE_BASELINE = 46
 IMAGE_TOP = 74
 IMAGE_BOX_W = VIDEO_W - 40      # 896
-IMAGE_BOX_H = 812
+IMAGE_BOX_H = 742
 CAPTION_TOP = IMAGE_TOP + IMAGE_BOX_H + 6
+
+# 「本段要点」强调行：浅蓝底 + 左侧色条 + 大字，是画面上最抢眼的一行
+POINT_TOP = 878
+POINT_LEFT = 40
+POINT_WIDTH = VIDEO_W - POINT_LEFT * 2
+POINT_HEIGHT = 74
+POINT_BAR_W = 6
+POINT_BG = "#eef4fb"
+POINT_BAR = "#2f6fb5"
+POINT_TEXT = "#17416f"
+POINT_MAX_FONT = 40.0
+POINT_SLIDE_SEC = 0.4     # 强调行滑入的时长：它标记「新的一段开始了」
+# 强调文案的长度上限。40px 字号下一行能放约 22 个汉字、约 44 个西文字符，
+# 各留一点余量。
+#
+# **中英文必须分开定**：卡成一个数（比如 20 字符）会把英文切得只剩三四个词 ——
+# 实测出现过 "State pool outgrows"、"Memory problem is" 这种断在半句的强调行，
+# 而 prompt 里对英文的要求是「8 个词」（≈40 字符）。两边必须对齐。
+POINT_MAX_CHARS = 20
+POINT_MAX_CHARS_EN = 40
+
+
+def point_char_limit(language: str) -> int:
+    """强调行的长度上限（按语言）。prompt 里的字数要求必须和它对齐。"""
+    return POINT_MAX_CHARS_EN if language == "en" else POINT_MAX_CHARS
 
 SUBTITLE_TOP = 968
 SUBTITLE_LEFT = 40
@@ -91,20 +121,21 @@ SUBTITLE_TEXT = "#16202f"
 # 动效
 # ---------------------------------------------------------------------------
 #
-# 目标是「别像在翻 PPT」。三件事，都是**先渲染出帧、采过像素确认真在动**才留下的：
+# **动效必须服务于内容，而不是「让画面别太静」。**
 #
-# 1. **缓慢推近/拉远 + 轻微平移**（Ken Burns）。一张静止画面撑 4 秒以上，
-#    观众就会觉得「卡住了」；持续的运动能让同一张图撑得更久。
-# 2. **字幕逐句出现**。一段话一次性糊上去，信息密度最低；拆成两句先后浮现，
-#    观众跟得上节奏，画面也在段中间变化一次。
-# 3. **顶部进度条**。长内容需要「还剩多少」的锚点。
+# 第一版做的是缓慢推近/拉远 + 平移（Ken Burns），被一句「这种图片无意义的放大、
+# 移动和缩小没有价值，重点是突出解读的内容」否掉了 —— 而且否得对：
+# 那种运动跟正在讲的内容没有任何关系，观众看得出它只是在动。
+# 现在留下的是**三件都在讲内容的事**：
 #
-# 三条都靠 ffmpeg 滤镜完成，**不额外渲染帧**（渲染成本不变）：
-# 推拉用 `zoompan`，字幕用 `overlay` + `fade`，进度条用 `overlay` 的逐帧 x 表达式。
-MOTION_UPSCALE = 2        # 推镜前先放大：zoompan 按整数像素取窗口，放大 2 倍后步进更细、不抖
-MOTION_MIN_ZOOM = 1.02    # 起始缩放
-MOTION_ZOOM_SPAN = 0.07   # 一段之内推拉多少（再大就像在晃镜头）
-MOTION_PAN_RATIO = 0.3    # 平移幅度：占「可平移余量」的比例
+# 1. **「本段要点」强调行**：一段大字滑入，写的就是这一段最该被记住的结论或数字。
+#    这是画面上最抢眼的东西，也是「突出解读」的落点。
+# 2. **字幕逐句出现**，并把句子里的**数字**标成强调色 + 浅色底：
+#    论文解读里真正有信息量的往往就是那个百分比。
+# 3. **顶部进度条**：长内容需要「还剩多少」的锚点。
+#
+# 三件都靠 ffmpeg 滤镜完成，**不额外渲染帧**（渲染成本不变）：
+# 强调行/字幕用 `overlay` + `fade`/`x` 表达式，进度条用 `overlay` 的逐帧 x 表达式。
 PROGRESS_BAR_H = 5
 PROGRESS_BAR_COLOR = "#2f6fb5"
 # 编码质量。**加了动效之后不能再用 23**：静止幻灯片一帧能顶几秒、压缩率极高，
@@ -137,6 +168,8 @@ class Scene:
     speaker: str = ""
     text: str = ""
     caption: str = ""  # 图片说明（图注），显示在图片下方
+    # 「本段要点」：一句不超过 14 个字的大字强调（模型写，兜底从原文抠数字）
+    point: str = ""
     # "outro" 表示这是片尾品牌段 —— 视频层会把它渲染成品牌卡片而不是普通配图页
     brand: str = ""
 
@@ -259,6 +292,225 @@ def build_assign_messages(
     ]
 
 
+POINTS_SYSTEM = """你在给一个「论文解读视频」做**画面强调**。
+
+观众在听双人播客，画面上除了字幕，还需要一句**大字强调**：这一段最该被记住的是什么。
+你要为每一段脚本写一句强调文案。
+
+规则：
+- **不超过 14 个字**（英文不超过 8 个词）。画面上是一行大字，超了就挤。
+- 必须是**这一段自己的内容**：关键的结论、数字、机制名、对比结果。
+  有数字就优先给数字（「成功率 67%」「比基线高 3 倍」）—— 这是观众最记得住的东西。
+- **不要**写「很重要」「值得关注」这类空话，也不要把整段话缩写一遍。
+- **不要编造**原文没有的数字或结论。
+- **每一段都要有一句**，包括过渡段：过渡段就写这一段**要讲的话题**（例如「误差为什么会滚雪球」），
+  而不是「我们接着看」这种本身没有信息量的话。
+  （第一版允许留空，结果整条视频只有 18% 的时间有强调行 —— 观众感觉「这行时有时无」。）
+- 语言与原文一致（原文中文就中文，英文就英文）。
+
+只输出 JSON：
+{"points": [{"segment": 0, "point": "成功率 67%"}, {"segment": 1, "point": ""}]}
+每个脚本段都要有一项。不要输出任何解释。"""
+
+POINTS_SYSTEM_EN = """You write the big on-screen emphasis line for a paper-explainer video.
+
+The viewer is listening to a two-host podcast. Besides the captions, the screen shows one
+line of large text: the single thing from this segment worth remembering. Write that line
+for every segment.
+
+Rules:
+- **At most 8 words.** It is one large line on a 936px-wide canvas; longer will not fit.
+- Use **this segment's own content**: the key result, number, mechanism name, or comparison.
+  Prefer a number when there is one ("67% success rate", "3x over baseline") — that is what
+  viewers remember.
+- Do **not** write vague filler like "this matters" or "worth noting", and do not paraphrase
+  the whole segment.
+- Do **not** invent numbers or conclusions that are not in the text.
+- **Every segment gets a line**, transitions included: for a transition, name the topic it
+  is introducing ("why errors snowball"), not "let's move on" (which says nothing).
+  (The first version allowed empty lines; only 18% of the video ended up with an emphasis
+  line, which reads as "this line flickers on and off".)
+- **Write in English** (the whole video is English), **start with a capital letter**,
+  and do not end with a period — it is a headline, not a sentence.
+
+Output JSON only:
+{"points": [{"segment": 0, "point": "67% success rate"}, {"segment": 1, "point": "why errors snowball"}]}
+Include one entry per segment. No explanations."""
+
+# 强调行里允许出现的数字形态（用于本地兜底）
+_NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?\s*(?:%|％|倍|万|亿|千|个百分点|个|条|张|次|秒|分钟|层|维|B|M|K)?")
+
+
+def local_point(text: str, *, max_chars: int = POINT_MAX_CHARS, language: str = "zh") -> str:
+    """没有模型可用时的兜底强调行：从这一段的原文里抠出一句带数字的短语。
+
+    为什么只认数字：实测这几集的脚本里只有 **30%~47%** 的段落含阿拉伯数字
+    （有一集 0%），而「论文关键词命中」几乎是 0 —— 脚本是口语化的，不会照抄术语。
+    所以本地抽取给不出稳定的「要点」，真正的要点得让模型写（见 `POINTS_SYSTEM`）。
+    兜底只做最有把握的一件事：**把数字拎出来**，其余情况返回空串（画面就不显示强调行）。
+    """
+    clean = " ".join((text or "").split())
+    candidates = list(_NUMBER_TOKEN.finditer(clean))
+    if not candidates:
+        return ""
+
+    # 一句里常有多个数字（「16 个任务上平均成功率 67%」）——要挑**信息量最大**的那个：
+    # 百分比 > 带单位 > 光秃秃的整数。挑第一个的话会拎出「16 个任务」，
+    # 而观众真正该记住的是「67%」。
+    def importance(match: re.Match[str]) -> int:
+        token = match.group(0)
+        if "%" in token or "％" in token or "倍" in token or "百分点" in token:
+            return 3
+        if any(unit in token for unit in ("万", "亿", "千", "秒", "分钟", "层", "维", "B", "M", "K")):
+            return 2
+        return 1 if len(token) >= 2 else 0
+
+    match = max(candidates, key=importance)
+
+    # 以数字为中心，向左右扩到句子边界，再截到 max_chars
+    left, right = match.start(), match.end()
+    for index in range(match.start() - 1, -1, -1):
+        if clean[index] in "。！？；，、,.;:":
+            left = index + 1
+            break
+        left = index
+    for index in range(match.end(), len(clean)):
+        if clean[index] in "。！？；，、,.;:":
+            right = index
+            break
+        right = index + 1
+
+    phrase = clean[left:right].strip()
+    # 短语里若还夹着标点（模型写的问句「Should we go to 8 bits? People tried…」），
+    # 就在第一个标点处收掉，别把下一句的头几个词带进来（实测出现过「to 8 bits? People」）
+    for position, char in enumerate(phrase):
+        if char in "。！？；，、,.;:!?":
+            phrase = phrase[:position]
+            break
+    phrase = phrase.strip()
+    if not phrase:
+        return ""
+    if len(phrase) > max_chars:
+        # 太长就只留数字和它前后的少量上下文
+        head = max(0, match.start() - left - 4)
+        phrase = clean[left + head : right]
+    return shorten_point(phrase, max_chars=max_chars, language=language)
+
+
+# 收短之后可能停在虚词上（「Quantization error feeds back and」「Memory problem is」）。
+# 画面上最抢眼的一行以虚词结尾很扎眼，把它们去掉 —— 只在剩下的长度还够时去。
+_TRAILING_STOPWORDS: dict[str, frozenset[str]] = {
+    "en": frozenset(
+        """and or but the a an to of with for in on that is are was were be been being as by at
+        from it its this these those than then so if when while which who whom whose not no into
+        over under about after before""".split()
+    ),
+    "zh": frozenset("的 了 和 与 或 而 就 还 也 在 是 把 被 对 从 到 这 那 并 且 以 及 有 会".split()),
+}
+
+
+def _strip_trailing_stopwords(text: str, *, language: str, floor: int) -> str:
+    """反复去掉结尾的虚词，直到不是虚词或剩下的太短为止。"""
+    stopwords = _TRAILING_STOPWORDS.get(language, frozenset())
+    if not stopwords:
+        return text
+    # 英文按空格分词；中文按字判断（中文虚词就是单字）
+    if language == "zh":
+        while text and text[-1] in stopwords and len(text) - 1 >= floor:
+            text = text[:-1]
+        return text.rstrip("，,、 ")
+    words = text.split()
+    while words and words[-1].strip(".,!?;:").lower() in stopwords:
+        if len(" ".join(words[:-1])) < floor:
+            break
+        words = words[:-1]
+    return " ".join(words).rstrip(" ,;:")
+
+
+def shorten_point(text: str, *, max_chars: int = POINT_MAX_CHARS, language: str = "zh") -> str:
+    """把过长的强调文案收短到上限，**在词/标点边界处断开**。
+
+    按字符硬切会切出「at 4 and 6 bi」「INT6 errors a」这种半截话（实测踩到过），
+    画面上最抢眼的一行出现半截英文比不显示还糟。
+    优先切成句标点，其次空格，实在没有才硬截。
+    """
+    clean = " ".join((text or "").split())
+    floor = int(max_chars * 0.5)
+    if len(clean) <= max_chars:
+        return _strip_trailing_stopwords(clean, language=language, floor=floor)
+    window = clean[:max_chars]
+    for separator in ("，", "。", "、", "；", "：", "！", "？", ",", ".", ";", ":", "!", "?", " "):
+        cut = window.rfind(separator)
+        if cut >= max_chars * 0.6:
+            return _strip_trailing_stopwords(
+                window[:cut].strip(), language=language, floor=floor
+            )
+    return _strip_trailing_stopwords(window.strip(), language=language, floor=floor)
+
+
+def build_points_messages(
+    segments: list[dict[str, Any]], *, title: str = "", language: str = "zh"
+) -> list[dict[str, str]]:
+    """为每一段脚本要一句「大字强调」。
+
+    单独一次调用（而不是塞进逐段配图那次）的原因：重新合成视频时必须**复用**画面分配、
+    不能重新问模型，但强调文案是可以补的、而且补一次就存下来。两件事的生命周期不同。
+
+    **英文版必须整段用英文 prompt**（`POINTS_SYSTEM_EN`）：中文 system 里就算写了
+    「语言与原文一致」，模型给英文脚本写的强调行仍然是中文 —— 实测踩到过，
+    英文那一版的画面上整行中文。这跟当初解读/脚本 prompt 踩的是同一个坑。
+    """
+    system = POINTS_SYSTEM if language == "zh" else POINTS_SYSTEM_EN
+    script_lines = []
+    for index, segment in enumerate(segments):
+        text = (segment.get("text") or "").strip().replace("\n", " ")
+        script_lines.append(f"[{index}] {text}")
+
+    if language == "zh":
+        user = f"""【论文标题】{title or "（未提供）"}
+
+【脚本分段】共 {len(segments)} 段（编号 0 到 {len(segments) - 1}）
+{chr(10).join(script_lines)}
+
+请为每一段写一句不超过 14 个字的大字强调，输出 JSON。"""
+    else:
+        user = f"""[PAPER TITLE] {title or "(not provided)"}
+
+[SCRIPT SEGMENTS] {len(segments)} segments (numbered 0 to {len(segments) - 1})
+{chr(10).join(script_lines)}
+
+Write one emphasis line of at most 8 words for every segment. Output JSON only."""
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _normalize_points(
+    raw: Any, *, count: int, max_chars: int = POINT_MAX_CHARS, language: str = "zh"
+) -> list[str]:
+    """整理模型给的强调文案：丢掉认不出的项、超长的截断，缺的补空串。
+
+    返回的列表长度一定是 `count` —— 调用方按段号取用，缺项要能对上位置。
+    """
+    points = [""] * max(count, 0)
+    if not isinstance(raw, list):
+        return points
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("segment", item.get("index")))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < count:
+            continue
+        text = shorten_point(str(item.get("point") or ""), max_chars=max_chars, language=language)
+        if text:
+            points[index] = text
+    return points
+
+
 def _normalize_per_segment(
     raw: Any, *, count: int, valid_ids: set[str], default_id: str
 ) -> list[str] | None:
@@ -350,6 +602,7 @@ def build_scenes(
     assets: dict[str, ImageAsset],
     image_for_segment: list[str],
     fallback_id: str,
+    points: list[str] | None = None,
 ) -> list[Scene]:
     """把脚本、时间戳和逐段配图拼成画面时间轴。
 
@@ -358,6 +611,8 @@ def build_scenes(
 
     `image_for_segment[i]` 是第 i 段脚本要显示的图片 id —— 逐段指定而不是
     「从某段开始一直用到下一张图」，这样才能保证画面跟着话题走。
+
+    `points[i]` 是第 i 段的「要点强调行」文案（可为空串 → 这一段不显示强调行）。
     """
     if not segments or not timings:
         raise VideoError("缺少脚本或时间戳，无法建立视频时间轴")
@@ -405,6 +660,7 @@ def build_scenes(
                 speaker=str(segment.get("speaker") or getattr(timing, "speaker", "") or "A"),
                 text=str(segment.get("text") or ""),
                 caption=asset.caption,
+                point=(points[index] if points and index < len(points) else ""),
                 brand=str(segment.get("brand") or ""),
             )
         )
@@ -594,7 +850,12 @@ def _fit_subtitle(
 
 
 def render_slide(
-    scene: Scene, output_path: Path, *, title: str = "", include_subtitle: bool = True
+    scene: Scene,
+    output_path: Path,
+    *,
+    title: str = "",
+    include_subtitle: bool = True,
+    include_point: bool = True,
 ) -> Path:
     """渲染一帧画面：配图 + 图注 + 字幕（白底竖版，与论文首页同尺寸）。
 
@@ -669,6 +930,28 @@ def render_slide(
         f'<rect x="0" y="{SUBTITLE_TOP}" width="{VIDEO_W}" height="2" fill="{SUBTITLE_RULE}"/>'
     )
 
+    if include_point and scene.point:
+        # 强调行：浅蓝底 + 左侧色条 + 大字。它是画面上最抢眼的一行，
+        # 也是「突出解读内容」的落点（不是装饰，是每一段的核心结论）。
+        parts.append(
+            f'<rect x="{POINT_LEFT}" y="{POINT_TOP}" width="{POINT_WIDTH}" '
+            f'height="{POINT_HEIGHT}" rx="10" fill="{POINT_BG}"/>'
+        )
+        parts.append(
+            f'<rect x="{POINT_LEFT}" y="{POINT_TOP}" width="{POINT_BAR_W}" '
+            f'height="{POINT_HEIGHT}" rx="3" fill="{POINT_BAR}"/>'
+        )
+        point_size, point_lines = _fit_subtitle(
+            scene.point, max_lines=1, max_size=POINT_MAX_FONT
+        )
+        if point_lines:
+            baseline = POINT_TOP + POINT_HEIGHT / 2 + point_size * 0.36
+            parts.append(
+                f'<text x="{POINT_LEFT + POINT_BAR_W + 18}" y="{baseline:.0f}" '
+                f'font-family="{FONT_STACK}" font-size="{point_size:.0f}" '
+                f'font-weight="600" fill="{POINT_TEXT}">{html.escape(point_lines[0])}</text>'
+            )
+
     if include_subtitle:
         line_height = font_size * 1.36
         for offset, line in enumerate(lines):
@@ -680,6 +963,87 @@ def render_slide(
 
     parts.append("</svg>")
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _rasterize_custom("\n".join(parts), output_path)
+    return output_path
+
+
+def _number_runs(line: str) -> list[tuple[str, bool]]:
+    """把一行字幕切成 [普通文字, 数字, 普通文字, ...]，数字段要单独上色。
+
+    只认阿拉伯数字：「第一」「两倍」这种中文数字太高频，标出来满屏都是重点。
+    """
+    runs: list[tuple[str, bool]] = []
+    cursor = 0
+    for match in _NUMBER_TOKEN.finditer(line):
+        if match.start() > cursor:
+            runs.append((line[cursor : match.start()], False))
+        runs.append((match.group(0), True))
+        cursor = match.end()
+    if cursor < len(line):
+        runs.append((line[cursor:], False))
+    return runs
+
+
+def _caption_line_parts(line: str, *, baseline: float, font_size: float) -> list[str]:
+    """渲染字幕的一行：数字用强调色 + 浅色底标出来，其余照常。
+
+    为什么值得单独做：一期论文解读里真正有信息量的往往就是那个「67%」，
+    而它夹在一整行灰白文字里最容易被读漏。强调它不需要任何模型输出，也不会看错。
+    """
+    from .illustration import _char_width
+
+    runs = _number_runs(line)
+    if not any(is_number for _, is_number in runs):
+        return [
+            f'<text x="{SUBTITLE_LEFT}" y="{baseline:.0f}" '
+            f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
+            f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
+        ]
+
+    parts: list[str] = []
+    cursor = SUBTITLE_LEFT
+    for text_run, is_number in runs:
+        width = sum(_char_width(char) for char in text_run) * font_size
+        if is_number:
+            parts.append(
+                f'<rect x="{cursor - 3:.1f}" y="{baseline - font_size * 0.92:.1f}" '
+                f'width="{width + 6:.1f}" height="{font_size * 1.22:.1f}" rx="4" '
+                f'fill="{POINT_BG}"/>'
+            )
+        parts.append(
+            f'<text x="{cursor:.1f}" y="{baseline:.0f}" '
+            f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
+            f'fill="{POINT_TEXT if is_number else SUBTITLE_TEXT}">{html.escape(text_run)}</text>'
+        )
+        cursor += width
+    return parts
+
+
+def render_point_row(point: str, output_path: Path) -> Path:
+    """只渲染「本段要点」那一行（画幅 936×POINT_HEIGHT，叠在 y=POINT_TOP）。
+
+    单独成层是为了让它**滑入**：一段新的内容开始时，这行从左边滑进来 0.4 秒。
+    这是有意保留的动效 —— 它标记「内容换了一段」，跟画面在讲什么直接相关，
+    与那种「整张图慢慢放大」的无意义运动不是一回事。
+    """
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{POINT_HEIGHT}" '
+        f'viewBox="0 0 {VIDEO_W} {POINT_HEIGHT}">',
+        f'<rect x="{POINT_LEFT}" y="0" width="{POINT_WIDTH}" height="{POINT_HEIGHT}" '
+        f'rx="10" fill="{POINT_BG}"/>',
+        f'<rect x="{POINT_LEFT}" y="0" width="{POINT_BAR_W}" height="{POINT_HEIGHT}" '
+        f'rx="3" fill="{POINT_BAR}"/>',
+    ]
+    size, lines = _fit_subtitle(point, max_lines=1, max_size=POINT_MAX_FONT)
+    if lines:
+        baseline = POINT_HEIGHT / 2 + size * 0.36
+        parts.append(
+            f'<text x="{POINT_LEFT + POINT_BAR_W + 18}" y="{baseline:.0f}" '
+            f'font-family="{FONT_STACK}" font-size="{size:.0f}" '
+            f'font-weight="600" fill="{POINT_TEXT}">{html.escape(lines[0])}</text>'
+        )
+    parts.append("</svg>")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _rasterize_custom("\n".join(parts), output_path)
     return output_path
@@ -711,10 +1075,9 @@ def render_caption_band(text: str, output_path: Path) -> Path:
         # 照搬那个基线会让文字顶在上沿、下面空一大片
         first_baseline = (band_h - block_h) / 2 + font_size * 0.95
         for offset, line in enumerate(lines):
-            parts.append(
-                f'<text x="{SUBTITLE_LEFT}" y="{first_baseline + offset * line_height:.0f}" '
-                f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
-                f'fill="{SUBTITLE_TEXT}">{html.escape(line)}</text>'
+            baseline = first_baseline + offset * line_height
+            parts.extend(
+                _caption_line_parts(line, baseline=baseline, font_size=font_size)
             )
 
     parts.append("</svg>")
@@ -883,50 +1246,6 @@ def ffmpeg_available() -> bool:
 # --------------------------------------------------------------------------
 
 
-def motion_filter(index: int, frames: int, *, still: bool = False) -> str:
-    """给第 index 段画面生成 ffmpeg 滤镜：缓慢推近或拉远 + 轻微平移。
-
-    几个刻意的选择：
-
-    - **缩放用 `on`（输出帧序号）算，不用累加式 `zoom+delta`**。累加式依赖上一帧状态，
-      分段编码时每段都从 1.0 重新开始，段与段之间的节奏会不齐；而且浮点累加在不同
-      ffmpeg 版本上落点不同。`on` 是确定的：同一段无论怎么编都是同一条曲线。
-    - **先 `scale` 放大 `MOTION_UPSCALE` 倍再 `zoompan`**。zoompan 在整数像素上取窗口，
-      1.02~1.09 的变化在原始尺寸上只有几个像素的步进，肉眼能看到一顿一顿的抖动；
-      放大 2 倍后步进细一倍，实测顺滑。
-    - **推近/拉远交替、平移方向按段号轮换**。整片都朝一个方向推，看久了像镜头坏了。
-    - **片尾品牌卡不推镜**（`still=True`）：那上面是关注引导的大字，动了反而难读。
-    """
-    if still or frames <= 1:
-        return f"scale={VIDEO_W}:{VIDEO_H}"
-
-    up_w, up_h = VIDEO_W * MOTION_UPSCALE, VIDEO_H * MOTION_UPSCALE
-    low = MOTION_MIN_ZOOM
-    high = MOTION_MIN_ZOOM + MOTION_ZOOM_SPAN
-    if index % 2 == 0:
-        zoom = f"{low}+{MOTION_ZOOM_SPAN}*on/{frames}"      # 推近
-    else:
-        zoom = f"{high}-{MOTION_ZOOM_SPAN}*on/{frames}"      # 拉远
-
-    # 平移方向：0 = 居中；1 = 左右；2 = 上下。乘以 on/frames 让它和缩放同步走完全程。
-    drift = f"({MOTION_PAN_RATIO}*on/{frames})"
-    center_x, center_y = "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
-    variant = index % 3
-    if variant == 1:
-        pos_x = f"(iw-iw/zoom)*{drift}"
-        pos_y = center_y
-    elif variant == 2:
-        pos_x = center_x
-        pos_y = f"(ih-ih/zoom)*{drift}"
-    else:
-        pos_x, pos_y = center_x, center_y
-
-    return (
-        f"scale={up_w}:{up_h},"
-        f"zoompan=z='{zoom}':x='{pos_x}':y='{pos_y}':d=1:s={VIDEO_W}x{VIDEO_H}:fps={FPS}"
-    )
-
-
 def progress_bar_svg() -> str:
     """进度条素材：一条**全宽**的色带。
 
@@ -1031,6 +1350,7 @@ def encode_video(
     *,
     target_duration: float | None = None,
     caption_bands: list[list[CaptionBand]] | None = None,
+    point_rows: list[Path | None] | None = None,
 ) -> VideoResult:
     """把幻灯片序列和音频合成 MP4。
 
@@ -1055,7 +1375,8 @@ def encode_video(
     现在是**每段先单独编成一个小片段**（`-frames:v` 精确控帧数），再 `-c copy`
     拼接，具体做法：
 
-    - 每段的底图过 `motion_filter`（缓慢推近/拉远 + 平移）；
+    - 每段的底图**静止**（不做推拉镜头：那种运动跟内容无关，观众看得出是凑的）；
+    - 「本段要点」强调行单独成层，每段开头从左侧**滑入** 0.4 秒 —— 它标记内容换段；
     - 字幕分句后各做成一张图，用 `overlay` + `fade` 按时间叠上去；
     - 顶部进度条是一张全宽色带，用 overlay 的**逐帧 x 表达式**推进画面，
       段与段之间靠「全局起始时间」接续，所以拼起来是一条连续推进的进度。
@@ -1079,6 +1400,7 @@ def encode_video(
     _rasterize_custom(progress_bar_svg(), bar_path)
 
     bands = caption_bands or [[] for _ in scenes]
+    rows = point_rows or [None] * len(scenes)
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
     frame_counts = [max(int(round(scene.duration * FPS)), 1) for scene in scenes]
@@ -1105,8 +1427,20 @@ def encode_video(
                 "-loop", "1", "-framerate", str(FPS), "-i", str(slide),
                 "-loop", "1", "-framerate", str(FPS), "-i", str(bar_path),
             ]
-            graph = [f"[0:v]{motion_filter(index, frames, still=scene.brand == 'outro')}[v0]"]
+            graph = [f"[0:v]scale={VIDEO_W}:{VIDEO_H}[v0]"]
             last, node = "v0", 0
+
+            # ---- 本段要点：从左侧滑入（标记这一段的开始） ----
+            row = rows[index] if index < len(rows) else None
+            if row is not None:
+                inputs += ["-loop", "1", "-framerate", str(FPS), "-i", str(row)]
+                node += 1
+                graph.append(f"[2:v]format=rgba[pt{node}]")
+                graph.append(
+                    f"[{last}][pt{node}]overlay="
+                    f"x='-(W)+W*min(1,t/{POINT_SLIDE_SEC:.2f})':y={POINT_TOP}[v{node}]"
+                )
+                last = f"v{node}"
 
             # ---- 进度条：整条色带从左推进，用全局时间算，跨段连续 ----
             node += 1
@@ -1120,12 +1454,13 @@ def encode_video(
             # ---- 字幕：第 0 句从一开始就在，后面的按窗口淡入 ----
             scene_bands = bands[index] if index < len(bands) else []
             windows = beat_windows([band.text for band in scene_bands], scene.duration)
+            first_band_input = 2 + (1 if row is not None else 0)
             for beat_index, (band, (beat_start, _beat_end)) in enumerate(
                 zip(scene_bands, windows)
             ):
                 inputs += ["-loop", "1", "-framerate", str(FPS), "-i", str(band.image)]
                 node += 1
-                source = 2 + beat_index
+                source = first_band_input + beat_index
                 graph.append(
                     f"[{source}:v]format=rgba,fade=t=in:st={beat_start:.3f}:"
                     f"d={CAPTION_FADE_SEC}:alpha=1[cap{node}]"
@@ -1294,6 +1629,8 @@ def compose_video(
     max_topic_images: int = 4,
     preset_scenes: list[dict[str, Any]] | None = None,
     preset_assets: dict[str, str] | None = None,
+    allow_point_llm: bool | None = None,
+    language: str = "zh",
 ) -> VideoResult:
     """合成视频解读播客。任何一步失败都抛 VideoError，由调用方降级。
 
@@ -1432,6 +1769,85 @@ def compose_video(
         sum(1 for pick in image_for_segment if pick == default_id),
     )
 
+    # ---- 「本段要点」强调行 ----
+    #
+    # 三级来源，优先级从高到低：
+    # 1. **上次存下来的**（`video.scenes[i].point`）—— 重新合成时必须复用，
+    #    否则用户只是转了个配图，整段强调文案就全变了。
+    # 2. **让模型写**（`POINTS_SYSTEM`）。这是唯一能给出「这一段最该记住什么」的来源：
+    #    实测本地抽取够不着 —— 只有 30%~47% 的段落含阿拉伯数字，关键词命中接近 0。
+    # 3. **本地兜底**（`local_point`，只抠数字），没有就留空、不显示强调行。
+    #
+    # **复用画面时默认不碰模型**（`tests/test_video.py::TestPresetReuse` 钉着这条），
+    # 因为「用户只是转了个配图，画面和文案不该全变」。但旧视频里没有强调行文案，
+    # 需要能**单独补一次**：调用方显式传 `allow_point_llm=True` 即可（见维护脚本）。
+    if allow_point_llm is None:
+        allow_point_llm = not preset_scenes
+    point_limit = point_char_limit(language)
+
+    points: list[str] = [""] * len(segments)
+    if preset_scenes:
+        reused = 0
+        for entry in preset_scenes:
+            index = entry.get("index")
+            point = str(entry.get("point") or "").strip()
+            if isinstance(index, int) and 0 <= index < len(points) and point:
+                points[index] = point
+                reused += 1
+        if reused:
+            logger.info("强调行：复用上次的 %d 段", reused)
+
+    if (
+        allow_point_llm
+        and any(not point for point in points)
+        and llm is not None
+        and not getattr(llm, "mock", True)
+    ):
+        # 重试一次：这一路失败不会让视频整体失败（下面有本地兜底），
+        # 但结果会从「每段都有要点」退化成「只有含数字的段有」——
+        # 实测踩到过一次（中文那版整集没有要点，英文那版正常），所以值得多试一次。
+        for attempt in (1, 2):
+            try:
+                data = llm._chat_json(
+                    build_points_messages(segments, title=title, language=language),
+                    max_tokens=max(800, len(segments) * 40),
+                    temperature=0.3,
+                )
+                written = _normalize_points(
+                    data.get("points"),
+                    count=len(segments),
+                    max_chars=point_limit,
+                    language=language,
+                )
+                filled = 0
+                for index, point in enumerate(written):
+                    if point and not points[index]:
+                        points[index] = point
+                        filled += 1
+                if filled:
+                    logger.info("强调行：模型写了 %d 段", filled)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 1:
+                    logger.warning("强调行生成失败，重试一次：%s", exc)
+                else:
+                    logger.warning("强调行生成失败，退回本地抽取：%s", exc)
+
+    fallback_used = 0
+    for index, segment in enumerate(segments):
+        if not points[index]:
+            local = local_point(
+                str(segment.get("text") or ""), max_chars=point_limit, language=language
+            )
+            if local:
+                points[index] = local
+                fallback_used += 1
+    logger.info(
+        "强调行：共 %d 段有内容（其中本地兜底 %d 段）",
+        sum(1 for point in points if point),
+        fallback_used,
+    )
+
     scenes = build_scenes(
         segments=segments,
         timings=timings,
@@ -1439,12 +1855,15 @@ def compose_video(
         assets=pool,
         image_for_segment=image_for_segment,
         fallback_id=default_id,
+        points=points,
     )
 
     work_dir.mkdir(parents=True, exist_ok=True)
     slide_paths: list[Path] = []
     caption_bands: list[list[CaptionBand]] = []
     band_paths: list[Path] = []
+    point_rows: list[Path | None] = []
+    point_paths: list[Path] = []
     endcard_count = 0
     beat_count = 0
     for index, scene in enumerate(scenes):
@@ -1457,8 +1876,15 @@ def compose_video(
             render_endcard(scene, slide_path, title=title)
             endcard_count += 1
         elif len(beats) > 1:
-            # 字幕拆成两句 → 底图不画字幕，两句各自成图层按时叠上去
-            render_slide(scene, slide_path, title=title, include_subtitle=False)
+            # 字幕拆成两句 → 底图不画字幕，两句各自成图层按时叠上去；
+            # 强调行也交给独立图层（要滑入）
+            render_slide(
+                scene,
+                slide_path,
+                title=title,
+                include_subtitle=False,
+                include_point=False,
+            )
             for beat_index, beat in enumerate(beats):
                 band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
                 render_caption_band(beat, band_path)
@@ -1466,9 +1892,16 @@ def compose_video(
                 band_paths.append(band_path)
             beat_count += 1
         else:
-            render_slide(scene, slide_path, title=title)
+            render_slide(scene, slide_path, title=title, include_point=False)
         slide_paths.append(slide_path)
         caption_bands.append(bands)
+        if scene.point and scene.brand != "outro":
+            point_path = work_dir / f"point-{index:04d}.png"
+            render_point_row(scene.point, point_path)
+            point_rows.append(point_path)
+            point_paths.append(point_path)
+        else:
+            point_rows.append(None)
     logger.info(
         "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧，字幕分句 %d 段）",
         len(slide_paths), endcard_count, beat_count,
@@ -1481,10 +1914,16 @@ def compose_video(
         output_path,
         target_duration=audio_duration,
         caption_bands=caption_bands,
+        point_rows=point_rows,
     )
     result.assignment = strategy
     result.scenes = [
-        {"index": index, "image": image_for_segment[index]}
+        {
+            "index": index,
+            "image": image_for_segment[index],
+            # 强调文案存下来，重新合成时复用（见上面三级来源的说明）
+            "point": points[index] if index < len(points) else "",
+        }
         for index in range(min(len(segments), len(image_for_segment)))
     ]
     result.assets = {asset_id: str(asset.path) for asset_id, asset in pool.items()}
@@ -1492,7 +1931,7 @@ def compose_video(
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
     }
 
-    for temp_path in [*slide_paths, *band_paths]:
+    for temp_path in [*slide_paths, *band_paths, *point_paths]:
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
