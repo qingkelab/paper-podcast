@@ -1,9 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { Analysis } from '../api'
+import HighlightedText from './HighlightedText.vue'
 
 const props = defineProps<{
   analysis: Analysis | null
+  /** 关键词高亮（契约 §2.9）：与脚本正文同一套规则 */
+  keywords?: readonly string[] | null
+  highlight?: boolean
 }>()
 
 interface TextCard {
@@ -76,13 +80,15 @@ function paragraphs(body: string): string[] {
       </header>
 
       <div v-if="card.kind === 'text'" class="analysis-card__body">
-        <p v-for="(line, lineIndex) in paragraphs(card.body)" :key="lineIndex">{{ line }}</p>
+        <p v-for="(line, lineIndex) in paragraphs(card.body)" :key="lineIndex">
+          <HighlightedText :text="line" :keywords="keywords" :enabled="highlight" />
+        </p>
       </div>
 
       <ul v-else class="analysis-list">
         <li v-for="(item, itemIndex) in card.items" :key="itemIndex" class="analysis-list__item">
           <span class="analysis-list__bullet" aria-hidden="true">{{ itemIndex + 1 }}</span>
-          <span>{{ item }}</span>
+          <span><HighlightedText :text="item" :keywords="keywords" :enabled="highlight" /></span>
         </li>
       </ul>
     </section>

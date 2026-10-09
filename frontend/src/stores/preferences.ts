@@ -10,6 +10,12 @@ export interface EpisodePreferences {
   voice_b: string
   /** 要生成的语言版本（契约 §1：新建时用 options.languages 指定，至少一个） */
   languages: EpisodeLanguage[]
+  /**
+   * 关键词高亮开关（契约 §2.9：详情页一个开关，**默认开**，偏好存 localStorage）。
+   * 放在偏好里而不是组件内部：用户关掉它是有理由的（正文被涂得花花的），
+   * 换一集打开又自己亮起来会很烦。
+   */
+  highlight_keywords: boolean
 }
 
 const STORAGE_KEY = 'paper-podcast:preferences:v1'
@@ -21,6 +27,8 @@ export const DEFAULT_PREFERENCES: EpisodePreferences = {
   voice_a: 'zh_male_dayixiansheng_v2_saturn_bigtts',
   voice_b: 'zh_female_mizaitongxue_v2_saturn_bigtts',
   languages: [...DEFAULT_LANGUAGES],
+  // 契约 §2.9：默认开
+  highlight_keywords: true,
 }
 
 const DURATIONS = [3, 5, 10]
@@ -44,6 +52,12 @@ function sanitize(raw: unknown): EpisodePreferences {
     voice_a: typeof value.voice_a === 'string' && value.voice_a ? value.voice_a : DEFAULT_PREFERENCES.voice_a,
     voice_b: typeof value.voice_b === 'string' && value.voice_b ? value.voice_b : DEFAULT_PREFERENCES.voice_b,
     languages: languages.length ? languages : [...DEFAULT_PREFERENCES.languages],
+    // 老访客的偏好里没有这个字段：缺失时取默认值 true（而不是 false），
+    // 否则升级后高亮会「悄悄全关掉」
+    highlight_keywords:
+      typeof value.highlight_keywords === 'boolean'
+        ? value.highlight_keywords
+        : DEFAULT_PREFERENCES.highlight_keywords,
   }
 }
 

@@ -1,5 +1,5 @@
 /**
- * 数据模型 —— 严格对齐 docs/API.md（冻结版 v1）§1。
+ * 数据模型 —— 严格对齐 docs/API.md（冻结版 v2）§1。
  * 前端不得依赖契约之外的字段。
  */
 
@@ -23,6 +23,10 @@ export interface EpisodeOptions {
   level: LevelValue
   voice_a: string
   voice_b: string
+  /** 主语言（契约 §1）；老后端不返回 */
+  language?: EpisodeLanguage
+  /** 要产出哪些语言版本 */
+  languages?: EpisodeLanguage[]
 }
 
 export interface PaperMeta {
@@ -193,6 +197,18 @@ export interface Episode {
   created_at: string
   updated_at: string
 
+  // --- 归属与可见性（契约 §1「账号、归属与可见性（V2）」） ---------------------
+
+  /**
+   * 可见性。`public` 时任何人拿到 `share_token` 都能看（免登录）。
+   * 标成可选：老后端 / 老落盘数据里没有这两个字段，缺失一律当「私有、无分享」处理。
+   */
+  visibility?: Visibility
+  /** 分享随机串；只有 visibility=public 时才有值（契约 §2.7） */
+  share_token?: string | null
+  /** 所属专辑 id；不在任何专辑里时为 null（契约 §2.6） */
+  album_id?: string | null
+
   // --- 双语版本（契约 §1「双语版本（bilingual）」） --------------------------
   //
   // 上面的**顶层字段 mirror 主语言那一版**（`language` 指的那一版），所以老代码
@@ -234,6 +250,15 @@ export interface ListEpisodesResult {
   items: EpisodeSummary[]
   total: number
 }
+
+/**
+ * 可见性（契约 §1）。
+ * `private` 只有作者能看，`public` 任何人拿到 share_token 都能看。
+ */
+export type Visibility = 'private' | 'public'
+
+/** 无归属（V1 时代留下的数据）/ 有归属用户，用于提示 */
+export type HealthMode = 'open' | 'auth'
 
 export interface DurationOption {
   value: number
@@ -280,6 +305,164 @@ export interface HealthPayload {
     llm: ModeValue | string
     tts: ModeValue | string
   }
+  /**
+   * 契约 §2「GET /api/health」：`"open"`（库里还没有任何用户，免登录直接用）
+   * 或 `"auth"`（需要登录）。老后端不返回这个字段，缺失时按 `"auth"` 之外的
+   * 「不知道」处理 —— 见 stores/session.ts 的判定，避免误把用户挡在门外。
+   */
+  mode?: HealthMode
+}
+
+// ---------------------------------------------------------------------------
+// V2：账号与会话（契约 §2.5）
+// ---------------------------------------------------------------------------
+
+/** 契约 §2.5「用户信息」。口令永不返回。 */
+export interface User {
+  id: string
+  username: string
+  display_name: string
+  created_at: string
+}
+
+export interface RegisterInput {
+  username: string
+  password: string
+  display_name?: string
+  /** 服务端设了 SIGNUP_CODE 时必填且必须一致 */
+  signup_code?: string
+}
+
+export interface LoginInput {
+  username: string
+  password: string
+}
+
+export interface PasswordChangeInput {
+  current_password: string
+  new_password: string
+}
+
+/**
+ * 生成配额（`GET /api/usage`）。**这是 V2 后期新增的接口**，文档可能还没写进去，
+ * 所以前端一律 fail-open：拿不到就不显示额度提示，绝不因为这一个接口挡住生成表单。
+ *
+ * `remaining === null` 表示服务端没设配额（等于不限量）。
+ */
+export interface UsagePayload {
+  /** 最近 24 小时已生成几期（滑动窗口） */
+  used: number
+  /** 上限；0 表示不限 */
+  limit: number
+  remaining: number | null
+  resets_at: string | null
+}
+
+// ---------------------------------------------------------------------------
+// V2：个人专辑（契约 §2.6）
+// ---------------------------------------------------------------------------
+
+export interface Album {
+  id: string
+  title: string
+  description: string | null
+  episode_count: number
+  /** 专辑里最新一集的封面；没有单集时为 null */
+  cover_url: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** 详情接口附带里面的单集（只含 include_large=false 的摘要） */
+export interface AlbumDetail extends Album {
+  episodes: EpisodeSummary[]
+}
+
+export interface AlbumWriteInput {
+  title?: string
+  description?: string | null
+}
+
+// ---------------------------------------------------------------------------
+// V2：一键分享（契约 §2.7）
+// ---------------------------------------------------------------------------
+
+/**
+ * 公开视图。**不是完整 Episode**：不含 options / source_ref / raw_text /
+ * error / id / user_id，作者也只给展示名。
+ */
+export interface ShareVersion {
+  language: EpisodeLanguage
+  paper_meta: PaperMeta | null
+  analysis: Analysis | null
+  script: Script | null
+  illustration: Illustration | null
+  audio_url: string | null
+  audio_duration_sec: number | null
+  audio_bytes: number | null
+  video: VideoInfo | null
+}
+
+export interface ShareAuthor {
+  /** 展示名（可为空时后端回退到 username） */
+  display_name: string
+}
+
+export interface ShareView {
+  token: string | null
+  title: string
+  paper_meta: PaperMeta | null
+  language: EpisodeLanguage
+  languages: EpisodeLanguage[]
+  /** 按语言索引，与 Episode.versions 同形（但只含公开字段） */
+  versions: Partial<Record<EpisodeLanguage, ShareVersion>>
+  cover_url: string | null
+  cover_width?: number | null
+  cover_height?: number | null
+  figures: Figure[]
+  illustration: Illustration | null
+  video: VideoInfo | null
+  audio_url: string | null
+  audio_duration_sec: number | null
+  audio_bytes: number | null
+  script: Script | null
+  analysis: Analysis | null
+  author?: ShareAuthor | null
+  created_at: string
+}
+
+// ---------------------------------------------------------------------------
+// V2：批量生成（契约 §2.8）
+// ---------------------------------------------------------------------------
+
+export interface BatchFailure {
+  /** 出错的来源（链接 / 文件名） */
+  ref: string
+  reason: string
+}
+
+export interface BatchResult {
+  /** 成功入队的单集（摘要形态） */
+  created: EpisodeSummary[]
+  /** 失败项：**单项失败不影响其他项**，所以这里要逐条给出原因 */
+  failed: BatchFailure[]
+  total: number
+}
+
+/** 批量生成的入参：三种来源各走一套（PDF 多文件 / 多条链接 / 多篇文本） */
+export interface BatchFilesInput {
+  files: File[]
+  options?: EpisodeOptionsInput
+}
+
+export interface BatchUrlsInput {
+  urls: string[]
+  options?: EpisodeOptionsInput
+}
+
+export interface BatchTextsInput {
+  texts: string[]
+  options?: EpisodeOptionsInput
 }
 
 /** 创建任务的参数（三种来源统一成同一个 options 结构） */
@@ -322,6 +505,14 @@ export interface ApiAdapter {
   createEpisodeFromFile(input: CreateFileInput): Promise<Episode>
   createEpisodeFromUrl(input: CreateUrlInput): Promise<Episode>
   createEpisodeFromText(input: CreateTextInput): Promise<Episode>
+  /**
+   * 批量生成（契约 §2.8）：一次提交多篇，串行入队。
+   * **单项失败不影响其他项** —— 抓不到的进 `failed` 并给出原因，能用的照常入队。
+   * 上限 20 篇/次（超了后端返回 400）。
+   */
+  createEpisodeBatch(
+    input: BatchFilesInput | BatchUrlsInput | BatchTextsInput,
+  ): Promise<BatchResult>
   listEpisodes(params?: ListEpisodesParams): Promise<ListEpisodesResult>
   getEpisode(id: string): Promise<Episode>
   deleteEpisode(id: string): Promise<void>
@@ -352,4 +543,46 @@ export interface ApiAdapter {
   scriptTxtUrl(id: string, lang?: EpisodeLanguage): string
   /** 结构化解读 md 的下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
   analysisMdUrl(id: string, lang?: EpisodeLanguage): string
+
+  // --- V2：账号与会话（契约 §2.5） -----------------------------------------
+
+  /** `GET /api/auth/me`；未登录时抛 401 的 ApiError（**不**触发全局跳登录，由调用方决定） */
+  getMe(): Promise<User>
+  register(input: RegisterInput): Promise<User>
+  login(input: LoginInput): Promise<User>
+  /** 幂等：未登录也返回成功 */
+  logout(): Promise<void>
+  changePassword(input: PasswordChangeInput): Promise<void>
+
+  /** 生成配额（可能不存在于老后端：调用方必须 fail-open） */
+  getUsage(): Promise<UsagePayload>
+
+  // --- V2：个人专辑（契约 §2.6） -------------------------------------------
+
+  listAlbums(): Promise<Album[]>
+  createAlbum(input: AlbumWriteInput): Promise<Album>
+  getAlbum(id: string): Promise<AlbumDetail>
+  updateAlbum(id: string, input: AlbumWriteInput): Promise<Album>
+  /** 只删专辑，**不删里面的单集**（单集的 album_id 置空） */
+  deleteAlbum(id: string): Promise<void>
+  /** 批量加入（幂等），返回更新后的专辑详情 */
+  addAlbumEpisodes(id: string, episodeIds: string[]): Promise<AlbumDetail>
+  /** 从专辑里移出一集，返回更新后的专辑详情 */
+  removeAlbumEpisode(id: string, episodeId: string): Promise<AlbumDetail>
+
+  // --- V2：一键分享（契约 §2.7） -------------------------------------------
+
+  /** 开启分享；share_token 已有则**保持不变**（重复点不会让已发出的链接失效） */
+  enableShare(id: string): Promise<Episode>
+  /** 关闭分享：visibility 置 private、share_token 置 null（链接立即失效） */
+  disableShare(id: string): Promise<Episode>
+  /** 换一个新 token（旧链接立即失效） */
+  resetShare(id: string): Promise<Episode>
+  /** 公开视图（**免登录**）；token 失效或那一集不再公开时抛 404 */
+  getShare(token: string): Promise<ShareView>
+  /** 首页展示用的一期（**免登录**）：登录了取自己最新的，没登录取公开分享的 */
+  getShowcase(): Promise<ShareView>
+  /** 公开页的脚本 / 解读下载地址（mock 下是 Blob URL） */
+  shareScriptTxtUrl(token: string, lang?: EpisodeLanguage): string
+  shareAnalysisMdUrl(token: string, lang?: EpisodeLanguage): string
 }

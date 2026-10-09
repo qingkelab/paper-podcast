@@ -12,16 +12,24 @@ const props = withDefaults(
     episode: EpisodeSummary
     /** 首屏可见的卡片用 eager，别让 LCP 图卡在懒加载上 */
     priority?: boolean
+    /** 这一集所属专辑的名字（列表页用 albums 接口补上；null = 不在任何专辑里） */
+    albumTitle?: string | null
   }>(),
-  { priority: false },
+  { priority: false, albumTitle: null },
 )
 
 const emit = defineEmits<{
   (event: 'delete', episode: EpisodeSummary): void
   (event: 'retry', episode: EpisodeSummary): void
+  /** 「加入专辑 / 移出专辑」（契约 §2.6）：弹窗由列表页统一管，卡片只负责发起 */
+  (event: 'album', episode: EpisodeSummary): void
 }>()
 
 const isDone = computed(() => props.episode.status === 'completed')
+/** 已经公开分享（契约 §2.7）：列表上给个角标，免得忘了哪一期是对外可看的 */
+const isShared = computed(
+  () => (props.episode.visibility ?? 'private') === 'public' && Boolean(props.episode.share_token),
+)
 const target = computed(() => ({
   name: isDone.value ? 'episode' : 'task',
   params: { id: props.episode.id },
@@ -79,6 +87,12 @@ const thumbUrl = computed(() => {
 
     <div class="episode-card__ref" :title="refText">{{ refText }}</div>
 
+    <!-- V2：归属与可见性，一眼看得出这一集在哪张专辑、有没有对外分享 -->
+    <div v-if="isShared || albumTitle" class="episode-card__meta" style="margin-top: 8px">
+      <span v-if="isShared" class="badge badge--completed">已分享</span>
+      <span v-if="albumTitle" class="badge badge--accent">专辑 · {{ albumTitle }}</span>
+    </div>
+
     <div v-if="episode.status !== 'completed' && episode.status !== 'failed'" class="progress progress--thin">
       <div class="progress__bar" :style="{ width: `${episode.progress}%` }" />
     </div>
@@ -98,6 +112,9 @@ const thumbUrl = computed(() => {
         @click="emit('retry', episode)"
       >
         重新生成
+      </button>
+      <button type="button" class="btn btn--sm btn--ghost" @click="emit('album', episode)">
+        {{ albumTitle ? '改专辑' : '加入专辑' }}
       </button>
       <span class="spacer" />
       <span v-if="episode.audio_bytes" class="file-pill__size">{{ formatBytes(episode.audio_bytes) }}</span>

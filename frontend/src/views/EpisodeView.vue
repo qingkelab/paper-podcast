@@ -5,7 +5,9 @@ import {
   IS_MOCK,
   analysisMdUrl,
   deleteFigure,
+  disableShare,
   downloadUrl,
+  enableShare,
   errorMessage,
   getEpisode,
   isApiError,
@@ -13,6 +15,7 @@ import {
   isEpisodeLanguage,
   // 组件里已经有一个 video 计算属性，这个请求函数换个名字，避免撞名
   rebuildVideo as requestVideoRebuild,
+  resetShare,
   retryEpisode,
   rotateFigure,
   scriptTxtUrl,
@@ -26,7 +29,10 @@ import type {
   FigureRotateDirection,
   VideoInfo,
 } from '../api'
+import AccountPrompt from '../components/AccountPrompt.vue'
+import AlbumPickerDialog from '../components/AlbumPickerDialog.vue'
 import AudioPlayer from '../components/AudioPlayer.vue'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import AnalysisView from '../components/AnalysisView.vue'
 import FigureGallery from '../components/FigureGallery.vue'
 import FigureLightbox from '../components/FigureLightbox.vue'
@@ -34,13 +40,18 @@ import PaperMetaSection from '../components/PaperMetaSection.vue'
 import ScriptView from '../components/ScriptView.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { useMetaStore } from '../stores/meta'
+import { usePreferencesStore } from '../stores/preferences'
+import { useSessionStore } from '../stores/session'
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
+import { hasKeywords, normalizeKeywords } from '../utils/highlight'
 import { languageLabel, languageShort, loadEpisodeLanguage, rememberEpisodeLanguage } from '../utils/language'
 import { LEVEL_LABELS, SOURCE_LABELS } from '../utils/stages'
 
 const route = useRoute()
 const router = useRouter()
 const meta = useMetaStore()
+const prefs = usePreferencesStore()
+const session = useSessionStore()
 
 const id = computed(() => String(route.params.id ?? ''))
 const episode = ref<Episode | null>(null)
@@ -528,6 +539,144 @@ function rotateFromGallery(figure: Figure): void {
 }
 
 // ---------------------------------------------------------------------------
+// V2：一键分享（契约 §2.7）
+//
+// 三种操作：开启 / 关闭 / 换新链接。三者都返回更新后的完整 Episode，就地覆盖即可。
+// 「复制链接」优先用 navigator.clipboard —— 它在**非 HTTPS**（比如局域网 IP 访问）
+// 或用户拒绝权限时会直接抛错/不存在，所以必须有降级路径：把链接选中，让人手动复制。
+// ---------------------------------------------------------------------------
+
+const shareBusy = ref<null | 'enable' | 'disable' | 'reset'>(null)
+const shareError = ref<string | null>(null)
+/** 降级提示：剪贴板不可用时告诉用户「链接已经选中，按 ⌘/Ctrl+C」 */
+const copyHint = ref<string | null>(null)
+const shareLinkInput = ref<HTMLInputElement | null>(null)
+const confirmResetShare = ref(false)
+const albumPickerOpen = ref(false)
+
+const isPublic = computed(() => (episode.value?.visibility ?? 'private') === 'public')
+const shareToken = computed(() => episode.value?.share_token ?? null)
+
+/**
+ * 分享链接。**用 router.resolve 生成**，这样 Mock（hash 路由）与真实后端（history 路由）
+ * 两种模式都能得到可直接发出去的地址，不必在这里判 IS_MOCK 拼字符串。
+ */
+const shareLink = computed(() => {
+  const token = shareToken.value
+  if (!token) return ''
+  const resolved = router.resolve({ name: 'share', params: { token } })
+  if (typeof window === 'undefined') return resolved.href
+  return `${window.location.origin}${resolved.href}`
+})
+
+/** 关键词高亮开关（契约 §2.9）：默认开，偏好存 localStorage */
+const highlightEnabled = computed(() => prefs.preferences.highlight_keywords)
+const keywords = computed(() => displayPaperMeta.value?.keywords ?? [])
+const showHighlightSwitch = computed(() => hasKeywords(keywords.value))
+
+/**
+ * 正文里实际命中了几个关键词。
+ *
+ * 为什么要算它：关键词是模型抽的，**经常和正文对不上** ——
+ * 实测某一集的关键词是「循环状态量化 / Delta 规则线性注意力…」，
+ * 而脚本通篇没出现这几个词。这时开关照样能点，但页面上一个高亮都没有，
+ * 用户只会认为「这个功能坏了」。所以命中为 0 时要明说一句。
+ */
+const keywordsHitInBody = computed(() => {
+  const list = normalizeKeywords(keywords.value)
+  if (!list.length) return 0
+  const body = [
+    ...(displayScript.value?.segments ?? []).map((segment) => segment.text),
+    ...Object.values(displayAnalysis.value ?? {}).flatMap((value) =>
+      Array.isArray(value) ? value : [value],
+    ),
+  ]
+    .join(' ')
+    .toLowerCase()
+  return list.filter((word) => body.includes(word.toLowerCase())).length
+})
+
+/** 开了高亮但正文里一个都没命中 —— 说清楚，别让人以为按钮没生效 */
+const highlightHasNoMatch = computed(
+  () => showHighlightSwitch.value && highlightEnabled.value && keywordsHitInBody.value === 0,
+)
+
+/** 需要账号的操作（契约：开放模式下给中文提示，不自动跳登录页、也不弹后端 detail） */
+function needsAccount(action: string): boolean {
+  if (session.isOpenMode && !session.isLoggedIn) {
+    session.requireAccount(action)
+    return true
+  }
+  return false
+}
+
+function openAlbumPicker(): void {
+  if (needsAccount('把播客加入专辑')) return
+  albumPickerOpen.value = true
+}
+
+async function runShareAction(kind: 'enable' | 'disable' | 'reset'): Promise<void> {
+  if (shareBusy.value) return
+  const label = kind === 'enable' ? '开启分享' : kind === 'disable' ? '关闭分享' : '换新链接'
+  if (needsAccount(label)) return
+  const targetId = id.value
+  shareBusy.value = kind
+  shareError.value = null
+  copyHint.value = null
+  try {
+    const updated =
+      kind === 'enable'
+        ? await enableShare(targetId)
+        : kind === 'disable'
+          ? await disableShare(targetId)
+          : await resetShare(targetId)
+    // 中途换了单集：这次结果已经不属于当前页面，丢掉
+    if (id.value !== targetId) return
+    episode.value = updated
+    confirmResetShare.value = false
+    if (kind === 'enable') showToast('ok', '已开启分享，链接可以发给任何人了')
+    else if (kind === 'disable') showToast('ok', '已关闭分享，旧链接立即失效')
+    else showToast('ok', '已换新链接，旧链接立即失效')
+  } catch (cause) {
+    // 开放模式下后端返回 401「需要登录」：换成中文说明 + 登录入口
+    if (session.isAccountRequired(cause)) session.requireAccount(label)
+    else shareError.value = errorMessage(cause, '分享操作失败')
+  } finally {
+    shareBusy.value = null
+  }
+}
+
+async function copyShareLink(): Promise<void> {
+  const link = shareLink.value
+  if (!link) return
+  copyHint.value = null
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+    await navigator.clipboard.writeText(link)
+    showToast('ok', '链接已复制到剪贴板')
+    return
+  } catch {
+    // 降级：选中输入框里的链接，让人按 ⌘/Ctrl+C。
+    // 不引第三方剪贴板库，也不假装成功 —— 复制失败却提示「已复制」最坑人。
+    const input = shareLinkInput.value
+    if (input) {
+      input.focus()
+      input.select()
+      copyHint.value = navigator.clipboard
+        ? '浏览器拒绝了剪贴板访问：链接已选中，请按 ⌘/Ctrl+C 复制。'
+        : '当前环境不支持剪贴板 API（需要 HTTPS 或 localhost）：链接已选中，请按 ⌘/Ctrl+C 复制。'
+    } else {
+      copyHint.value = '当前环境不支持自动复制，请手动选中链接复制。'
+    }
+  }
+}
+
+function onAlbumChanged(albumId: string | null): void {
+  if (episode.value) episode.value = { ...episode.value, album_id: albumId }
+  showToast('ok', albumId ? '已加入专辑' : '已从专辑移出')
+}
+
+// ---------------------------------------------------------------------------
 // 折叠区（只有「有视频」形态才用得上）
 // ---------------------------------------------------------------------------
 
@@ -624,6 +773,13 @@ watch(id, () => {
   rebuildError.value = null
   rebuildingVideo.value = false
   stopRebuildClock()
+  // 分享区的状态也不能跨集残留：上一集停在「换新链接」的确认框里，
+  // 换了单集还挂着，点确认就会对错误的单集生效
+  shareBusy.value = null
+  shareError.value = null
+  copyHint.value = null
+  confirmResetShare.value = false
+  albumPickerOpen.value = false
   if (toastTimer !== undefined) {
     window.clearTimeout(toastTimer)
     toastTimer = undefined
@@ -857,6 +1013,7 @@ onBeforeUnmount(() => {
               </button>
             </div>
             <RouterLink to="/library" class="btn btn--ghost">播客库</RouterLink>
+            <button type="button" class="btn btn--ghost" @click="openAlbumPicker">加入专辑</button>
           </div>
         </div>
       </header>
@@ -901,6 +1058,116 @@ onBeforeUnmount(() => {
             所以切换语言时播放器会真的换源并重新加载；配图两版共用，切换时不会重新拉图。
           </template>
         </span>
+      </div>
+
+      <!--
+        V2：一键分享 + 关键词高亮（契约 §2.7 / §2.9）。
+        两件事都只影响这一页的阅读体验，所以放在正文之前的一个「控制条」里，
+        而不是散落在页面各处。
+      -->
+      <AccountPrompt />
+
+      <div class="card card--pad episode-tools">
+        <div class="episode-tools__row">
+          <div style="min-width: 0; flex: 1">
+            <div class="row" style="gap: 8px; flex-wrap: wrap">
+              <span class="badge" :class="isPublic ? 'badge--completed' : 'badge--neutral'">
+                {{ isPublic ? '已分享（公开）' : '私有' }}
+              </span>
+              <span v-if="episode.album_id" class="badge badge--accent">已加入专辑</span>
+            </div>
+            <p class="section__hint" style="margin: 10px 0 0">
+              <template v-if="isPublic">
+                任何拿到链接的人都能免登录查看这一期（视频 / 音频 / 脚本 / 解读 / 配图）；
+                别人搜不到它，只有拿到链接才看得到。
+              </template>
+              <template v-else>
+                开启分享会生成一条免登录链接，把这一期发给任何人不登录也能看。
+              </template>
+            </p>
+          </div>
+          <div class="row" style="gap: 8px; flex-wrap: wrap">
+            <button
+              v-if="!isPublic"
+              type="button"
+              class="btn btn--primary"
+              :disabled="shareBusy !== null"
+              @click="runShareAction('enable')"
+            >
+              <span v-if="shareBusy === 'enable'" class="spinner" aria-hidden="true" />
+              {{ shareBusy === 'enable' ? '开启中…' : '开启分享' }}
+            </button>
+            <template v-else>
+              <button type="button" class="btn btn--primary" @click="copyShareLink">复制链接</button>
+              <button
+                type="button"
+                class="btn"
+                :disabled="shareBusy !== null"
+                @click="confirmResetShare = true"
+              >
+                <span v-if="shareBusy === 'reset'" class="spinner" aria-hidden="true" />
+                换新链接
+              </button>
+              <button
+                type="button"
+                class="btn btn--ghost"
+                :disabled="shareBusy !== null"
+                @click="runShareAction('disable')"
+              >
+                <span v-if="shareBusy === 'disable'" class="spinner" aria-hidden="true" />
+                关闭分享
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <div v-if="isPublic && shareLink" class="share-link">
+          <input
+            ref="shareLinkInput"
+            class="input share-link__input"
+            type="text"
+            :value="shareLink"
+            readonly
+            aria-label="分享链接"
+            @focus="($event.target as HTMLInputElement).select()"
+          />
+          <RouterLink :to="{ name: 'share', params: { token: shareToken ?? '' } }" class="btn btn--sm btn--ghost">
+            预览公开页
+          </RouterLink>
+        </div>
+
+        <p v-if="copyHint" class="section__hint" style="margin: 10px 0 0; color: var(--accent-strong)">
+          {{ copyHint }}
+        </p>
+        <p v-if="shareError" class="section__hint" style="margin: 10px 0 0; color: var(--danger)">
+          {{ shareError }}
+        </p>
+        <p v-if="isPublic && shareToken" class="section__hint" style="margin: 10px 0 0">
+          分享 token：<code>{{ shareToken }}</code> · 关闭分享或换新链接后，旧链接会立即失效
+        </p>
+
+        <hr class="divider" />
+
+        <!-- 关键词高亮（契约 §2.9）：规则是「大小写不敏感的原文包含」，不做翻译映射 -->
+        <div class="row row--between" style="flex-wrap: wrap; gap: 12px">
+          <div style="min-width: 0">
+            <label v-if="showHighlightSwitch" class="switch">
+              <input v-model="prefs.preferences.highlight_keywords" type="checkbox" />
+              关键词高亮
+            </label>
+            <span v-else class="section__hint">这一集没有抽取到关键词，无法做高亮</span>
+            <p class="section__hint" style="margin: 8px 0 0">
+              用论文关键词在脚本与解读正文里做大小写不敏感的原文包含匹配，对不上就不高亮
+              （不做翻译映射）；开关记在本地，默认开。
+            </p>
+            <p v-if="highlightHasNoMatch" class="section__hint" style="margin: 6px 0 0">
+              这一集的正文里没有出现上面任何一个关键词，所以暂时没有可高亮的地方。
+            </p>
+          </div>
+          <div v-if="showHighlightSwitch" class="chips" aria-label="本集关键词">
+            <span v-for="word in keywords" :key="word" class="chip is-static">{{ word }}</span>
+          </div>
+        </div>
       </div>
 
       <!--
@@ -1261,6 +1528,8 @@ onBeforeUnmount(() => {
               :language="activeLanguage ?? undefined"
               :voice-a="voiceA"
               :voice-b="voiceB"
+              :keywords="keywords"
+              :highlight="highlightEnabled"
             />
           </div>
         </div>
@@ -1277,6 +1546,8 @@ onBeforeUnmount(() => {
             :language="activeLanguage ?? undefined"
             :voice-a="voiceA"
             :voice-b="voiceB"
+            :keywords="keywords"
+            :highlight="highlightEnabled"
           />
         </div>
       </section>
@@ -1305,7 +1576,7 @@ onBeforeUnmount(() => {
           </span>
         </summary>
         <div class="fold__body">
-          <AnalysisView :analysis="displayAnalysis" />
+          <AnalysisView :analysis="displayAnalysis" :keywords="keywords" :highlight="highlightEnabled" />
         </div>
       </details>
 
@@ -1318,6 +1589,25 @@ onBeforeUnmount(() => {
         </div>
         <AnalysisView :analysis="displayAnalysis" />
       </section>
+
+      <AlbumPickerDialog
+        :open="albumPickerOpen"
+        :episode-id="id"
+        :episode-title="episode.title"
+        :album-id="episode.album_id ?? null"
+        @close="albumPickerOpen = false"
+        @changed="onAlbumChanged"
+      />
+
+      <ConfirmDialog
+        :open="confirmResetShare"
+        title="换一条新的分享链接？"
+        text="旧链接会立即失效，已经发出去的链接就打不开了。这一期仍然是公开的，只是地址变了。"
+        confirm-text="换新链接"
+        :busy="shareBusy === 'reset'"
+        @confirm="runShareAction('reset')"
+        @cancel="confirmResetShare = false"
+      />
 
       <FigureLightbox
         :figures="figures"

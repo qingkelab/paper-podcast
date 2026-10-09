@@ -3663,3 +3663,275 @@ pre {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ============================================================================
+   V2：账号 / 专辑 / 分享 / 批量 / 关键词高亮
+   新增的类沿用既有的 CSS 变量与命名习惯（--surface / --accent / --border / --text-dim …），
+   不引入任何 UI 库。
+   ============================================================================ */
+
+/* ---------------------------------------------------------------- 顶栏账号区 */
+
+.account {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: 12px;
+}
+
+.account__name {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13.5px;
+  color: var(--text-dim);
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 已登录的小圆点：比图标省地方，也一眼看得出是「在线」状态 */
+.account__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-dim);
+}
+
+/* ---------------------------------------------------------------- 登录 / 注册 */
+
+.auth-card {
+  max-width: 520px;
+}
+
+/* ---------------------------------------------------------------- 详情页工具条（分享 / 高亮） */
+
+.episode-tools {
+  margin-bottom: 22px;
+}
+
+.episode-tools__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.share-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.share-link__input {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* 只读的关键词标签：不可点击，纯展示，所以去掉 hover 反馈 */
+.chip.is-static {
+  cursor: default;
+  border-style: dashed;
+}
+
+.chip.is-static:hover {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+/* ---------------------------------------------------------------- 关键词高亮 */
+
+/* 用 <mark> 的语义（浏览器默认黄底太扎眼，换成品牌色系） */
+.hl {
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  border-radius: 3px;
+  padding: 0 2px;
+  font-weight: 500;
+}
+
+/* ---------------------------------------------------------------- 专辑 */
+
+.album-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 18px;
+}
+
+.album-card {
+  display: flex;
+  gap: 16px;
+  padding: 16px;
+  align-items: flex-start;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.18s var(--ease), transform 0.18s var(--ease);
+}
+
+.album-card:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-2px);
+}
+
+.album-card__cover {
+  width: 62px;
+  height: 84px;
+  flex: none;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  display: grid;
+  place-items: center;
+}
+
+.album-card__cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top;
+}
+
+.album-card__glyph {
+  color: var(--text-muted);
+  font-size: 22px;
+}
+
+.album-card__body {
+  min-width: 0;
+  flex: 1;
+}
+
+.album-card__title {
+  font-family: var(--font-serif);
+  font-size: 17px;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+.album-card__desc {
+  font-size: 13.5px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  line-height: 1.6;
+}
+
+/* 专辑详情里的一集：卡片 + 一条「移出专辑」操作条 */
+.album-episode {
+  display: flex;
+  flex-direction: column;
+}
+
+.album-episode__bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 0 4px;
+}
+
+/* 专辑选择器（弹窗里用） */
+.album-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+.album-picker__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-dim);
+}
+
+.album-picker__item.is-active {
+  border-color: rgba(211, 162, 74, 0.6);
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.album-picker__count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.album-picker--multi .album-picker__item {
+  cursor: pointer;
+}
+
+.modal--wide {
+  max-width: 620px;
+}
+
+/* ---------------------------------------------------------------- 批量结果 */
+
+.batch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 18px;
+}
+
+.batch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.batch-list__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 13.5px;
+}
+
+/* 失败项的来源可能是一长条链接：截断它，但 title 上是完整的 */
+.batch-list__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-list__reason {
+  margin-left: auto;
+  flex: none;
+  max-width: 46%;
+  text-align: right;
+  color: var(--danger);
+  font-size: 12.5px;
+}
+
+@media (max-width: 860px) {
+  .account__name {
+    display: none;
+  }
+
+  .share-link {
+    flex-wrap: wrap;
+  }
+
+  .album-grid,
+  .batch-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

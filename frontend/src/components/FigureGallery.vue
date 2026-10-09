@@ -22,10 +22,16 @@ const props = withDefaults(
     busyId?: string | null
     /** 本次会话内被人工校正过的配图 id（前端本地记录，后端没有这个字段） */
     correctedIds?: string[]
+    /**
+     * 只读（公开分享页）：不显示「方向不对？点开手动旋转纠正」那类只有作者能做的操作。
+     * 在别人的分享页上摆一个点了没反应的 ↻ 按钮，比不摆更糟。
+     */
+    readonly?: boolean
   }>(),
   {
     busyId: null,
     correctedIds: () => [],
+    readonly: false,
   },
 )
 
@@ -66,8 +72,11 @@ function isCorrected(figure: Figure): boolean {
     -->
     <p class="figure-note">
       <span class="figure-note__icon" aria-hidden="true">↻</span>
-      配图方向由程序按图内文字方向自动判定，可能出错 ——
-      点开任意一张可以手动旋转纠正，多余或没用的图也能删掉。
+      <template v-if="readonly">点击任意一张可以放大查看。</template>
+      <template v-else>
+        配图方向由程序按图内文字方向自动判定，可能出错 ——
+        点开任意一张可以手动旋转纠正，多余或没用的图也能删掉。
+      </template>
     </p>
 
     <div class="figure-grid">
@@ -97,6 +106,7 @@ function isCorrected(figure: Figure): boolean {
         </button>
 
         <button
+          v-if="!readonly"
           type="button"
           class="figure-card__quick"
           :disabled="busyId !== null"

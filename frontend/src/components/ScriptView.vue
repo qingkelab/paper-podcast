@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { Script } from '../api'
+import HighlightedText from './HighlightedText.vue'
 import { useMetaStore } from '../stores/meta'
 import { formatDuration } from '../utils/format'
 
@@ -14,6 +15,12 @@ const props = defineProps<{
    * 英文版显示「427 字」是错的（那是 427 个词）。
    */
   language?: 'zh' | 'en'
+  /**
+   * 关键词高亮（契约 §2.9）：用 `paper_meta.keywords` 在正文里做
+   * 「大小写不敏感的原文包含」匹配。默认关 —— 由页面按 localStorage 里的偏好传进来。
+   */
+  keywords?: readonly string[] | null
+  highlight?: boolean
 }>()
 
 const meta = useMetaStore()
@@ -120,7 +127,9 @@ function speakerName(speaker: string): string {
           </span>
           <span class="segment__round">第 {{ segment.round + 1 }} 段 / 主播{{ segment.speaker }}</span>
         </header>
-        <p class="segment__text">{{ segment.text }}</p>
+        <p class="segment__text">
+          <HighlightedText :text="segment.text" :keywords="keywords" :enabled="highlight" />
+        </p>
       </article>
     </div>
 

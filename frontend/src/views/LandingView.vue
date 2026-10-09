@@ -11,20 +11,23 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { IS_MOCK, getEpisode, isEpisodeLanguage, listEpisodes } from '../api'
+import { IS_MOCK, getEpisode, getShowcase, isEpisodeLanguage, listEpisodes } from '../api'
 import type {
   Analysis,
   EpisodeLanguage,
   Figure,
   Illustration,
   ScriptSegment,
+  ShareView,
 } from '../api'
 import LanguageSwitch from '../components/LanguageSwitch.vue'
 import { useMetaStore } from '../stores/meta'
+import { useSessionStore } from '../stores/session'
 import { formatDuration } from '../utils/format'
 import { languageLabel } from '../utils/language'
 
 const meta = useMetaStore()
+const session = useSessionStore()
 
 /** 一个语言版本的展示数据。切换器一按就换的就是这一坨。 */
 type ShowcaseVersion = {
@@ -79,9 +82,78 @@ const videoRef = ref<HTMLVideoElement | null>(null)
  * 等它回来才渲染的话，首屏会在骨架上停很久。
  * 所以先用列表项（标题 / 封面 / 时长 / 语言）把页面画出来，详情回来后再补视频与配图。
  */
+/**
+ * 把公开视图（`GET /api/showcase`，免登录）转成展示区需要的数据。
+ *
+ * 为什么要用这条路：V2 起 `GET /api/episodes` 需要登录，未登录访客在 auth 模式下
+ * 会拿到 401 —— 产品介绍页就再也看不到真东西了。后端为此留了免登录的 `/api/showcase`：
+ * 登录了给你自己最新一期，没登录就给最近一期**公开分享**的。
+ * 它返回的是 ShareView（字段与 Episode 不同名但语义一致），所以在这里做一次映射。
+ */
+function showcaseFromShare(view: ShareView): Showcase {
+  const order = (view.languages ?? []).filter(isEpisodeLanguage)
+  const primary = isEpisodeLanguage(view.language) ? view.language : (order[0] ?? 'zh')
+  const list = order.length ? order : [primary]
+  const versions: Partial<Record<EpisodeLanguage, ShowcaseVersion>> = {}
+  list.forEach((language) => {
+    const version = view.versions?.[language] ?? null
+    const surface = language === primary ? view : null
+    versions[language] = {
+      language,
+      videoUrl: version?.video?.url ?? surface?.video?.url ?? null,
+      audioUrl: version?.audio_url ?? surface?.audio_url ?? null,
+      durationSec:
+        version?.video?.duration_sec ??
+        version?.audio_duration_sec ??
+        surface?.video?.duration_sec ??
+        surface?.audio_duration_sec ??
+        null,
+      segments: (version?.script?.segments ?? surface?.script?.segments ?? [])
+        .filter((segment) => !segment.brand)
+        .slice(0, 4),
+      analysis: version?.analysis ?? surface?.analysis ?? null,
+      illustration: version?.illustration ?? surface?.illustration ?? null,
+    }
+  })
+  return {
+    episodeId: `share:${view.token ?? 'showcase'}`,
+    title: view.title,
+    venue: view.paper_meta?.venue ?? null,
+    year: view.paper_meta?.year ?? null,
+    posterUrl: view.cover_url ?? null,
+    figures: view.figures ?? [],
+    order: list,
+    primaryLanguage: primary,
+    versions,
+  }
+}
+
+/** 未登录（auth 模式）时走免登录通道；其余情况保持原来的两阶段加载 */
+async function loadPublicShowcase(): Promise<boolean> {
+  try {
+    const view = await getShowcase()
+    const mapped = showcaseFromShare(view)
+    showcase.value = mapped
+    showcaseLanguage.value = mapped.primaryLanguage
+    heroLanguage.value = mapped.primaryLanguage
+    showcaseDetailReady.value = true
+    return true
+  } catch {
+    // 404 = 还没有公开分享的成品：这不是错误，展示区整块隐藏即可
+    return false
+  }
+}
+
 async function loadShowcase(): Promise<void> {
   showcaseLoading.value = true
   try {
+    // 先等会话探测完（先 health 后 me，契约 §3）：它决定「该走哪条数据通道」
+    await session.ensureInit()
+    if (session.isAuthMode && !session.isLoggedIn) {
+      await loadPublicShowcase()
+      return
+    }
+
     const list = await listEpisodes({ status: 'completed', limit: 12 })
     const candidates = list.items.filter((item) => item.status === 'completed')
     // 优先挑多语言的：一屏就能把「视频 + 双语 + 切换器」三件事讲清楚
@@ -519,7 +591,7 @@ onMounted(() => {
             <h2 class="lp-head__title">看一期真正的成品</h2>
             <p class="lp-head__lede">
               下面所有东西都来自库里真实生成的一期，不是示意图：视频、音频、脚本、解读、
-              配图都是它的产物。中英两版各有独立的脚本和音视频 —— 这里的按钮换的是**这一整块**；
+              配图都是它的产物。中英两版各有独立的脚本和音视频 —— 这里的按钮换的是这一整块；
               首屏视频上的那个按钮只换首屏那段视频。
             </p>
           </header>

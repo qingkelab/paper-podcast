@@ -27,12 +27,18 @@ const props = withDefaults(
     error?: string | null
     /** 本次会话内被人工校正过的配图 id（前端本地记录，后端没有这个字段） */
     correctedIds?: string[]
+    /**
+     * 只读（公开分享页）：隐藏旋转/删除那一栏。
+     * 公开页拿的是 `/api/share/{token}/…`，本来就没有写接口，摆按钮只会让人白点。
+     */
+    readonly?: boolean
   }>(),
   {
     title: '',
     pending: null,
     error: null,
     correctedIds: () => [],
+    readonly: false,
   },
 )
 
@@ -207,7 +213,7 @@ onBeforeUnmount(() => {
         </div>
 
         <footer class="lightbox__foot">
-          <div class="lightbox__tools">
+          <div v-if="!readonly" class="lightbox__tools">
             <span class="lightbox__tools-label">方向不对？</span>
             <button
               type="button"
@@ -251,7 +257,9 @@ onBeforeUnmount(() => {
           <p class="lightbox__caption">{{ current.caption }}</p>
 
           <div class="lightbox__foot-meta">
-            <span class="section__hint">旋转即时保存，90° 无损 · 转多了转回来即可</span>
+            <span class="section__hint">
+              {{ readonly ? '由作者分享的公开配图' : '旋转即时保存，90° 无损 · 转多了转回来即可' }}
+            </span>
             <span class="spacer" />
             <span v-if="sizeText" class="file-pill__size">{{ sizeText }}</span>
             <span class="section__hint">点击遮罩、按 Esc 或点右上角 ✕ 关闭</span>

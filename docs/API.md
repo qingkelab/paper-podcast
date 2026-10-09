@@ -395,14 +395,15 @@ range 请求探测 moov box）。无视频时 `404`。
 { "username": "guo", "password": "至少 8 位", "display_name": "Guo", "signup_code": "可选" }
 ```
 
-- `201` → `{ "user": User }`，响应同时 `Set-Cookie: pp_session=...`（等于注册即登录）。
+- `201` → **裸 `User` 对象**（不是 `{"user": …}` 包一层），
+  响应同时 `Set-Cookie: pp_session=...`（等于注册即登录）。
 - `409` 用户名已被占用；`400` 参数不合法；`403` 邀请码不对。
 - 服务端设了 `SIGNUP_CODE` 时 `signup_code` 必填且必须一致；没设则开放注册。
 - **第一个用户会认领所有无主单集**（见「开放模式」）。
 
 ### `POST /api/auth/login`
 
-`{ "username": "...", "password": "..." }` → `200 { "user": User }` + `Set-Cookie`。
+`{ "username": "...", "password": "..." }` → `200` + **裸 `User` 对象** + `Set-Cookie`。
 用户名或口令错都是 `401 {"detail": "用户名或口令不正确"}`（不区分，别提示是哪一个错）。
 
 **登录限流**：按「用户名 + 来源 IP」记失败次数，默认 8 次后锁 15 分钟，
@@ -428,7 +429,10 @@ range 请求探测 moov box）。无视频时 `404`。
 
 ### `GET /api/auth/me`
 
-`200 { "user": User }`；未登录 `401`。前端启动时用它判断登录态。
+`200` + **裸 `User` 对象**；未登录 `401`。前端启动时用它判断登录态。
+
+> 上面三个接口的响应体都是**裸 User**，没有 `{"user": …}` 外壳。
+> 前端两种都兼容，但契约以本文为准 —— 要加外层结构得同时改两边。
 
 ```jsonc
 // User
@@ -450,8 +454,9 @@ range 请求探测 moov box）。无视频时 `404`。
   `POST /api/auth/login`、`POST /api/auth/register`、`POST /api/auth/logout`、
   `GET /api/share/*`、`GET /api/showcase`。
 - 未登录访问受保护接口 → `401 {"detail": "需要登录"}`；开放模式下不返回 401。
-- 登录后 `GET /api/health` 会多一个 `"mode": "open" | "auth"` 字段，
-  前端据此决定要不要显示登录入口（开放模式下不显示，避免误导）。
+- `GET /api/health` **始终**带 `"mode": "open" | "auth"`（登录与否都带）。
+  前端启动顺序依赖它，所以它必须免登录、也不能只在登录后才出现。
+  缺失时前端按 "unknown" 处理 —— 不拦人。
 
 ### 用户信息
 
@@ -547,6 +552,11 @@ range 请求探测 moov box）。无视频时 `404`。
 `/illustration.png`、`/illustration.svg`、`/script.txt`、`/analysis.md`
 
 都支持 `?lang=`，语义与受保护版本完全一致（含 Range 请求）。token 失效或那一集不再公开 → `404`。
+
+> **公开通道的 URL 一律带 `?lang=`，连主语言也带**（`/video?lang=zh&v=…`）。
+> 「主语言不带 `?lang=`」那条规则只针对受保护通道 `/api/episodes/{id}/…` ——
+> 那里的初衷是让**已经发布出去的主语言链接保持稳定**；
+> 公开通道的 URL 里本来就带 share token、只在链接有效期内存在，没有这个顾虑。
 
 ---
 

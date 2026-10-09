@@ -1,14 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { deleteEpisode, errorMessage, listEpisodes, retryEpisode } from '../api'
-import type { EpisodeStatus, EpisodeSummary } from '../api'
+import { deleteEpisode, errorMessage, listAlbums, listEpisodes, retryEpisode } from '../api'
+import type { Album, EpisodeStatus, EpisodeSummary } from '../api'
+import AccountPrompt from '../components/AccountPrompt.vue'
+import AlbumPickerDialog from '../components/AlbumPickerDialog.vue'
 import EpisodeCard from '../components/EpisodeCard.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import { useSessionStore } from '../stores/session'
 import { FILTERABLE_STATUSES, STATUS_LABELS } from '../utils/stages'
 
 const PAGE_SIZE = 12
 const AUTO_REFRESH_MS = 5000
+
+const session = useSessionStore()
 
 // 列表接口返回的是 EpisodeSummary（不含 analysis / script / figures / illustration）
 const items = ref<EpisodeSummary[]>([])
@@ -22,6 +27,59 @@ const status = ref<EpisodeStatus | 'all'>('all')
 const confirmTarget = ref<EpisodeSummary | null>(null)
 const deleting = ref(false)
 const refreshing = ref(false)
+
+/** 专辑（契约 §2.6）：列表上显示「属于哪张专辑」，并提供一个加入/移出的入口 */
+const albums = ref<Album[]>([])
+const pickerTarget = ref<EpisodeSummary | null>(null)
+
+const albumTitles = computed(() => {
+  const map = new Map<string, string>()
+  albums.value.forEach((album) => map.set(album.id, album.title))
+  return map
+})
+
+function albumTitleFor(episode: EpisodeSummary): string | null {
+  const id = episode.album_id
+  if (!id) return null
+  return albumTitles.value.get(id) ?? '未知专辑'
+}
+
+async function loadAlbums(): Promise<void> {
+  try {
+    albums.value = await listAlbums()
+  } catch {
+    // 专辑读不到不该把播客库整页搞坏：卡片上少一个角标而已
+    albums.value = []
+  }
+}
+
+/**
+ * 点卡片上的「加入专辑」：开放模式下先给中文提示 + 登录入口，
+ * 不打开一个点了也做不成的弹窗（那是把人引到死路上）
+ */
+function openAlbumPicker(episode: EpisodeSummary): void {
+  if (session.isOpenMode && !session.isLoggedIn) {
+    session.requireAccount('把播客加入专辑')
+    return
+  }
+  pickerTarget.value = episode
+}
+
+/** 弹窗里改完归属：就地更新这一条，不必整页重拉 */
+function onAlbumChanged(albumId: string | null): void {
+  const target = pickerTarget.value
+  if (!target) return
+  const index = items.value.findIndex((episode) => episode.id === target.id)
+  if (index >= 0) {
+    const next = items.value.slice()
+    next[index] = { ...next[index]!, album_id: albumId }
+    items.value = next
+  }
+  notice.value = albumId
+    ? `已把《${target.title}》加入专辑`
+    : `已把《${target.title}》移出专辑`
+  void loadAlbums()
+}
 
 let refreshTimer: number | undefined
 let debounceTimer: number | undefined
@@ -144,6 +202,7 @@ watch([keyword, status], () => {
 
 onMounted(() => {
   void fetchPage(0, PAGE_SIZE)
+  void loadAlbums()
 })
 
 onBeforeUnmount(() => {
@@ -167,6 +226,7 @@ onBeforeUnmount(() => {
           <span v-if="refreshing" class="spinner" aria-hidden="true" />
           {{ refreshing ? '刷新中…' : '刷新' }}
         </button>
+        <RouterLink to="/albums" class="btn btn--ghost">我的专辑</RouterLink>
         <RouterLink to="/create" class="btn btn--primary">导入新论文</RouterLink>
       </div>
     </header>
@@ -197,6 +257,8 @@ onBeforeUnmount(() => {
         有任务正在生成，页面每 5 秒会自动刷新一次状态。
       </p>
     </div>
+
+    <AccountPrompt />
 
     <div v-if="notice" class="alert alert--info" style="margin-bottom: 20px">
       <span class="alert__icon" aria-hidden="true">i</span>
@@ -246,8 +308,10 @@ onBeforeUnmount(() => {
           :key="episode.id"
           :episode="episode"
           :priority="index < 3"
+          :album-title="albumTitleFor(episode)"
           @delete="onConfirmDelete"
           @retry="onRetry"
+          @album="openAlbumPicker"
         />
       </div>
 
@@ -265,6 +329,15 @@ onBeforeUnmount(() => {
         <span v-else class="section__hint">已经到底了 · 共 {{ total }} 条</span>
       </div>
     </template>
+
+    <AlbumPickerDialog
+      :open="pickerTarget !== null"
+      :episode-id="pickerTarget?.id ?? ''"
+      :episode-title="pickerTarget?.title ?? ''"
+      :album-id="pickerTarget?.album_id ?? null"
+      @close="pickerTarget = null"
+      @changed="onAlbumChanged"
+    />
 
     <ConfirmDialog
       :open="confirmTarget !== null"

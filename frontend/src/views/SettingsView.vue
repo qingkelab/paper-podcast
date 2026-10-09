@@ -1,15 +1,80 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { IS_MOCK } from '../api'
-import type { EpisodeLanguage } from '../api'
+import {
+  IS_MOCK,
+  changePassword as apiChangePassword,
+  errorMessage,
+  getUsage,
+} from '../api'
+import type { EpisodeLanguage, UsagePayload } from '../api'
 import { useMetaStore } from '../stores/meta'
+import { useSessionStore } from '../stores/session'
 import { DEFAULT_PREFERENCES, usePreferencesStore } from '../stores/preferences'
 import { LANGUAGE_OPTIONS, languagesText } from '../utils/language'
 import { LEVEL_LABELS } from '../utils/stages'
 
 const meta = useMetaStore()
 const prefs = usePreferencesStore()
+const session = useSessionStore()
+
+// --- 生成配额（契约 §2.9：GET /api/usage） -----------------------------------
+// 有配额却不告诉用户还剩多少，等于让人撞 429 才知道。生成页也会显示这一行，
+// 但设置页是「运行状态」的地方，放一份方便随时查（尤其是配额被用完之后）。
+const usage = ref<UsagePayload | null>(null)
+const usageError = ref<string | null>(null)
+
+const usageText = computed(() => {
+  const value = usage.value
+  if (!value) return null
+  if (value.limit <= 0) return '服务端没有设置配额（不限量）'
+  const reset = value.resets_at ? `，${value.resets_at} 之后释放` : ''
+  return `最近 24 小时已生成 ${value.used} 期，上限 ${value.limit} 期，还能生成 ${value.remaining ?? 0} 期${reset}`
+})
+
+async function loadUsage(): Promise<void> {
+  usageError.value = null
+  try {
+    usage.value = await getUsage()
+  } catch (cause) {
+    // 老后端没有这个接口 / 未登录：不当成错误刷红，只是不显示这一行
+    usage.value = null
+    usageError.value = errorMessage(cause, '')
+  }
+}
+
+// --- 修改口令（契约 §2.5：必须带旧口令） -------------------------------------
+const passwordForm = ref({ current_password: '', new_password: '', confirm_password: '' })
+const passwordBusy = ref(false)
+const passwordError = ref<string | null>(null)
+const passwordNotice = ref<string | null>(null)
+
+const canChangePassword = computed(() => {
+  if (passwordBusy.value) return false
+  if (!session.isLoggedIn) return false
+  if (passwordForm.value.current_password.length < 1) return false
+  if (passwordForm.value.new_password.length < 8) return false
+  return passwordForm.value.new_password === passwordForm.value.confirm_password
+})
+
+async function submitPassword(): Promise<void> {
+  if (!canChangePassword.value) return
+  passwordBusy.value = true
+  passwordError.value = null
+  passwordNotice.value = null
+  try {
+    await apiChangePassword({
+      current_password: passwordForm.value.current_password,
+      new_password: passwordForm.value.new_password,
+    })
+    passwordForm.value = { current_password: '', new_password: '', confirm_password: '' }
+    passwordNotice.value = '口令已更新。其他设备上的会话已经失效，这台设备仍然保持着登录。'
+  } catch (cause) {
+    passwordError.value = errorMessage(cause, '修改口令失败')
+  } finally {
+    passwordBusy.value = false
+  }
+}
 
 /** 表单是偏好的本地副本：点「保存偏好」才写入 localStorage */
 const form = ref({ ...prefs.preferences })
@@ -60,6 +125,12 @@ async function refreshHealth(): Promise<void> {
   refreshing.value = false
 }
 
+async function logoutHere(): Promise<void> {
+  await session.logout()
+  passwordNotice.value = null
+  passwordError.value = null
+}
+
 async function resetMockData(): Promise<void> {
   if (!IS_MOCK) return
   mockBusy.value = true
@@ -79,6 +150,9 @@ function modeBadge(mode: string | undefined): string {
 
 onMounted(() => {
   void meta.load()
+  void session.ensureInit().then(() => {
+    if (session.isLoggedIn) void loadUsage()
+  })
 })
 </script>
 
@@ -94,6 +168,152 @@ onMounted(() => {
     </header>
 
     <section class="section" style="margin-top: 0">
+      <div class="section__head">
+        <h2 class="section__title">账号</h2>
+        <span class="section__hint">POST /api/auth/password</span>
+      </div>
+
+      <div class="card card--pad">
+        <div v-if="session.isOpenMode" class="section__hint">
+          当前是开放模式（后端库里还没有任何账号），因此没有账号可改 ——
+          第一个账号建好之后，应用会自动切换成「需要登录」。
+        </div>
+
+        <template v-else-if="session.isLoggedIn">
+          <div class="meta-grid">
+            <div class="meta-item">
+              <div class="meta-item__label">展示名</div>
+              <div class="meta-item__value">{{ session.displayName }}</div>
+            </div>
+            <div class="meta-item">
+              <div class="meta-item__label">用户名</div>
+              <div class="meta-item__value">{{ session.user?.username }}</div>
+            </div>
+            <div class="meta-item">
+              <div class="meta-item__label">用户 ID</div>
+              <div class="meta-item__value"><code>{{ session.user?.id }}</code></div>
+            </div>
+            <div class="meta-item">
+              <div class="meta-item__label">注册时间</div>
+              <div class="meta-item__value">{{ session.user?.created_at }}</div>
+            </div>
+          </div>
+
+          <hr class="divider" />
+
+          <h3 class="analysis-card__title" style="margin-bottom: 6px">生成配额</h3>
+          <p class="section__hint" style="margin: 0 0 12px">
+            窗口是最近 24 小时的滑动窗口（不是自然日）；单篇扣 1，批量按篇数扣。
+          </p>
+          <div class="meta-grid">
+            <div class="meta-item">
+              <div class="meta-item__label">最近 24 小时用量</div>
+              <div class="meta-item__value">
+                {{
+                  usage
+                    ? `${usage.used} / ${usage.limit > 0 ? usage.limit : '不限'}`
+                    : usageError
+                      ? '读取失败'
+                      : '读取中…'
+                }}
+              </div>
+            </div>
+            <div class="meta-item">
+              <div class="meta-item__label">还能生成</div>
+              <div class="meta-item__value">
+                {{ usage && usage.limit > 0 ? `${usage.remaining ?? 0} 期` : '—' }}
+              </div>
+            </div>
+            <div class="meta-item">
+              <div class="meta-item__label">配额释放时间</div>
+              <div class="meta-item__value">{{ usage?.resets_at ?? '—' }}</div>
+            </div>
+          </div>
+          <p v-if="usageText" class="section__hint" style="margin: 12px 0 0">{{ usageText }}</p>
+
+          <hr class="divider" />
+
+          <h3 class="analysis-card__title" style="margin-bottom: 6px">修改口令</h3>
+          <p class="section__hint" style="margin: 0 0 16px">
+            必须填当前口令。改完会删除其他设备上的会话，只保留这一台 ——
+            否则「明明改了密码，别处还挂着旧会话」就等于没改。
+          </p>
+
+          <div class="form-grid">
+            <div class="field">
+              <label class="field__label" for="pwd-current">当前口令</label>
+              <input
+                id="pwd-current"
+                v-model="passwordForm.current_password"
+                class="input"
+                type="password"
+                autocomplete="current-password"
+              />
+            </div>
+            <div class="field">
+              <label class="field__label" for="pwd-new">新口令（至少 8 位）</label>
+              <input
+                id="pwd-new"
+                v-model="passwordForm.new_password"
+                class="input"
+                type="password"
+                autocomplete="new-password"
+              />
+            </div>
+            <div class="field">
+              <label class="field__label" for="pwd-confirm">再输一次新口令</label>
+              <input
+                id="pwd-confirm"
+                v-model="passwordForm.confirm_password"
+                class="input"
+                type="password"
+                autocomplete="new-password"
+              />
+              <span
+                v-if="
+                  passwordForm.confirm_password &&
+                  passwordForm.confirm_password !== passwordForm.new_password
+                "
+                class="field__hint"
+                style="color: var(--danger)"
+              >
+                两次输入的新口令不一致
+              </span>
+            </div>
+          </div>
+
+          <div v-if="passwordError" class="alert alert--error" style="margin-top: 16px">
+            <span class="alert__icon" aria-hidden="true">!</span>
+            <span class="alert__body">{{ passwordError }}</span>
+          </div>
+          <p v-if="passwordNotice" class="section__hint" style="color: var(--success); margin-top: 16px">
+            ✓ {{ passwordNotice }}
+          </p>
+
+          <div class="row row--between" style="margin-top: 18px">
+            <button type="button" class="btn btn--ghost" @click="logoutHere">登出</button>
+            <button
+              type="button"
+              class="btn btn--primary"
+              :disabled="!canChangePassword"
+              @click="submitPassword"
+            >
+              <span v-if="passwordBusy" class="spinner" aria-hidden="true" />
+              {{ passwordBusy ? '正在修改…' : '修改口令' }}
+            </button>
+          </div>
+        </template>
+
+        <div v-else class="section__hint">
+          未登录。
+          <RouterLink :to="{ name: 'login' }" class="btn btn--sm btn--primary" style="margin-left: 10px">
+            去登录
+          </RouterLink>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
       <div class="section__head">
         <h2 class="section__title">默认播客参数</h2>
         <span class="section__hint">契约 §5 默认值：5 分钟 · 入门 · 大义先生 + 米仔同学</span>
@@ -239,7 +459,7 @@ onMounted(() => {
           <div class="meta-item">
             <div class="meta-item__label">接口前缀</div>
             <div class="meta-item__value">
-              {{ IS_MOCK ? '—（不发起网络请求）' : '/api → http://127.0.0.1:8000' }}
+              {{ IS_MOCK ? '—（不发起任何网络请求）' : 'api 前缀 → http://127.0.0.1:8000' }}
             </div>
           </div>
           <div class="meta-item">
@@ -313,8 +533,10 @@ onMounted(() => {
 
         <div class="row row--between">
           <p class="section__hint" style="margin: 0">
-            偏好设置存在 localStorage 的 <code>paper-podcast:preferences:v1</code>；
-            Mock 数据存在 <code>paper-podcast:mock:episodes:v1</code>。
+            偏好设置（含关键词高亮开关）存在 localStorage 的
+            <code>paper-podcast:preferences:v1</code>；Mock 数据存在
+            <code>paper-podcast:mock:episodes:v3</code>
+            （schema 版本号变化就意味着老数据会重新播种，避免看到旧语义的缓存）。
           </p>
           <RouterLink to="/library" class="btn btn--ghost">去看播客库</RouterLink>
         </div>

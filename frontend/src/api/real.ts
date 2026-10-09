@@ -1,7 +1,15 @@
 import { ApiError } from './error'
+import { notifyUnauthorized, setUnauthorizedHandler as registerUnauthorizedHandler } from './unauthorized'
 import { sanitizeLanguages } from '../utils/language'
 import type {
+  Album,
+  AlbumDetail,
+  AlbumWriteInput,
   ApiAdapter,
+  BatchFilesInput,
+  BatchResult,
+  BatchTextsInput,
+  BatchUrlsInput,
   CreateFileInput,
   CreateTextInput,
   CreateUrlInput,
@@ -12,7 +20,13 @@ import type {
   HealthPayload,
   ListEpisodesParams,
   ListEpisodesResult,
+  LoginInput,
   OptionsPayload,
+  PasswordChangeInput,
+  RegisterInput,
+  ShareView,
+  UsagePayload,
+  User,
 } from './types'
 
 /**
@@ -21,10 +35,36 @@ import type {
 
 const BASE = '/api'
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * 全局 401 处理（契约 §3「登录态与路由」）。
+ *
+ * 为什么要有它：会话 cookie 是 30 天有效的 httpOnly cookie，**随时可能过期或被服务端删掉**
+ * （改口令会删掉其他设备的会话）。只在启动时判一次登录态的话，用户会在一次点击之后
+ * 收到一句「需要登录」的红字，却不知道该去哪里 —— 得让他落到登录页。
+ *
+ * `api/real.ts` 不认识 vue-router，所以真正的跳转由 stores/session.ts 通过
+ * `api/unauthorized.ts` 注册进来（mock 走同一条通道）。
+ */
+export function setUnauthorizedHandler(handler: ((error: ApiError) => void) | null): void {
+  registerUnauthorizedHandler(handler)
+}
+
+interface RequestOptions extends RequestInit {
+  /**
+   * 401 时不触发全局跳登录。
+   * `/auth/me`、`/auth/login`、`/auth/password` 必须带上它：
+   * 「没登录」对前两个来说是正常结果，不能反过来把人踹去登录页（会成环）。
+   */
+  skipAuthRedirect?: boolean
+}
+
+async function request<T>(path: string, init?: RequestOptions): Promise<T> {
+  const { skipAuthRedirect, ...rest } = init ?? {}
   let response: Response
   try {
-    response = await fetch(`${BASE}${path}`, init)
+    // credentials 默认 same-origin：开发态走 Vite proxy 是同源，生产态后端同源托管，
+    // 都带得上 pp_session。显式写出来是为了避免以后有人改成跨域部署时静默丢 cookie。
+    response = await fetch(`${BASE}${path}`, { credentials: 'same-origin', ...rest })
   } catch {
     throw new ApiError('无法连接后端服务，请确认 http://127.0.0.1:8000 已启动', 0)
   }
@@ -41,7 +81,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // 响应不是 JSON，保留默认文案
     }
-    throw new ApiError(detail, response.status)
+    const error = new ApiError(detail, response.status)
+    // 401 统一交给会话层处理（清空登录态 + 跳登录页）；白名单里的接口除外
+    if (response.status === 401 && !skipAuthRedirect) notifyUnauthorized(error)
+    throw error
   }
 
   if (response.status === 204) return undefined as T
@@ -69,7 +112,7 @@ function langQuery(lang?: EpisodeLanguage): string {
 export const mode = 'real' as const
 
 export function getHealth(): Promise<HealthPayload> {
-  return request<HealthPayload>('/health')
+  return request<HealthPayload>('/health', { skipAuthRedirect: true })
 }
 
 export function getOptions(): Promise<OptionsPayload> {
@@ -112,6 +155,39 @@ export function createEpisodeFromText(input: CreateTextInput): Promise<Episode> 
     body: JSON.stringify({
       source_type: 'text',
       text: input.text,
+      options: { duration_min, level, voice_a, voice_b, languages },
+    }),
+  })
+}
+
+/**
+ * 批量生成（契约 §2.8）。
+ * PDF 走 multipart（`files` 字段**出现多次**），链接 / 文本走 JSON（`urls` / `texts` 数组）。
+ */
+export function createEpisodeBatch(
+  input: BatchFilesInput | BatchUrlsInput | BatchTextsInput,
+): Promise<BatchResult> {
+  if ('files' in input) {
+    const { duration_min, level, voice_a, voice_b, languages } = normalizeOptions(input.options)
+    const form = new FormData()
+    input.files.forEach((file) => form.append('files', file))
+    form.append('duration_min', String(duration_min))
+    form.append('level', level)
+    form.append('voice_a', voice_a)
+    form.append('voice_b', voice_b)
+    form.append('languages', languages.join(','))
+    return request<BatchResult>('/episodes/batch', { method: 'POST', body: form })
+  }
+
+  const { duration_min, level, voice_a, voice_b, languages } = normalizeOptions(input.options)
+  const body = 'urls' in input
+    ? { source_type: 'url', urls: input.urls }
+    : { source_type: 'text', texts: input.texts }
+  return request<BatchResult>('/episodes/batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...body,
       options: { duration_min, level, voice_a, voice_b, languages },
     }),
   })
@@ -189,6 +265,164 @@ export function analysisMdUrl(id: string, lang?: EpisodeLanguage): string {
   return `${BASE}/episodes/${encodeURIComponent(id)}/analysis.md${langQuery(lang)}`
 }
 
+// ---------------------------------------------------------------------------
+// V2：账号与会话（契约 §2.5）
+//
+// 会话走 httpOnly cookie（pp_session），前端**拿不到也不该拿** token：
+// 所以这里没有任何 Authorization 头，全靠浏览器自动带上 cookie。
+// ---------------------------------------------------------------------------
+
+export function getMe(): Promise<User> {
+  // 401 = 没登录，是正常结果：绝不能触发全局跳登录（那会在启动时成环）
+  return request<User>('/auth/me', { skipAuthRedirect: true }).then((payload) => unwrapUser(payload))
+}
+
+export function register(input: RegisterInput): Promise<User> {
+  return request<{ user?: User } & User>('/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: input.username,
+      password: input.password,
+      display_name: input.display_name ?? '',
+      signup_code: input.signup_code ?? '',
+    }),
+    // 登录/注册本身的 401/403 是「口令错 / 邀请码不对」，要显示在表单上，不是跳转信号
+    skipAuthRedirect: true,
+  }).then((payload) => unwrapUser(payload))
+}
+
+export function login(input: LoginInput): Promise<User> {
+  return request<{ user?: User } & User>('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: input.username, password: input.password }),
+    skipAuthRedirect: true,
+  }).then((payload) => unwrapUser(payload))
+}
+
+export function logout(): Promise<void> {
+  return request<void>('/auth/logout', { method: 'POST', skipAuthRedirect: true })
+}
+
+export function changePassword(input: PasswordChangeInput): Promise<void> {
+  return request<void>('/auth/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      current_password: input.current_password,
+      new_password: input.new_password,
+    }),
+    // 当前口令错是 401：要显示在表单上（而不是被当成「会话失效」跳登录页）
+    skipAuthRedirect: true,
+  })
+}
+
+/**
+ * 契约里 `/auth/*` 返回的是裸 User（`{"id":…,"username":…}`），
+ * 但 §2.5 的 register/login 示例写的是 `{ "user": User }`。两种都认：
+ * 有 `user` 字段就用它，否则整包当 User —— 契约在这点上有歧义，前端兼容两边。
+ */
+function unwrapUser(payload: (User & { user?: User }) | null | undefined): User {
+  const candidate = payload && typeof payload === 'object' && payload.user ? payload.user : payload
+  if (!candidate || typeof candidate !== 'object' || typeof candidate.id !== 'string') {
+    throw new ApiError('后端返回的账号信息无法识别', 0)
+  }
+  return candidate as User
+}
+
+/**
+ * 生成配额（`GET /api/usage`）。有配额却不告诉用户还剩多少，等于让人撞 429 才知道。
+ * 这个接口比 docs/API.md 的冻结版新，**调用方要 fail-open**（404 就当没有配额）。
+ */
+export function getUsage(): Promise<UsagePayload> {
+  return request<UsagePayload>('/usage', { skipAuthRedirect: true })
+}
+
+// ---------------------------------------------------------------------------
+// V2：个人专辑（契约 §2.6）
+// ---------------------------------------------------------------------------
+
+export function listAlbums(): Promise<Album[]> {
+  return request<Album[]>('/albums')
+}
+
+export function createAlbum(input: AlbumWriteInput): Promise<Album> {
+  return request<Album>('/albums', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: input.title ?? '', description: input.description ?? null }),
+  })
+}
+
+export function getAlbum(id: string): Promise<AlbumDetail> {
+  return request<AlbumDetail>(`/albums/${encodeURIComponent(id)}`)
+}
+
+export function updateAlbum(id: string, input: AlbumWriteInput): Promise<Album> {
+  const body: Record<string, unknown> = {}
+  if (input.title !== undefined) body.title = input.title
+  if (input.description !== undefined) body.description = input.description
+  return request<Album>(`/albums/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function deleteAlbum(id: string): Promise<void> {
+  return request<void>(`/albums/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export function addAlbumEpisodes(id: string, episodeIds: string[]): Promise<AlbumDetail> {
+  return request<AlbumDetail>(`/albums/${encodeURIComponent(id)}/episodes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ episode_ids: episodeIds }),
+  })
+}
+
+export function removeAlbumEpisode(id: string, episodeId: string): Promise<AlbumDetail> {
+  return request<AlbumDetail>(
+    `/albums/${encodeURIComponent(id)}/episodes/${encodeURIComponent(episodeId)}`,
+    { method: 'DELETE' },
+  )
+}
+
+// ---------------------------------------------------------------------------
+// V2：一键分享（契约 §2.7）
+// ---------------------------------------------------------------------------
+
+export function enableShare(id: string): Promise<Episode> {
+  return request<Episode>(`/episodes/${encodeURIComponent(id)}/share`, { method: 'POST' })
+}
+
+export function disableShare(id: string): Promise<Episode> {
+  return request<Episode>(`/episodes/${encodeURIComponent(id)}/share`, { method: 'DELETE' })
+}
+
+export function resetShare(id: string): Promise<Episode> {
+  return request<Episode>(`/episodes/${encodeURIComponent(id)}/share/reset`, { method: 'POST' })
+}
+
+/** 公开视图：**免登录**，所以 404（链接失效）不能被当成「会话过期」 */
+export function getShare(token: string): Promise<ShareView> {
+  return request<ShareView>(`/share/${encodeURIComponent(token)}`, { skipAuthRedirect: true })
+}
+
+/** 首页展示用的一期：同样免登录 */
+export function getShowcase(): Promise<ShareView> {
+  return request<ShareView>('/showcase', { skipAuthRedirect: true })
+}
+
+export function shareScriptTxtUrl(token: string, lang?: EpisodeLanguage): string {
+  return `${BASE}/share/${encodeURIComponent(token)}/script.txt${langQuery(lang)}`
+}
+
+export function shareAnalysisMdUrl(token: string, lang?: EpisodeLanguage): string {
+  return `${BASE}/share/${encodeURIComponent(token)}/analysis.md${langQuery(lang)}`
+}
+
 const adapter: ApiAdapter = {
   mode,
   getHealth,
@@ -196,6 +430,7 @@ const adapter: ApiAdapter = {
   createEpisodeFromFile,
   createEpisodeFromUrl,
   createEpisodeFromText,
+  createEpisodeBatch,
   listEpisodes,
   getEpisode,
   deleteEpisode,
@@ -205,6 +440,26 @@ const adapter: ApiAdapter = {
   rebuildVideo,
   scriptTxtUrl,
   analysisMdUrl,
+  getMe,
+  register,
+  login,
+  logout,
+  changePassword,
+  getUsage,
+  listAlbums,
+  createAlbum,
+  getAlbum,
+  updateAlbum,
+  deleteAlbum,
+  addAlbumEpisodes,
+  removeAlbumEpisode,
+  enableShare,
+  disableShare,
+  resetShare,
+  getShare,
+  getShowcase,
+  shareScriptTxtUrl,
+  shareAnalysisMdUrl,
 }
 
 export default adapter

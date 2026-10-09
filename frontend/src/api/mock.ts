@@ -1,4 +1,5 @@
 import { ApiError } from './error'
+import { notifyUnauthorized } from './unauthorized'
 import { renderMockAudio } from './mockAudio'
 import { renderMockVideo } from './mockVideo'
 import { buildArtwork } from './mockArt'
@@ -11,8 +12,15 @@ import {
   sanitizeLanguages,
 } from '../utils/language'
 import type {
+  Album,
+  AlbumDetail,
+  AlbumWriteInput,
   Analysis,
   ApiAdapter,
+  BatchFilesInput,
+  BatchResult,
+  BatchTextsInput,
+  BatchUrlsInput,
   CreateFileInput,
   CreateTextInput,
   CreateUrlInput,
@@ -27,11 +35,18 @@ import type {
   HealthPayload,
   ListEpisodesParams,
   ListEpisodesResult,
+  LoginInput,
   OptionsPayload,
   PaperMeta,
+  PasswordChangeInput,
+  RegisterInput,
   Script,
   ScriptSegment,
+  ShareVersion,
+  ShareView,
   SourceType,
+  UsagePayload,
+  User,
   VideoInfo,
 } from './types'
 import { isEpisodeLanguage } from './types'
@@ -53,6 +68,13 @@ import { countWords } from '../utils/format'
  *
  * 把 URL 或文本里带上 "fail" 字样，可以让任务在「深度解读」阶段模拟失败，
  * 用来演示失败态与「重新生成」流程（点重试后即可正常完成）。
+ *
+ * V2（账号 / 专辑 / 分享 / 批量 / 关键词偏好）同样在浏览器里复刻：
+ * - **自动登录一个演示账号**（guo / demo1234），打开就是「登录后」的完整形态；
+ *   但登录页、注册页、登出、改口令都能真的演示 —— 登出后受保护页面会被挡到 /login。
+ * - 专辑、分享 token、批量结果与单集一起落在 localStorage 里（同一个 schema 版本号）。
+ * - Mock 里所有单集都属于演示账号（没有真实的多人数据），但**分享链接真的按 token 查**：
+ *   关掉分享后那条链接立刻 404，与真实后端一致。
  */
 
 export const mode = 'mock' as const
@@ -63,13 +85,28 @@ export const mode = 'mock' as const
  * 于是他们看到的是旧行为（实测：把预估时长改成按语言算之后，
  * 老访客页面上的英文版仍是「1173 词 / 预估 05:00」）。
  * 宁可让老访客重新播种一遍示例数据，也不要给他一个自相矛盾的页面。
+ *
+ * v3（V2）：单集多了 visibility / share_token / album_id，落盘多了专辑列表。
  */
-const STORAGE_SCHEMA = 2
+const STORAGE_SCHEMA = 3
 const STORAGE_KEY = `paper-podcast:mock:episodes:v${STORAGE_SCHEMA}`
+/** 会话（登录状态）单独一个键：生命周期和内容数据不一样，别捆在一起 */
+const SESSION_KEY = 'paper-podcast:mock:session:v1'
 /** 每个阶段的模拟耗时（契约 §4 要求约 700ms） */
 const STAGE_MS = 700
 /** 来源（文件名 / 链接 / 文本）里带上这个标记，可演示失败态与重试流程 */
 const FAIL_DEMO = /fail-demo/i
+/** 批量生成上限（契约 §2.8：20 篇/次） */
+const MAX_BATCH = 20
+/**
+ * 批量里「文本」一篇的最短长度。真实后端要求 ≥200 字（`_batch_from_json`），
+ * 而单篇导入只要 20 字 —— 这里跟着真实规则走，否则演示说「可以」、
+ * 换成真实后端被拒，是最让人困惑的那种不一致。
+ */
+const BATCH_TEXT_MIN = 200
+/** 演示账号：首次打开自动登录它，登录页上也把这对凭据写出来 */
+const DEMO_USERNAME = 'guo'
+const DEMO_PASSWORD = 'demo1234'
 
 /** Mock 音频片段时长：太长会拖慢浏览器渲染，36 秒足够验证播放器 */
 const MOCK_AUDIO_SEC = 36
@@ -187,6 +224,34 @@ const objectUrls = new Map<string, Set<string>>()
 /** 需要模拟一次失败的单集（首次推进到「深度解读」时失败） */
 const failOnce = new Set<string>()
 
+// ---------------------------------------------------------------------------
+// V2：账号 / 专辑（Mock 内存态）
+// ---------------------------------------------------------------------------
+
+/** 落盘的账号（口令是明文 —— 这只是一个浏览器演示，绝不代表真实做法） */
+interface MockAccount {
+  id: string
+  username: string
+  display_name: string
+  created_at: string
+  password: string
+}
+
+/** 落盘的专辑（episode_count / cover_url 是读的时候算出来的，不落盘） */
+interface MockAlbumRecord {
+  id: string
+  title: string
+  description: string | null
+  episode_ids: string[]
+  created_at: string
+  updated_at: string
+}
+
+let accounts: MockAccount[] = []
+let albums: MockAlbumRecord[] = []
+/** 当前会话对应的账号 id；null = 已登出 */
+let sessionUserId: string | null = null
+
 /**
  * 现场录制的演示视频。录制是真实时间的，所以全站只录一次、所有单集共用同一份 Blob。
  *
@@ -233,6 +298,8 @@ function findEpisode(id: string): Episode | undefined {
 }
 
 function requireEpisode(id: string): Episode {
+  // 契约 §2.5：单集相关的接口全部需要登录（连音频/视频这些资源接口也一样）
+  requireAccount()
   const episode = findEpisode(id)
   if (!episode) throw new ApiError('单集不存在或已被删除', 404)
   return episode
@@ -482,6 +549,10 @@ function createEpisodeRecord(input: {
     audio_url: null,
     audio_duration_sec: null,
     audio_bytes: null,
+    // V2：新建的单集一律私有、无分享、无专辑（与真实后端一致）
+    visibility: 'private',
+    share_token: null,
+    album_id: null,
     created_at: created,
     updated_at: created,
   }
@@ -790,6 +861,7 @@ async function blobFromUrl(url: string): Promise<Blob | null> {
  */
 export async function rebuildVideo(id: string, lang?: EpisodeLanguage): Promise<Episode> {
   ensureLoaded()
+  requireAccount()
   await delay(60)
   const episode = requireEpisode(id)
 
@@ -862,10 +934,22 @@ function persist(): void {
         video: null,
         versions: stripVersionsForStorage(episode.versions),
       })),
+      // V2：专辑与账号跟着一起落盘（分享 token 就在单集上，已经含在上面的 episodes 里）
+      albums,
+      accounts,
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
   } catch {
     // 隐私模式或配额不足：忽略，内存态仍然可用
+  }
+}
+
+/** 会话落盘：让「登出」这件事在刷新后依然成立（不然一刷新又自动登录回去了） */
+function persistSession(): void {
+  try {
+    window.localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: sessionUserId }))
+  } catch {
+    // 忽略
   }
 }
 
@@ -936,6 +1020,10 @@ function normalizeStored(raw: unknown): Episode | null {
     audio_url: null,
     audio_duration_sec: null,
     audio_bytes: null,
+    // V2：老落盘数据里没有这三个字段（schema 对不上本来也会整份丢掉，这里再兜一层）
+    visibility: value.visibility === 'public' ? 'public' : 'private',
+    share_token: typeof value.share_token === 'string' && value.share_token ? value.share_token : null,
+    album_id: typeof value.album_id === 'string' && value.album_id ? value.album_id : null,
     created_at: value.created_at ?? nowIso(),
     updated_at: value.updated_at ?? nowIso(),
   }
@@ -1002,6 +1090,8 @@ function ensureLoaded(): void {
   loaded = true
 
   let restored: Episode[] = []
+  let restoredAlbums: MockAlbumRecord[] = []
+  let restoredAccounts: MockAccount[] = []
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY)
     if (raw) {
@@ -1014,6 +1104,8 @@ function ensureLoaded(): void {
         if (Array.isArray(list)) {
           restored = list.map(normalizeStored).filter((item): item is Episode => item !== null)
         }
+        restoredAlbums = normalizeStoredAlbums((parsed as { albums?: unknown }).albums)
+        restoredAccounts = normalizeStoredAccounts((parsed as { accounts?: unknown }).accounts)
       }
     }
   } catch {
@@ -1022,9 +1114,17 @@ function ensureLoaded(): void {
 
   if (restored.length) {
     episodes.push(...restored)
+    albums = restoredAlbums
+    accounts = restoredAccounts
   } else {
     seed()
+    seedAlbums()
   }
+
+  // 库里的账一个都没有是不可能的（演示账号兜底）：没有账号时连登出都做不了
+  if (!accounts.length) accounts.push(demoAccount())
+
+  loadSession()
 
   episodes.forEach((episode) => {
     if (episode.status === 'completed') {
@@ -1039,6 +1139,674 @@ function ensureLoaded(): void {
   if (episodes.some((episode) => episode.status === 'completed')) void ensureSharedVideo()
 
   persist()
+}
+
+/** 会话读取：没有记录时自动登录演示账号（契约 §4 的离线演示要「打开就能用」） */
+function loadSession(): void {
+  let stored: unknown = null
+  try {
+    const raw = window.localStorage.getItem(SESSION_KEY)
+    stored = raw ? JSON.parse(raw) : null
+  } catch {
+    stored = null
+  }
+  if (stored && typeof stored === 'object' && 'userId' in (stored as object)) {
+    const userId = (stored as { userId?: unknown }).userId
+    sessionUserId = typeof userId === 'string' && findAccountById(userId) ? userId : null
+    return
+  }
+  sessionUserId = demoAccount().id
+  persistSession()
+}
+
+/** 演示账号（内存里的兜底对象不写盘，等 persist 时再落） */
+function demoAccount(): MockAccount {
+  const existing = findAccountByUsername(DEMO_USERNAME)
+  if (existing) return existing
+  const account: MockAccount = {
+    id: 'u_demo01',
+    username: DEMO_USERNAME,
+    display_name: 'Guo（演示账号）',
+    created_at: nowIso(),
+    password: DEMO_PASSWORD,
+  }
+  accounts.push(account)
+  return account
+}
+
+// ---------------------------------------------------------------------------
+// V2：账号（Mock 会话）
+// ---------------------------------------------------------------------------
+
+function findAccountById(id: string): MockAccount | undefined {
+  return accounts.find((account) => account.id === id)
+}
+
+function findAccountByUsername(username: string): MockAccount | undefined {
+  const wanted = username.trim().toLowerCase()
+  return accounts.find((account) => account.username === wanted)
+}
+
+function publicUser(account: MockAccount): User {
+  // 口令绝不返回（契约 §2.5）—— 白名单式构造，不是把对象删两个字段
+  return {
+    id: account.id,
+    username: account.username,
+    display_name: account.display_name,
+    created_at: account.created_at,
+  }
+}
+
+/** 当前登录的账号；未登录返回 null */
+function currentAccount(): MockAccount | null {
+  ensureLoaded()
+  return sessionUserId ? (findAccountById(sessionUserId) ?? null) : null
+}
+
+/**
+ * 受保护接口的统一入口：未登录就抛 401（并通知会话层跳登录页）。
+ * 与真实后端 `/api/episodes` 一族的行为一致 —— Mock 演示站上「登出后再点播放库」
+ * 必须能看到「被挡到登录页」这条路径，否则等于把鉴权从演示里删掉了。
+ */
+function requireAccount(): MockAccount {
+  const account = currentAccount()
+  if (!account) {
+    const error = new ApiError('需要登录', 401)
+    notifyUnauthorized(error)
+    throw error
+  }
+  return account
+}
+
+/** 用户名规则与后端 auth_lib.normalize_username 对齐（3-32 位 ASCII 字母/数字/_-） */
+function normalizeMockUsername(raw: string): string {
+  const username = (raw || '').trim().toLowerCase()
+  if (username.length < 3 || username.length > 32) {
+    throw new ApiError('用户名长度需要 3-32 位', 400)
+  }
+  // 显式限定 ASCII：中文、日文在 JS 里也算「字母数字」，不写死字符集会放它们过去
+  if (!/^[a-z0-9_-]+$/.test(username)) {
+    throw new ApiError('用户名只能包含字母、数字、下划线和连字符', 400)
+  }
+  return username
+}
+
+function normalizeMockPassword(raw: string): string {
+  const password = raw || ''
+  if (password.length < 8) throw new ApiError('口令至少 8 位', 400)
+  if (password.length > 128) throw new ApiError('口令最长 128 位', 400)
+  return password
+}
+
+// ---------------------------------------------------------------------------
+// V2：专辑（Mock）
+// ---------------------------------------------------------------------------
+
+function normalizeStoredAlbums(raw: unknown): MockAlbumRecord[] {
+  if (!Array.isArray(raw)) return []
+  return raw.flatMap<MockAlbumRecord>((item) => {
+    if (!item || typeof item !== 'object') return []
+    const value = item as Partial<MockAlbumRecord>
+    if (typeof value.id !== 'string' || !value.id) return []
+    const ids = Array.isArray(value.episode_ids)
+      ? value.episode_ids.filter((id): id is string => typeof id === 'string' && Boolean(id))
+      : []
+    return [
+      {
+        id: value.id,
+        title: typeof value.title === 'string' && value.title ? value.title : '未命名专辑',
+        description: typeof value.description === 'string' ? value.description : null,
+        episode_ids: ids,
+        created_at: value.created_at ?? nowIso(),
+        updated_at: value.updated_at ?? nowIso(),
+      },
+    ]
+  })
+}
+
+function normalizeStoredAccounts(raw: unknown): MockAccount[] {
+  if (!Array.isArray(raw)) return []
+  return raw.flatMap<MockAccount>((item) => {
+    if (!item || typeof item !== 'object') return []
+    const value = item as Partial<MockAccount>
+    if (typeof value.id !== 'string' || typeof value.username !== 'string') return []
+    return [
+      {
+        id: value.id,
+        username: value.username,
+        display_name: value.display_name ?? '',
+        created_at: value.created_at ?? nowIso(),
+        password: typeof value.password === 'string' ? value.password : DEMO_PASSWORD,
+      },
+    ]
+  })
+}
+
+/** 内置演示专辑：空库会让「专辑」这个功能看起来什么都没做 */
+function seedAlbums(): void {
+  const completed = episodes.filter((episode) => episode.status === 'completed')
+  const first = completed[0]
+  const second = completed[1]
+  const created = new Date(Date.now() - 3600000).toISOString()
+  if (first) {
+    albums.push({
+      id: makeAlbumId(),
+      title: 'Transformer 系列',
+      description: '从 Attention 到后续跟进工作',
+      episode_ids: second ? [first.id, second.id] : [first.id],
+      created_at: created,
+      updated_at: created,
+    })
+    first.album_id = albums[0]?.id ?? null
+    if (second && albums[0]) second.album_id = albums[0].id
+  }
+}
+
+function makeAlbumId(): string {
+  const hex = '0123456789abcdef'
+  let id = 'al_'
+  do {
+    id = 'al_'
+    for (let i = 0; i < 6; i += 1) id += hex[Math.floor(Math.random() * hex.length)]
+  } while (albums.some((album) => album.id === id))
+  return id
+}
+
+function findAlbum(id: string): MockAlbumRecord | undefined {
+  return albums.find((album) => album.id === id)
+}
+
+function requireAlbum(id: string): MockAlbumRecord {
+  requireAccount()
+  const album = findAlbum(id)
+  // 别的用户的专辑一律 404（Mock 里只有一个演示账号，语义照样照搬）
+  if (!album) throw new ApiError('专辑不存在', 404)
+  return album
+}
+
+function albumEpisodes(album: MockAlbumRecord): Episode[] {
+  return album.episode_ids
+    .map((id) => findEpisode(id))
+    .filter((episode): episode is Episode => episode !== undefined)
+}
+
+function albumPayload(album: MockAlbumRecord): Album {
+  const items = albumEpisodes(album)
+  // 封面取专辑里最新一集的封面（契约 §2.6）
+  const latest = items
+    .slice()
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+  return {
+    id: album.id,
+    title: album.title,
+    description: album.description,
+    episode_count: items.length,
+    cover_url: latest?.cover_url ?? null,
+    created_at: album.created_at,
+    updated_at: album.updated_at,
+  }
+}
+
+function albumDetail(album: MockAlbumRecord): AlbumDetail {
+  return {
+    ...albumPayload(album),
+    episodes: albumEpisodes(album)
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+      .map(toSummary),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// V2：分享（Mock）
+// ---------------------------------------------------------------------------
+
+function makeShareToken(): string {
+  const hex = '0123456789abcdef'
+  let token = ''
+  for (let i = 0; i < 22; i += 1) token += hex[Math.floor(Math.random() * hex.length)]
+  return token
+}
+
+function findEpisodeByShareToken(token: string): Episode | undefined {
+  // 契约 §2.7：必须**同时**匹配 visibility=public，只看 token 在不在的话，
+  // 取消分享那一刻旧链接还是通的 —— 这正是「关掉后旧链接失效」的关键。
+  return episodes.find(
+    (episode) => episode.share_token === token && (episode.visibility ?? 'private') === 'public',
+  )
+}
+
+/** 公开视图：白名单式构造，不含 options / source_ref / id（契约 §2.7） */
+function buildShareView(episode: Episode, token: string | null): ShareView {
+  const languages = episodeLanguages(episode)
+  const order = languages.length ? languages : episode.languages ?? [primaryLanguage(episode)]
+  const versions: Partial<Record<EpisodeLanguage, ShareVersion>> = {}
+  order.forEach((language) => {
+    const version = versionFor(episode, language)
+    versions[language] = {
+      language,
+      paper_meta: version?.paper_meta ?? episode.paper_meta,
+      analysis: version?.analysis ?? episode.analysis,
+      script: version?.script ?? episode.script,
+      illustration: version?.illustration ?? episode.illustration ?? null,
+      audio_url: version?.audio_url ?? episode.audio_url,
+      audio_duration_sec: version?.audio_duration_sec ?? episode.audio_duration_sec,
+      audio_bytes: version?.audio_bytes ?? episode.audio_bytes,
+      video: version?.video ?? episode.video,
+    }
+  })
+  const primary = primaryLanguage(episode)
+  const surface = versions[primary] ?? versions[order[0] ?? primary]
+  const owner = currentAccount() ?? findAccountById(sessionUserId ?? '') ?? null
+  return {
+    token,
+    title: episode.title,
+    paper_meta: surface?.paper_meta ?? episode.paper_meta,
+    language: primary,
+    languages: order.length ? order : [primary],
+    versions,
+    cover_url: episode.cover_url,
+    cover_width: episode.cover_width,
+    cover_height: episode.cover_height,
+    figures: episode.figures.map((figure) => ({ ...figure })),
+    illustration: surface?.illustration ?? episode.illustration ?? null,
+    video: surface?.video ?? episode.video,
+    audio_url: surface?.audio_url ?? episode.audio_url,
+    audio_duration_sec: surface?.audio_duration_sec ?? episode.audio_duration_sec,
+    audio_bytes: surface?.audio_bytes ?? episode.audio_bytes,
+    script: surface?.script ?? episode.script,
+    analysis: surface?.analysis ?? episode.analysis,
+    author: owner ? { display_name: owner.display_name || owner.username } : null,
+    created_at: episode.created_at,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// V2：账号与会话（契约 §2.5）
+// ---------------------------------------------------------------------------
+
+export async function getMe(): Promise<User> {
+  ensureLoaded()
+  await delay(60)
+  const account = currentAccount()
+  if (!account) throw new ApiError('需要登录', 401)
+  return publicUser(account)
+}
+
+export async function register(input: RegisterInput): Promise<User> {
+  ensureLoaded()
+  await delay(200)
+  const username = normalizeMockUsername(input.username)
+  const password = normalizeMockPassword(input.password)
+  // 真实的 SIGNUP_CODE 只在服务端，Mock 里没有这回事：邀请码字段照样显示，填什么都放行
+  if (findAccountByUsername(username)) {
+    throw new ApiError('这个用户名已经被用了', 409)
+  }
+  const account: MockAccount = {
+    id: `u_${Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0')}`,
+    username,
+    display_name: (input.display_name ?? '').trim().slice(0, 40),
+    created_at: nowIso(),
+    password,
+  }
+  accounts.push(account)
+  // 注册即登录（契约 §2.5）
+  sessionUserId = account.id
+  persistSession()
+  persist()
+  return publicUser(account)
+}
+
+export async function login(input: LoginInput): Promise<User> {
+  ensureLoaded()
+  await delay(200)
+  const account = findAccountByUsername(input.username ?? '')
+  // 用户名不存在与口令错给同一个提示（契约 §2.5：别告诉对方哪个错了）
+  if (!account || account.password !== (input.password ?? '')) {
+    throw new ApiError('用户名或口令不正确', 401)
+  }
+  sessionUserId = account.id
+  persistSession()
+  return publicUser(account)
+}
+
+export async function logout(): Promise<void> {
+  ensureLoaded()
+  await delay(120)
+  // 幂等：没登录也成功（契约 §2.5）
+  sessionUserId = null
+  persistSession()
+}
+
+export async function changePassword(input: PasswordChangeInput): Promise<void> {
+  ensureLoaded()
+  await delay(200)
+  const account = requireAccount()
+  if (account.password !== (input.current_password ?? '')) {
+    throw new ApiError('当前口令不正确', 401)
+  }
+  account.password = normalizeMockPassword(input.new_password)
+  persist()
+}
+
+// ---------------------------------------------------------------------------
+// V2：个人专辑（契约 §2.6）
+// ---------------------------------------------------------------------------
+
+export async function listAlbums(): Promise<Album[]> {
+  ensureLoaded()
+  requireAccount()
+  await delay(160)
+  return albums
+    .slice()
+    .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))
+    .map(albumPayload)
+}
+
+export async function createAlbum(input: AlbumWriteInput): Promise<Album> {
+  ensureLoaded()
+  requireAccount()
+  await delay(180)
+  const title = (input.title ?? '').trim()
+  if (!title) throw new ApiError('专辑名称不能为空', 400)
+  if (title.length > 60) throw new ApiError('专辑名称最长 60 字', 400)
+  const created = nowIso()
+  const album: MockAlbumRecord = {
+    id: makeAlbumId(),
+    title,
+    description: (input.description ?? '').trim().slice(0, 200) || null,
+    episode_ids: [],
+    created_at: created,
+    updated_at: created,
+  }
+  albums.push(album)
+  persist()
+  return albumPayload(album)
+}
+
+export async function getAlbum(id: string): Promise<AlbumDetail> {
+  ensureLoaded()
+  await delay(140)
+  return albumDetail(requireAlbum(id))
+}
+
+export async function updateAlbum(id: string, input: AlbumWriteInput): Promise<Album> {
+  ensureLoaded()
+  await delay(180)
+  const album = requireAlbum(id)
+  if (input.title !== undefined) {
+    const title = (input.title ?? '').trim()
+    if (!title) throw new ApiError('专辑名称不能为空', 400)
+    album.title = title.slice(0, 60)
+  }
+  if (input.description !== undefined) {
+    album.description = (input.description ?? '').trim().slice(0, 200) || null
+  }
+  album.updated_at = nowIso()
+  persist()
+  return albumPayload(album)
+}
+
+export async function deleteAlbum(id: string): Promise<void> {
+  ensureLoaded()
+  await delay(180)
+  const album = requireAlbum(id)
+  const index = albums.indexOf(album)
+  if (index >= 0) albums.splice(index, 1)
+  // 契约 §2.6：**只删专辑，不删里面的单集**（单集的 album_id 置空）
+  episodes.forEach((episode) => {
+    if (episode.album_id === id) episode.album_id = null
+  })
+  persist()
+}
+
+export async function addAlbumEpisodes(id: string, episodeIds: string[]): Promise<AlbumDetail> {
+  ensureLoaded()
+  await delay(180)
+  const album = requireAlbum(id)
+  const ids = episodeIds.filter((episodeId) => Boolean(episodeId))
+  if (!ids.length) throw new ApiError('episode_ids 不能为空', 400)
+  if (ids.length > 100) throw new ApiError('一次最多加 100 集', 400)
+  ids.forEach((episodeId) => {
+    const episode = findEpisode(episodeId)
+    // 只能加自己的单集：不存在的一律忽略（契约 §2.6：不报错，也不泄漏它们存在）
+    if (!episode) return
+    if (!album.episode_ids.includes(episodeId)) album.episode_ids.push(episodeId)
+    episode.album_id = album.id
+  })
+  album.updated_at = nowIso()
+  persist()
+  return albumDetail(album)
+}
+
+export async function removeAlbumEpisode(id: string, episodeId: string): Promise<AlbumDetail> {
+  ensureLoaded()
+  await delay(160)
+  const album = requireAlbum(id)
+  album.episode_ids = album.episode_ids.filter((item) => item !== episodeId)
+  const episode = findEpisode(episodeId)
+  if (episode && episode.album_id === album.id) episode.album_id = null
+  album.updated_at = nowIso()
+  persist()
+  return albumDetail(album)
+}
+
+// ---------------------------------------------------------------------------
+// V2：一键分享（契约 §2.7）
+// ---------------------------------------------------------------------------
+
+export async function enableShare(id: string): Promise<Episode> {
+  ensureLoaded()
+  await delay(180)
+  const episode = requireEpisode(id)
+  episode.visibility = 'public'
+  // 已有 token 就**保持不变**：重复点一次不该让刚发给别人的链接失效
+  if (!episode.share_token) episode.share_token = makeShareToken()
+  episode.updated_at = nowIso()
+  persist()
+  return copyEpisode(episode)
+}
+
+export async function disableShare(id: string): Promise<Episode> {
+  ensureLoaded()
+  await delay(180)
+  const episode = requireEpisode(id)
+  episode.visibility = 'private'
+  episode.share_token = null
+  episode.updated_at = nowIso()
+  persist()
+  return copyEpisode(episode)
+}
+
+export async function resetShare(id: string): Promise<Episode> {
+  ensureLoaded()
+  await delay(180)
+  const episode = requireEpisode(id)
+  episode.visibility = 'public'
+  episode.share_token = makeShareToken()
+  episode.updated_at = nowIso()
+  persist()
+  return copyEpisode(episode)
+}
+
+export async function getShare(token: string): Promise<ShareView> {
+  ensureLoaded()
+  await delay(160)
+  const episode = findEpisodeByShareToken(token)
+  if (!episode) throw new ApiError('分享链接已失效', 404)
+  if (episode.status === 'completed') {
+    // 公开页要能播，先把异步产物补齐（音频/视频都是现场合成的）
+    await ensureAudio(episode)
+    await ensureVideo(episode)
+  }
+  return buildShareView(episode, token)
+}
+
+export async function getShowcase(): Promise<ShareView> {
+  ensureLoaded()
+  await delay(160)
+  const completed = episodes.filter((episode) => episode.status === 'completed')
+  const account = currentAccount()
+  // 登录了：自己的最新一期；没登录：只有公开分享的那些能看（契约：/api/showcase 免登录）
+  const pool = account
+    ? completed
+    : completed.filter((episode) => (episode.visibility ?? 'private') === 'public')
+  const recent = pool
+    .slice()
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+    .slice(0, 20)
+  // 优先多语言：一屏就能把「视频 + 双语 + 切换器」三件事讲清楚（与真实后端同规则）
+  const picked = recent.reduce<Episode | undefined>(
+    (best, item) =>
+      !best || episodeLanguages(item).length > episodeLanguages(best).length ? item : best,
+    undefined,
+  )
+  if (!picked) throw new ApiError('还没有可以展示的成品', 404)
+  await ensureAudio(picked)
+  await ensureVideo(picked)
+  const token = (picked.visibility ?? 'private') === 'public' ? picked.share_token ?? null : null
+  return buildShareView(picked, token)
+}
+
+export function shareScriptTxtUrl(token: string, lang?: EpisodeLanguage): string {
+  ensureLoaded()
+  const episode = findEpisodeByShareToken(token)
+  if (!episode) return ''
+  const { meta, script } = downloadContentFor(episode, lang)
+  if (!script) return ''
+  return trackObjectUrl(episode.id, textBlobUrl(buildScriptText(episode, meta, script), 'text/plain;charset=utf-8'))
+}
+
+/**
+ * 生成配额（`GET /api/usage`）。Mock 里给一个「已用 6 / 共 30」的演示值：
+ * 这个数字在演示站上不需要真实，但界面上那块提示得有东西可显示。
+ * 没登录（或开放模式）时按契约返回 limit=0，等价于「不限量」。
+ */
+export async function getUsage(): Promise<UsagePayload> {
+  ensureLoaded()
+  await delay(60)
+  const account = currentAccount()
+  if (!account) return { used: 0, limit: 0, remaining: null, resets_at: null }
+  const used = episodes.filter((episode) => episode.status !== 'failed').length
+  const limit = 30
+  return {
+    used,
+    limit,
+    remaining: Math.max(limit - used, 0),
+    resets_at: new Date(Date.now() + 3600000 * 8).toISOString(),
+  }
+}
+
+export function shareAnalysisMdUrl(token: string, lang?: EpisodeLanguage): string {
+  ensureLoaded()
+  const episode = findEpisodeByShareToken(token)
+  if (!episode) return ''
+  const { meta, analysis } = downloadContentFor(episode, lang)
+  if (!analysis) return ''
+  return trackObjectUrl(
+    episode.id,
+    textBlobUrl(buildAnalysisMarkdown(episode, meta, analysis), 'text/markdown;charset=utf-8'),
+  )
+}
+
+// ---------------------------------------------------------------------------
+// V2：批量生成（契约 §2.8）
+// ---------------------------------------------------------------------------
+
+/** 链接看起来能不能抓：Mock 不真的联网，用「明显不可达」的规则演示 failed 分支 */
+function mockUrlUnreachable(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return true
+    // .invalid 是 RFC 2606 保留的不可解析后缀；另外随便约定两个关键字便于演示
+    return (
+      /\.invalid$/i.test(parsed.hostname) ||
+      /unreachable|nonexistent/i.test(parsed.hostname)
+    )
+  } catch {
+    return true
+  }
+}
+
+export async function createEpisodeBatch(
+  input: BatchFilesInput | BatchUrlsInput | BatchTextsInput,
+): Promise<BatchResult> {
+  ensureLoaded()
+  requireAccount()
+  await delay(280)
+
+  if ('files' in input) {
+    const files = input.files ?? []
+    if (!files.length) throw new ApiError('缺少 files 字段（PDF 文件，可多选）', 400)
+    if (files.length > MAX_BATCH) throw new ApiError(`一次最多 ${MAX_BATCH} 篇`, 400)
+    const created: EpisodeSummary[] = []
+    const failed: BatchResult['failed'] = []
+    files.forEach((file) => {
+      const name = file.name || 'paper.pdf'
+      try {
+        if (!/\.pdf$/i.test(name)) throw new Error('只支持 PDF 文件')
+        if (!file.size) throw new Error('文件是空的')
+        if (file.size > 40 * 1024 * 1024) {
+          throw new Error(`文件过大（${Math.round(file.size / 1024 / 1024)}MB，Mock 上限 40MB）`)
+        }
+        const episode = createEpisodeRecord({
+          title: titleFromFilename(name),
+          sourceType: 'pdf',
+          sourceRef: name,
+          options: input.options,
+          shouldFail: FAIL_DEMO.test(name),
+        })
+        runPipeline(episode)
+        created.push(toSummary(episode))
+      } catch (cause) {
+        // 单项失败不影响其他项（契约 §2.8）：这一条进 failed 并带上原因，其余照常入队
+        failed.push({ ref: name, reason: cause instanceof Error ? cause.message : '无法处理这个文件' })
+      }
+    })
+    persist()
+    return { created, failed, total: created.length + failed.length }
+  }
+
+  const items: string[] = 'urls' in input ? (input.urls ?? []) : (input.texts ?? [])
+  const isUrl = 'urls' in input
+  if (!items.length) {
+    throw new ApiError(`缺少 ${isUrl ? 'urls' : 'texts'}（非空数组）`, 400)
+  }
+  if (items.length > MAX_BATCH) throw new ApiError(`一次最多 ${MAX_BATCH} 篇`, 400)
+
+  const created: EpisodeSummary[] = []
+  const failed: BatchResult['failed'] = []
+  items.forEach((item) => {
+    const ref = String(item ?? '').trim()
+    const label = isUrl ? '链接' : '文本'
+    try {
+      if (isUrl) {
+        if (!/^https?:\/\//i.test(ref)) throw new Error('链接必须以 http:// 或 https:// 开头')
+        if (mockUrlUnreachable(ref)) throw new Error('链接不可抓取')
+      } else if (ref.length < BATCH_TEXT_MIN) {
+        throw new Error(`文本太短（少于 ${BATCH_TEXT_MIN} 字）`)
+      }
+      const arxivId = isUrl ? extractArxivId(ref) : null
+      const known = arxivId ? paperByArxivId(arxivId) : undefined
+      const title = isUrl ? known?.meta.title ?? titleFromUrl(ref) : titleFromText(ref)
+      const episode = createEpisodeRecord({
+        title,
+        sourceType: isUrl ? 'url' : 'text',
+        sourceRef: isUrl ? ref : null,
+        options: input.options,
+        paper: known,
+        shouldFail: FAIL_DEMO.test(ref.slice(0, 400)),
+      })
+      runPipeline(episode)
+      created.push(toSummary(episode))
+    } catch (cause) {
+      failed.push({
+        ref: ref.slice(0, 120) || `${label}为空`,
+        reason: cause instanceof Error ? cause.message : `${label}无法处理`,
+      })
+    }
+  })
+  persist()
+  return { created, failed, total: created.length + failed.length }
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,7 +1892,14 @@ function textBlobUrl(content: string, type: string): string {
 export async function getHealth(): Promise<HealthPayload> {
   ensureLoaded()
   await delay(90)
-  return { status: 'ok', version: '0.1.0-mock', modes: { llm: 'mock', tts: 'mock' } }
+  // mode 恒为 auth：Mock 里有一个可登出/可注册的演示账号，
+  // 只有这样「登录页 / 被挡在登录页」这两条路径在离线演示站上才走得通。
+  return {
+    status: 'ok',
+    version: '0.2.0-mock',
+    modes: { llm: 'mock', tts: 'mock' },
+    mode: 'auth',
+  }
 }
 
 export async function getOptions(): Promise<OptionsPayload> {
@@ -1134,6 +1909,7 @@ export async function getOptions(): Promise<OptionsPayload> {
 
 export async function createEpisodeFromFile(input: CreateFileInput): Promise<Episode> {
   ensureLoaded()
+  requireAccount()
   await delay(240)
   if (!input.file) throw new ApiError('请选择要上传的 PDF 文件', 400)
   if (!/\.pdf$/i.test(input.file.name)) throw new ApiError('仅支持 .pdf 文件', 400)
@@ -1154,6 +1930,7 @@ export async function createEpisodeFromFile(input: CreateFileInput): Promise<Epi
 
 export async function createEpisodeFromUrl(input: CreateUrlInput): Promise<Episode> {
   ensureLoaded()
+  requireAccount()
   await delay(240)
   const url = input.url.trim()
   let parsed: URL
@@ -1184,6 +1961,7 @@ export async function createEpisodeFromUrl(input: CreateUrlInput): Promise<Episo
 
 export async function createEpisodeFromText(input: CreateTextInput): Promise<Episode> {
   ensureLoaded()
+  requireAccount()
   await delay(240)
   const text = input.text.trim()
   if (text.length < 20) throw new ApiError('请粘贴至少 20 个字的论文正文', 400)
@@ -1227,6 +2005,10 @@ function toSummary(episode: Episode): EpisodeSummary {
     audio_bytes: episode.audio_bytes,
     language: episode.language ?? null,
     languages: episode.languages ?? null,
+    // V2：列表上要显示「已分享 / 属于哪张专辑」的角标，所以这几个字段必须带上
+    visibility: episode.visibility ?? 'private',
+    share_token: episode.share_token ?? null,
+    album_id: episode.album_id ?? null,
     created_at: episode.created_at,
     updated_at: episode.updated_at,
   }
@@ -1234,6 +2016,7 @@ function toSummary(episode: Episode): EpisodeSummary {
 
 export async function listEpisodes(params: ListEpisodesParams = {}): Promise<ListEpisodesResult> {
   ensureLoaded()
+  requireAccount()
   await delay(200)
 
   const limit = Math.min(Math.max(params.limit ?? 20, 1), 100)
@@ -1252,6 +2035,7 @@ export async function listEpisodes(params: ListEpisodesParams = {}): Promise<Lis
 
 export async function getEpisode(id: string): Promise<Episode> {
   ensureLoaded()
+  requireAccount()
   await delay(140)
   const episode = requireEpisode(id)
   if (episode.status === 'completed' && !episode.audio_url) {
@@ -1264,6 +2048,7 @@ export async function getEpisode(id: string): Promise<Episode> {
 
 export async function deleteEpisode(id: string): Promise<void> {
   ensureLoaded()
+  requireAccount()
   await delay(160)
   const index = episodes.findIndex((episode) => episode.id === id)
   if (index < 0) throw new ApiError('单集不存在或已被删除', 404)
@@ -1277,6 +2062,7 @@ export async function deleteEpisode(id: string): Promise<void> {
 
 export async function retryEpisode(id: string): Promise<Episode> {
   ensureLoaded()
+  requireAccount()
   await delay(180)
   const episode = requireEpisode(id)
   if (episode.status !== 'failed') throw new ApiError('仅失败的任务可以重新生成', 409)
@@ -1433,6 +2219,9 @@ export function analysisMdUrl(id: string, lang?: EpisodeLanguage): string {
 /** 仅供调试：清空 mock 数据（localStorage + 内存） */
 export function resetMockStore(): void {
   episodes.length = 0
+  // 专辑跟着单集一起清（它引用的就是 episode id，单集没了只剩空壳）；
+  // **账号与会话不动** —— 重置演示数据不该顺手把人踢出登录状态
+  albums.length = 0
   timers.forEach((timer) => window.clearTimeout(timer))
   timers.clear()
   audioJobs.clear()
@@ -1460,6 +2249,7 @@ const adapter: ApiAdapter = {
   createEpisodeFromFile,
   createEpisodeFromUrl,
   createEpisodeFromText,
+  createEpisodeBatch,
   listEpisodes,
   getEpisode,
   deleteEpisode,
@@ -1469,6 +2259,26 @@ const adapter: ApiAdapter = {
   rebuildVideo,
   scriptTxtUrl,
   analysisMdUrl,
+  getMe,
+  register,
+  login,
+  logout,
+  changePassword,
+  getUsage,
+  listAlbums,
+  createAlbum,
+  getAlbum,
+  updateAlbum,
+  deleteAlbum,
+  addAlbumEpisodes,
+  removeAlbumEpisode,
+  enableShare,
+  disableShare,
+  resetShare,
+  getShare,
+  getShowcase,
+  shareScriptTxtUrl,
+  shareAnalysisMdUrl,
 }
 
 export default adapter
