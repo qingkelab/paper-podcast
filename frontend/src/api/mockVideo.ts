@@ -265,19 +265,16 @@ function drawBody(ctx: Ctx, accent: string, progress: number): void {
   ctx.textAlign = 'left'
 }
 
-/** 片尾：模拟「模型生成的信息图」 */
+/** 片尾：模拟「模型生成的信息图」。白底，与后端 illustration.ILLUSTRATION_PALETTE 一致 */
 function drawOutro(ctx: Ctx, title: string, progress: number): void {
-  const gradient = ctx.createLinearGradient(0, 0, MOCK_VIDEO_WIDTH, MOCK_VIDEO_HEIGHT)
-  gradient.addColorStop(0, '#0f1a2c')
-  gradient.addColorStop(1, '#132238')
-  ctx.fillStyle = gradient
+  ctx.fillStyle = '#ffffff'
   ctx.fillRect(0, 0, MOCK_VIDEO_WIDTH, MOCK_VIDEO_HEIGHT)
 
-  ctx.fillStyle = '#f2f6fc'
+  ctx.fillStyle = '#1a2233'
   ctx.font = `700 21px ${SANS}`
   ctx.fillText(truncate(title, 18), 32, 74)
 
-  ctx.fillStyle = '#8ea3bd'
+  ctx.fillStyle = '#6b7a8f'
   ctx.font = `400 11px ${SANS}`
   ctx.fillText('Mock 信息图 · 离线现场生成', 32, 96)
 
@@ -286,58 +283,50 @@ function drawOutro(ctx: Ctx, title: string, progress: number): void {
     const y = 150 + index * 92
     const active = progress > (index + 0.5) / labels.length
     roundRect(ctx, 32, y, MOCK_VIDEO_WIDTH - 64, 72, 10)
-    ctx.fillStyle = '#16233a'
+    ctx.fillStyle = '#f4f7fa'
     ctx.fill()
-    ctx.strokeStyle = active ? '#5ea8e0' : '#24344c'
+    ctx.strokeStyle = active ? '#2f6fb5' : '#dde5ee'
     ctx.lineWidth = 2
     ctx.stroke()
-    ctx.fillStyle = active ? '#5ea8e0' : '#54677f'
+    ctx.fillStyle = active ? '#2f6fb5' : '#93a4b8'
     ctx.beginPath()
     ctx.arc(58, y + 30, 6, 0, Math.PI * 2)
     ctx.fill()
-    ctx.fillStyle = '#eef4fb'
+    ctx.fillStyle = '#33415a'
     ctx.font = `600 15px ${SANS}`
     ctx.fillText(label, 76, y + 36)
-    ctx.fillStyle = '#22314a'
+    ctx.fillStyle = '#dde5ee'
     ctx.fillRect(76, y + 48, (MOCK_VIDEO_WIDTH - 140) * (active ? 1 : 0.3), 6)
   })
 }
 
-/** 底部字幕条：按主播分色，和详情页 ScriptView 的配色约定一致 */
+/** 底部字幕条：极浅底 + 分隔线，正文深色 */
 function drawSubtitle(ctx: Ctx, scene: Scene, timeInScene: number): void {
   const color = SPEAKER_COLORS[scene.speaker]
   const barHeight = 168
   const top = MOCK_VIDEO_HEIGHT - barHeight
 
-  const gradient = ctx.createLinearGradient(0, top, 0, MOCK_VIDEO_HEIGHT)
-  gradient.addColorStop(0, 'rgba(6, 10, 16, 0)')
-  gradient.addColorStop(0.32, 'rgba(6, 10, 16, 0.86)')
-  gradient.addColorStop(1, 'rgba(6, 10, 16, 0.96)')
-  ctx.fillStyle = gradient
+  ctx.fillStyle = '#f4f7fa'
   ctx.fillRect(0, top, MOCK_VIDEO_WIDTH, barHeight)
+  ctx.fillStyle = '#dde5ee'
+  ctx.fillRect(0, top, MOCK_VIDEO_WIDTH, 2)
 
   // 顶部小标签 + 画面进度条
-  ctx.fillStyle = 'rgba(232, 230, 225, 0.62)'
+  ctx.fillStyle = '#6b7a8f'
   ctx.font = `500 11px ${SANS}`
   ctx.fillText(scene.label, 24, top + 26)
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.12)'
+  ctx.fillStyle = '#dde5ee'
   ctx.fillRect(24, top + 34, MOCK_VIDEO_WIDTH - 48, 2)
 
-  // 主播标签
-  roundRect(ctx, 24, top + 52, 62, 24, 12)
+  // 只用一个颜色圆点表示谁在说话：**不出「主播A / 主播B」文字标签**，
+  // 谁在说话听声音就知道，多一行字只会分散注意力、也占掉字幕空间。
   ctx.fillStyle = color
-  ctx.globalAlpha = 0.16
+  ctx.beginPath()
+  ctx.arc(30, top + 62, 5, 0, Math.PI * 2)
   ctx.fill()
-  ctx.globalAlpha = 1
-  ctx.strokeStyle = color
-  ctx.lineWidth = 1
-  ctx.stroke()
-  ctx.fillStyle = color
-  ctx.font = `600 12px ${SANS}`
-  ctx.fillText(`主播${scene.speaker}`, 38, top + 68)
 
   // 字幕正文：逐段「打字机」出现，证明画面确实在按时间推进
-  ctx.fillStyle = '#f1efe9'
+  ctx.fillStyle = '#16202f'
   ctx.font = `400 15px ${SANS}`
   const shown = truncate(scene.subtitle, Math.max(6, Math.ceil(scene.subtitle.length * Math.min(1, timeInScene * 0.9))))
   const lines = wrapText(ctx, shown, MOCK_VIDEO_WIDTH - 48, 4)
@@ -355,7 +344,7 @@ function drawFrame(ctx: Ctx, scenes: Scene[], title: string, elapsed: number, to
   const progress = Math.min(1, Math.max(0, timeInScene / perScene))
 
   ctx.save()
-  ctx.fillStyle = '#0b1119'
+  ctx.fillStyle = '#ffffff'
   ctx.fillRect(0, 0, MOCK_VIDEO_WIDTH, MOCK_VIDEO_HEIGHT)
 
   if (scene.kind === 'intro') drawIntro(ctx, title)

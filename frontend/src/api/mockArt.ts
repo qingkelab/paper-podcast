@@ -513,8 +513,21 @@ function truncate(text: string, max: number): string {
  * 生成信息图 SVG 源码。
  * 关键点：内含 SMIL 动画（<animateMotion> 让光点沿流水线跑，<animate> 让节点呼吸），
  * 因此必须用 <object type="image/svg+xml"> 引用才会播放动画。
+ * 配色必须跟后端 `illustration.ILLUSTRATION_PALETTE` 一致（白底）：
+ * 这些图最后要贴进白底的视频画面，自己做成深色就是一大块黑斑。
  */
-export function buildIllustrationSvg(title: string, accent = '#5ea8e0'): string {
+export const ILLUSTRATION_PALETTE = {
+  bg: '#ffffff',
+  title: '#1a2233',
+  body: '#33415a',
+  muted: '#6b7a8f',
+  card: '#f4f7fa',
+  cardBorder: '#dde5ee',
+  accent: '#2f6fb5',
+  accentSoft: '#e8f0fa',
+} as const
+
+export function buildIllustrationSvg(title: string, accent = ILLUSTRATION_PALETTE.accent): string {
   const safeTitle = escapeXml(truncate(title, 34))
   const nodes = [
     { x: 70, label: '论文 PDF' },
@@ -531,15 +544,15 @@ export function buildIllustrationSvg(title: string, accent = '#5ea8e0'): string 
     .map((node, index) => {
       const begin = `${(index * 0.45).toFixed(2)}s`
       return `    <g>
-      <rect x="${node.x}" y="${nodeY}" width="${nodeWidth}" height="${nodeHeight}" rx="16" fill="#16233a" stroke="${accent}" stroke-opacity="0.55" stroke-width="2">
+      <rect x="${node.x}" y="${nodeY}" width="${nodeWidth}" height="${nodeHeight}" rx="16" fill="${ILLUSTRATION_PALETTE.card}" stroke="${accent}" stroke-opacity="0.55" stroke-width="2">
         <animate attributeName="stroke-opacity" values="0.35;0.85;0.35" dur="3.2s" begin="${begin}" repeatCount="indefinite" />
       </rect>
       <circle cx="${node.x + 30}" cy="${nodeY + 38}" r="7" fill="${accent}">
         <animate attributeName="r" values="6;9;6" dur="2.4s" begin="${begin}" repeatCount="indefinite" />
       </circle>
-      <text x="${node.x + 52}" y="${nodeY + 45}" fill="#eef4fb" font-size="26" font-weight="600" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">${escapeXml(node.label)}</text>
-      <text x="${node.x + 30}" y="${nodeY + 92}" fill="#8ea3bd" font-size="19" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">Mock 信息图 · 节点 ${index + 1}</text>
-      <rect x="${node.x + 30}" y="${nodeY + 112}" width="${nodeWidth - 60}" height="8" rx="4" fill="#22314a">
+      <text x="${node.x + 52}" y="${nodeY + 45}" fill="${ILLUSTRATION_PALETTE.body}" font-size="26" font-weight="600" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">${escapeXml(node.label)}</text>
+      <text x="${node.x + 30}" y="${nodeY + 92}" fill="${ILLUSTRATION_PALETTE.muted}" font-size="19" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">Mock 信息图 · 节点 ${index + 1}</text>
+      <rect x="${node.x + 30}" y="${nodeY + 112}" width="${nodeWidth - 60}" height="8" rx="4" fill="${ILLUSTRATION_PALETTE.cardBorder}">
         <animate attributeName="width" values="${(nodeWidth - 60) * 0.35};${nodeWidth - 60};${(nodeWidth - 60) * 0.35}" dur="4.6s" begin="${begin}" repeatCount="indefinite" />
       </rect>
     </g>`
@@ -567,10 +580,6 @@ export function buildIllustrationSvg(title: string, accent = '#5ea8e0'): string 
 
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${ILLUSTRATION_WIDTH} ${ILLUSTRATION_HEIGHT}" width="${ILLUSTRATION_WIDTH}" height="${ILLUSTRATION_HEIGHT}" role="img" aria-label="${safeTitle} 信息图">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0f1a2c" />
-      <stop offset="100%" stop-color="#132238" />
-    </linearGradient>
     <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
       <feGaussianBlur stdDeviation="6" result="blur" />
       <feMerge>
@@ -580,23 +589,23 @@ export function buildIllustrationSvg(title: string, accent = '#5ea8e0'): string 
     </filter>
   </defs>
 
-  <rect x="0" y="0" width="${ILLUSTRATION_WIDTH}" height="${ILLUSTRATION_HEIGHT}" rx="22" fill="url(#bg)" />
-  <rect x="1" y="1" width="${ILLUSTRATION_WIDTH - 2}" height="${ILLUSTRATION_HEIGHT - 2}" rx="21" fill="none" stroke="#24344c" stroke-width="2" />
+  <rect x="0" y="0" width="${ILLUSTRATION_WIDTH}" height="${ILLUSTRATION_HEIGHT}" fill="${ILLUSTRATION_PALETTE.bg}" />
+  <rect x="1" y="1" width="${ILLUSTRATION_WIDTH - 2}" height="${ILLUSTRATION_HEIGHT - 2}" fill="none" stroke="${ILLUSTRATION_PALETTE.cardBorder}" stroke-width="2" />
 
-  <text x="70" y="104" fill="#f2f6fc" font-size="44" font-weight="700" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">${safeTitle}</text>
-  <text x="70" y="148" fill="#8ea3bd" font-size="22" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">Mock 模式现场生成的信息图 · SVG 内含 SMIL 动画</text>
-  <line x1="70" y1="182" x2="${ILLUSTRATION_WIDTH - 70}" y2="182" stroke="#24344c" stroke-width="2" />
+  <text x="70" y="104" fill="${ILLUSTRATION_PALETTE.title}" font-size="44" font-weight="700" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">${safeTitle}</text>
+  <text x="70" y="148" fill="${ILLUSTRATION_PALETTE.muted}" font-size="22" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">Mock 模式现场生成的信息图 · SVG 内含 SMIL 动画</text>
+  <line x1="70" y1="182" x2="${ILLUSTRATION_WIDTH - 70}" y2="182" stroke="${ILLUSTRATION_PALETTE.cardBorder}" stroke-width="2" />
 
 ${arrowMarkup}
 
 ${nodeMarkup}
 
-  <circle r="7" fill="#ffd479" filter="url(#glow)">
+  <circle r="7" fill="${ILLUSTRATION_PALETTE.accent}" filter="url(#glow)">
     <animateMotion dur="5.2s" repeatCount="indefinite" rotate="auto" path="${pathD}" />
     <animate attributeName="opacity" values="0.35;1;0.35" dur="2.6s" repeatCount="indefinite" />
   </circle>
 
-  <text x="70" y="${ILLUSTRATION_HEIGHT - 52}" fill="#7d90aa" font-size="20" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">动画验证：黄色光点沿流水线循环移动，节点描边与进度条呼吸</text>
+  <text x="70" y="${ILLUSTRATION_HEIGHT - 52}" fill="${ILLUSTRATION_PALETTE.muted}" font-size="20" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">动画验证：蓝色光点沿流水线循环移动，节点描边与进度条呼吸</text>
 </svg>`
 }
 
@@ -704,23 +713,20 @@ export function buildIllustrationPngDataUrl(title: string): string {
   const made = createCanvas(ILLUSTRATION_WIDTH, ILLUSTRATION_HEIGHT)
   if (!made) return ''
   const { canvas, ctx } = made
-  const accent = '#5ea8e0'
+  const accent = ILLUSTRATION_PALETTE.accent
 
-  const background = ctx.createLinearGradient(0, 0, ILLUSTRATION_WIDTH, ILLUSTRATION_HEIGHT)
-  background.addColorStop(0, '#0f1a2c')
-  background.addColorStop(1, '#132238')
-  ctx.fillStyle = background
+  ctx.fillStyle = ILLUSTRATION_PALETTE.bg
   ctx.fillRect(0, 0, ILLUSTRATION_WIDTH, ILLUSTRATION_HEIGHT)
 
-  ctx.fillStyle = '#f2f6fc'
+  ctx.fillStyle = ILLUSTRATION_PALETTE.title
   ctx.font = `700 44px ${SANS}`
   ctx.fillText(truncate(title, 30), 70, 104)
 
-  ctx.fillStyle = '#8ea3bd'
+  ctx.fillStyle = ILLUSTRATION_PALETTE.muted
   ctx.font = `400 22px ${SANS}`
   ctx.fillText('Mock 模式现场生成的信息图（静态 PNG）', 70, 148)
 
-  ctx.strokeStyle = '#24344c'
+  ctx.strokeStyle = ILLUSTRATION_PALETTE.cardBorder
   ctx.lineWidth = 2
   ctx.beginPath()
   ctx.moveTo(70, 182)
@@ -734,7 +740,7 @@ export function buildIllustrationPngDataUrl(title: string): string {
   labels.forEach((label, index) => {
     const x = 70 + index * 280
     roundRect(ctx, x, nodeY, nodeWidth, nodeHeight, 16)
-    ctx.fillStyle = '#16233a'
+    ctx.fillStyle = ILLUSTRATION_PALETTE.card
     ctx.fill()
     ctx.strokeStyle = accent
     ctx.globalAlpha = 0.55
@@ -745,10 +751,10 @@ export function buildIllustrationPngDataUrl(title: string): string {
     ctx.beginPath()
     ctx.arc(x + 30, nodeY + 38, 7, 0, Math.PI * 2)
     ctx.fill()
-    ctx.fillStyle = '#eef4fb'
+    ctx.fillStyle = ILLUSTRATION_PALETTE.body
     ctx.font = `600 26px ${SANS}`
     ctx.fillText(label, x + 52, nodeY + 45)
-    ctx.fillStyle = '#8ea3bd'
+    ctx.fillStyle = ILLUSTRATION_PALETTE.muted
     ctx.font = `400 19px ${SANS}`
     ctx.fillText(`节点 ${index + 1}`, x + 30, nodeY + 92)
 
@@ -766,7 +772,7 @@ export function buildIllustrationPngDataUrl(title: string): string {
     }
   })
 
-  ctx.fillStyle = '#7d90aa'
+  ctx.fillStyle = ILLUSTRATION_PALETTE.muted
   ctx.font = `400 20px ${SANS}`
   ctx.fillText('静态版用于 <object> 的降级展示；动画请见 illustration.svg', 70, ILLUSTRATION_HEIGHT - 60)
 

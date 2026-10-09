@@ -188,6 +188,12 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   实测同一条视频里一半白底一半深色，比全深色还难看。
   **白底要铺满整张画布、不要加 `rx` 圆角** —— 圆角会切出透明角，落到深色预览底上就露黑边
   （测试里会真的渲染出来采样四角像素，光看字符串不够）。
+- **浏览器端 Mock 的配图和视频也必须跟着改白底**。离线演示（Pages 首页）里
+  「生成信息图」是 `mockArt.buildIllustrationSvg` / `buildIllustrationPngDataUrl` 现画的，
+  视频是 `mockVideo` 用 MediaRecorder 现场录的 —— 它们各自写了一套配色，
+  只改后端的话演示页看起来还是旧风格。三处配色统一到 `mockArt.ILLUSTRATION_PALETTE`
+  （与后端 `ILLUSTRATION_PALETTE` 同值）。Mock 视频同样**不出「主播A / 主播B」文字标签**，
+  字幕条是白底 + `#f4f7fa` 极浅底。（前端没有测试框架，这里只能靠改的时候一起想起来。）
 - **双语集每个语言各有一份信息图和一组段落配图**。改配色、重画、清理时都必须
   **逐语言版本**处理：只处理主语言的话，`.en` 那份会原地留着旧样式。
 - **「重画段落配图」要沿用原有的分组与文件名**。`video.scenes` 记着「第几段用哪张图」、
