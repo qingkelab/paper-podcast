@@ -50,14 +50,14 @@
   "cover_width": 935,
   "cover_height": 1210,
   "figures": [                                  // 从论文 PDF 提取的原图/表
+    // caption 是**整段图注**（跨行），不是只有标签那一行：图注里的 `(a) (b) (c)` 枚举
+    // 是「这张图有几个子图」的唯一可靠来源，视频靠它决定聚光灯框哪一块。
+    // 子图标注的位置（panel_marks）是内部数据，**不在响应里**（见下面视频那节的说明）。
     { "id": "f1", "kind": "figure", "label": "Figure 1",
-      "caption": "Figure 1: Why recurrent state needs structured compression. (a) … (b) … (c) …",
+      "caption": "Figure 1: Why recurrent state needs compressed state. (a) … (b) … (c) …",
       "page": 3,
       "url": "/api/episodes/3f2a9c1e/figures/f1",
-      "width": 473, "height": 690,
-      // 图内 `(a) (b) (c)` 标注的位置（相对整图 0~1），切子图时用来定位分隔缝。
-      // 图上没有这类标注时为空数组；这是内部数据，前端不必渲染。
-      "panel_marks": [ { "letter": "a", "x": 0.23, "y": 0.88 } ] }
+      "width": 473, "height": 690 }
   ],
   "illustration": {                             // 模型生成的信息图
     "png_url": "/api/episodes/3f2a9c1e/illustration.png",
@@ -352,10 +352,12 @@ V2 起每集属于一个用户，并且可以对外分享。三个字段：
 还是旧画面。`video.scenes` / `video.assets` / `video.asset_versions` 这三个字段
 就是为此存下来的（前两个用于复用分配，第三个用于判断过时）。
 
-`video.scenes[i]` 里的 `point`（本段要点文案）和 `focus`（图内聚光灯的框，
-相对整图 0~1）也是**复用**的：重新合成时一个字都不该变。
-`focus` 的来源是「模型从图注里挑出这一段讲的是哪个子图」+「我们按像素把那个子图切出来」，
-所以同一个框在重合成时是稳定的（`REBUILD` 不会再问模型）。
+`video.scenes[i]` 是**内部数据**（不在响应里）：它记着每段用哪张图，以及 `point`
+（本段要点文案）和 `focus`（图内聚光灯的框，相对整图 0~1）。重新合成时这两个都**复用**，
+一个字都不该变。`focus` 的来源是「模型从图注里挑出这一段讲的是哪个子图」+
+「我们按像素把那个子图切出来」（几何细节见 AGENTS.md 的「图内聚光灯」一节），
+所以同一个框在重合成时是稳定的 —— `REBUILD` 不会再问模型。
+**子图标注位置（`panel_marks`）同样只在库里**，和 scenes 一样不对外暴露。
 
 ### `video.stale` 字段
 
