@@ -560,13 +560,26 @@ const shareToken = computed(() => episode.value?.share_token ?? null)
 /**
  * 分享链接。**用 router.resolve 生成**，这样 Mock（hash 路由）与真实后端（history 路由）
  * 两种模式都能得到可直接发出去的地址，不必在这里判 IS_MOCK 拼字符串。
+ *
+ * ⚠️ 必须用 `new URL(href, location.href)` 来补全，**不能拼 `location.origin + href`**：
+ * hash 模式下 `resolved.href` 是 `#/share/xxx` 这种**不带路径**的形式，
+ * 只拼 origin 会丢掉站点子路径。实测在 GitHub Pages（`/paper-podcast/` 子路径）上
+ * 复制出来的链接是 `https://qingkelab.github.io#/share/xxx` —— 打开直接跑到了根站点，
+ * 分享出去就是个坏链接。以当前地址为基准解析则两种形式都对：
+ *   `#/share/x`             + `/paper-podcast/#/library` → `/paper-podcast/#/share/x`
+ *   `/share/x`（history）   + `/episode/abc`             → `/share/x`
  */
 const shareLink = computed(() => {
   const token = shareToken.value
   if (!token) return ''
   const resolved = router.resolve({ name: 'share', params: { token } })
   if (typeof window === 'undefined') return resolved.href
-  return `${window.location.origin}${resolved.href}`
+  try {
+    return new URL(resolved.href, window.location.href).href
+  } catch {
+    // 极端情况下（resolved.href 不是合法 URL 片段）退回原样，至少不炸
+    return resolved.href
+  }
 })
 
 /** 关键词高亮开关（契约 §2.9）：默认开，偏好存 localStorage */
