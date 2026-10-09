@@ -26,7 +26,9 @@ export function durationText(episode: EpisodeSummary): string {
  */
 export function sourceRefText(episode: EpisodeSummary): string | null {
   const ref = (episode.source_ref ?? '').trim()
-  if (episode.source_type === 'text') return '粘贴的文本'
+  // 粘贴文本本来就没有「出处」，元信息那行已经写着「文本粘贴」了，
+  // 这里再补一句「粘贴的文本」就是同一句话说两遍（实测在演示页很显眼）
+  if (episode.source_type === 'text') return null
   if (!ref) return null
 
   if (episode.source_type === 'pdf') {
