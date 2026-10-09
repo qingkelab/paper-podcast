@@ -17,10 +17,12 @@ import FigureGallery from '../components/FigureGallery.vue'
 import FigureLightbox from '../components/FigureLightbox.vue'
 import LanguageSwitch from '../components/LanguageSwitch.vue'
 import ScriptView from '../components/ScriptView.vue'
+import ShareToXButton from '../components/ShareToXButton.vue'
 import { usePreferencesStore } from '../stores/preferences'
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
 import { hasKeywords } from '../utils/highlight'
 import { languageLabel, languageShort } from '../utils/language'
+import { buildEpisodeShareText } from '../utils/shareX'
 
 /**
  * 公开分享页（契约 §2.7）。三条硬要求，逐条对应下面的实现：
@@ -98,6 +100,32 @@ const paperMeta = computed(() => activeVersion.value?.paper_meta ?? share.value?
 const keywords = computed(() => paperMeta.value?.keywords ?? [])
 const showHighlightSwitch = computed(() => hasKeywords(keywords.value))
 const highlight = computed(() => prefs.preferences.highlight_keywords)
+
+/**
+ * 在公开页上「分享到 X」。
+ *
+ * 地址用**当前页面地址**（去掉查询串）：这一页就是那条免登录链接本身，
+ * 再自己拼一遍反而容易和 `?lang=` 之类的参数打架 —— 别人点开只要落到同一页就行。
+ * 对读者来说这个按钮很有用：他往往是被人发来才看到这一页的，想转给同事时
+ * 不该指望他手动复制地址栏。
+ */
+const publicPageUrl = computed(() => {
+  if (typeof window === 'undefined') return ''
+  const { origin, pathname } = window.location
+  return `${origin}${pathname}`
+})
+
+const xShareText = computed(() => {
+  const current = share.value
+  if (!current || !publicPageUrl.value) return ''
+  const hook = analysis.value?.innovations?.find((item) => item?.trim()) ?? analysis.value?.conclusion ?? null
+  return buildEpisodeShareText({
+    title: paperMeta.value?.title?.trim() || current.title,
+    hook,
+    url: publicPageUrl.value,
+    duration: audioDuration.value ? formatDuration(audioDuration.value) : null,
+  })
+})
 
 const figures = computed<Figure[]>(() => share.value?.figures ?? [])
 
@@ -249,6 +277,7 @@ onBeforeUnmount(() => {
               label="语言"
               @update:model-value="selectLanguage"
             />
+            <ShareToXButton v-if="xShareText" :text="xShareText" />
           </div>
         </div>
       </header>

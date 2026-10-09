@@ -10,7 +10,7 @@
  * 页面退化成纯介绍，**不会出现空播放器或破图**。
  */
 import { computed, onMounted, ref, watch } from 'vue'
-import { RouterLink } from 'vue-router'
+import { RouterLink, useRouter } from 'vue-router'
 import { IS_MOCK, getEpisode, getShowcase, isEpisodeLanguage, listEpisodes } from '../api'
 import type {
   Analysis,
@@ -23,9 +23,12 @@ import type {
 import LanguageSwitch from '../components/LanguageSwitch.vue'
 import { useMetaStore } from '../stores/meta'
 import { useSessionStore } from '../stores/session'
+import ShareToXButton from '../components/ShareToXButton.vue'
 import { formatDuration } from '../utils/format'
 import { languageLabel } from '../utils/language'
+import { buildProductShareText } from '../utils/shareX'
 
+const router = useRouter()
 const meta = useMetaStore()
 const session = useSessionStore()
 
@@ -439,6 +442,22 @@ const FAQ = [
 
 const REPO_URL = 'https://github.com/qingkelab/paper-podcast'
 
+/**
+ * 「分享这个项目到 X」。
+ *
+ * 地址指的是**首页**，而不是当前页：用户在首页底部点它，就该分享首页 ——
+ * 分享 `/create` 或某个带查询串的地址，别人点开看到的是一个空表单，很怪。
+ * 用 `router.resolve` + `new URL(href, location.href)` 拼，这样 hash 模式
+ * 与子路径部署（GitHub Pages）都对（同 EpisodeView 里分享链接的处理）。
+ */
+const projectShareText = computed(() => {
+  // router 在 setup 阶段就取好：useRouter() 内部是 inject，
+  // 放进 computed 里执行会脱离 setup 上下文（只在渲染时才第一次调用，会直接报错）
+  const resolved = router.resolve({ name: 'landing' })
+  const href = typeof window === 'undefined' ? resolved.href : new URL(resolved.href, window.location.href).href
+  return buildProductShareText(href)
+})
+
 onMounted(() => {
   void meta.load()
   void loadShowcase()
@@ -814,6 +833,8 @@ onMounted(() => {
         </p>
         <div class="lp-cta__actions">
           <RouterLink to="/create" class="btn btn--primary btn--lg">生成一期播客</RouterLink>
+          <!-- 觉得有用就顺手发一条：预填好文案，用户确认后自己发（我们不代发） -->
+          <ShareToXButton :text="projectShareText" label="分享到 X" size="md" />
           <a class="btn btn--ghost btn--lg" :href="REPO_URL" target="_blank" rel="noopener noreferrer">
             GitHub 仓库
           </a>

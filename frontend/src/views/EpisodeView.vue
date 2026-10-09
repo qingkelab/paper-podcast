@@ -38,6 +38,7 @@ import FigureGallery from '../components/FigureGallery.vue'
 import FigureLightbox from '../components/FigureLightbox.vue'
 import PaperMetaSection from '../components/PaperMetaSection.vue'
 import ScriptView from '../components/ScriptView.vue'
+import ShareToXButton from '../components/ShareToXButton.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { useMetaStore } from '../stores/meta'
 import { usePreferencesStore } from '../stores/preferences'
@@ -45,6 +46,7 @@ import { useSessionStore } from '../stores/session'
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format'
 import { hasKeywords, normalizeKeywords } from '../utils/highlight'
 import { languageLabel, languageShort, loadEpisodeLanguage, rememberEpisodeLanguage } from '../utils/language'
+import { buildEpisodeShareText } from '../utils/shareX'
 import { LEVEL_LABELS, SOURCE_LABELS } from '../utils/stages'
 
 const route = useRoute()
@@ -582,6 +584,26 @@ const shareLink = computed(() => {
   }
 })
 
+/**
+ * 「分享到 X」的推文正文（见 utils/shareX.ts）。
+ *
+ * 看点优先取解读里的第一条「创新点」，取不到再退回「核心结论」——
+ * 单看标题（往往是「XXX: A Method for YYY」）没人知道这篇到底讲了什么，
+ * 而一句看点才是让别人点开链接的理由。全都没有时就不带看点，文案照样成立。
+ */
+const xShareText = computed(() => {
+  const current = episode.value
+  if (!current || !shareLink.value) return ''
+  const analysis = current.analysis
+  const hook = analysis?.innovations?.find((item) => item?.trim()) ?? analysis?.conclusion ?? null
+  return buildEpisodeShareText({
+    title: current.paper_meta?.title?.trim() || current.title,
+    hook,
+    url: shareLink.value,
+    duration: current.audio_duration_sec ? formatDuration(current.audio_duration_sec) : null,
+  })
+})
+
 /** 关键词高亮开关（契约 §2.9）：默认开，偏好存 localStorage */
 const highlightEnabled = computed(() => prefs.preferences.highlight_keywords)
 const keywords = computed(() => displayPaperMeta.value?.keywords ?? [])
@@ -1095,7 +1117,8 @@ onBeforeUnmount(() => {
                 别人搜不到它，只有拿到链接才看得到。
               </template>
               <template v-else>
-                开启分享会生成一条免登录链接，把这一期发给任何人不登录也能看。
+                开启分享会生成一条免登录链接，把这一期发给任何人不登录也能看；
+                想发到 X 也先开分享，否则对方点开只会看到「链接已失效」。
               </template>
             </p>
           </div>
@@ -1112,6 +1135,17 @@ onBeforeUnmount(() => {
             </button>
             <template v-else>
               <button type="button" class="btn btn--primary" @click="copyShareLink">复制链接</button>
+              <!--
+                分享到 X 排在「复制链接」之后：复制链接是通用动作（微信/Slack/邮件都能用），
+                发到 X 只是其中一种去处。**私有单集不显示这个按钮** ——
+                没有公开链接时发出去的地址对方打不开，那比没有按钮更糟。
+              -->
+              <ShareToXButton
+                v-if="xShareText"
+                :text="xShareText"
+                variant="ghost"
+                @open="copyHint = '已在新标签页打开 X 的发布框，内容已经填好，确认后即可发布。'"
+              />
               <button
                 type="button"
                 class="btn"

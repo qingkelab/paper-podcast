@@ -31,6 +31,9 @@ cd frontend && pnpm install && pnpm dev
 
 # 前端类型检查 + 构建
 cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
+
+# 前端纯逻辑自检（目前只有分享文案；Node 自带 TS 剥离，不引第三方依赖）
+cd frontend && pnpm test:units
 ```
 
 ## 关键约定
@@ -340,6 +343,27 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   「在跑的 / 完成的 / 失败的」，不该让他点五个状态各看一遍。
   「哪些算跑完」在后端只有一份定义（`db.TERMINAL_STATUSES`）。
 
+### 分享到 X
+
+- **走官方 intent 链接**（`https://x.com/intent/post?text=…`），**不需要任何密钥、OAuth 或 SDK**。
+  我们永远**不替用户发帖**：只打开一个预填好的发布框，发不发他自己决定。
+  别为了「更顺滑」去接 API —— 那要用户授权、要托管 token，收益却只是省一次点击。
+- **只有公开链接才能发**。私有单集没有对外可访问的地址，发出去对方只会看到
+  「链接已失效」。所以私有状态下**不显示这个按钮**（而不是显示一个点了弹错误提示的按钮），
+  并在分享说明里写清「想发到 X 也先开分享」。
+- **用 `<a target="_blank" rel="noopener noreferrer">` 而不是 `window.open()`**：
+  能中键新标签、能右键复制链接，也不会被弹窗拦截。
+- **长度必须按 X 的加权字数算**（CJK 记 2、链接固定 23、上限 280），
+  不是字符数。算法和截断在 `utils/shareX.ts`，`pnpm test:units` 盯着几条边界
+  （超长标题+超长看点时要压进预算、不能切掉链接、不能吃掉末尾标签）。
+  这里踩过一次「差一个字」：固定开销漏算了看点前那个换行，结果末尾的品牌标签被 X 截掉 ——
+  正好截掉最想让人看到的那句。
+- **看点取解读里的第一条「创新点」**，取不到退「核心结论」：只发标题的话
+  （`XXX: A Method for YYY`）没人知道这篇讲了什么。看点被截断要留省略号，
+  否则读起来像话说到一半。
+- **三个入口**：单集详情页（作者发自己的）、公开页（读者转给别人）、首页底部（分享项目）。
+  公开页的地址用**当前页面地址**（去掉查询串），不要自己再拼一遍 token。
+
 ## 结构
 
 ```
@@ -352,6 +376,8 @@ backend/tests/            408 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言
+frontend/src/utils/shareX.ts    分享到 X 的文案与 intent 链接（加权字数预算）
+frontend/scripts/               pnpm test:units：纯逻辑自检（Node 自带 TS 剥离，无第三方依赖）
 ```
 
 ## Mock 模式

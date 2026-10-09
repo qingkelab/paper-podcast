@@ -2145,6 +2145,45 @@ pre {
   border-radius: var(--radius-sm);
 }
 
+/* ---------------------------------------------------------------- 分享到 X */
+
+/*
+ * 图标用内联 SVG，不引任何字体/CDN：X 的字标是它自家的品牌图形，
+ * 拿字符「𝕏」凑的话不同系统渲染差别很大，还可能被当 emoji 染色。
+ */
+.share-x__glyph {
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+/* 只有图标的那种（列表行/紧凑处用）：尺寸对齐 .btn--sm 的高度，横排不跳 */
+.share-x--icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.18s var(--ease);
+}
+
+.share-x--icon:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.share-x.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 /* ---------------------------------------------------------------- 播客库：工具栏与卡片 */
 
 /*
