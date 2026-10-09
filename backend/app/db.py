@@ -135,6 +135,13 @@ class Database:
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE episodes ADD COLUMN {column} {sql_type}")
 
+        # V2 的 visibility 允许 NULL（老数据没有这个字段），但 NULL 在 SQL 里
+        # 不参与 `= 'public'` 之外的任何比较 —— 留着它会养出一类
+        # 「为什么这个 WHERE 不生效」的怪 bug。这里一次性归一化成 'private'。
+        self._conn.execute(
+            "UPDATE episodes SET visibility = 'private' WHERE visibility IS NULL"
+        )
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
