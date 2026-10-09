@@ -367,6 +367,22 @@ cd frontend && pnpm test:units
 什么都没突出。所以加了 `FOCUS_MAX_AREA = 0.85` 把这种挡掉；像素坐标（给 600 这种）也一律丢掉，
 因为归一化里无法反推图有多大，猜错会框到角落。
 
+**第二轮实测（自动切子图）**：改成「几何由像素定、语义由模型定」之后，量到了关键事实：
+- **真实论文图确实有干净空白沟**（实测 Figure 2 的列投影最小值 = 0），
+  所以「按沟切」在几何上是成立的：给定子图个数（`expected=2`）能正确切出 2 块（0.63 / 0.35）。
+- **但「有几个子图」不能从投影推**：所有空沟的「深度」都是满值，只能比宽度，
+  自动判断给不出稳定的块数（实测自动路径在这些真实图上返回 0 块）。
+- 块数本来写在**图注**里（`(a) (b) (c)`），可我们的图注是**逐行截取的**：
+  `_caption_text` 只取标签那一行的词（`rect.y0-4 … rect.y1+6`），
+  于是「(a) Recurrent …」这半句经常不在库里（实测某集 Figure 10 的图注只有 104 字符、
+  一个 `(a)` 都没有）。
+
+**所以下一步很清楚**（`panels.py` 已经写好并测过，等这一步接上就能用）：
+把图注抽取改成「整个图注块」（跨行、遇到下一个 Figure/Table 标签或大空档就停），
+图注里就能读到 `(a)(b)(c)` → `panel_count_from_caption()` 给出块数 →
+`detect_panels(path, expected=n)` 按最深的沟切成 n 块 → 模型只需回答「这一段在讲第几个子图」
+（这是它做得到的文字活）→ 复用已有的聚光灯图层。旧数据要重抽一次图注。
+
 **结论**：这条路要能用，必须先解决「怎么知道图里哪一块是什么」：
 1. **人工框一次**（最稳）：像 `POST /figures/{fid}/rotate` 那个人工校正一样，
    让用户在图上拖一个框，存进 figure 记录；同一张图的所有段落共用它。
@@ -542,12 +558,13 @@ cd frontend && pnpm test:units
 
 ```
 backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟) podcast_tts(语音)
+                          panels(多子图切分)
                           audio_track(停顿检测/字幕对齐)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            486 项，改完必须全绿
+backend/tests/            496 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言
