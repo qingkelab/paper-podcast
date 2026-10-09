@@ -22,13 +22,24 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # `Figure 1:` / `Fig. 1.` / `Table 2：`  —— 冒号可能是半角或全角
 _CAPTION = re.compile(r"^\s*(Figure|Fig\.?|Table)\s+(\d+)\s*[:.．：]", re.IGNORECASE | re.MULTILINE)
+# 同一个块里出现第二条图注时用来断开（不带 ^ 锚，因为要数「第几条」）
+_CAPTION_ANYWHERE = re.compile(r"(?:Figure|Fig\.?|Table)\s+\d+\s*[:.．：]", re.IGNORECASE)
+# 图内部单独成词的子图标注：`(a)`、`(b)`…（`(i)`/`(iv)` 这种罗马数字不算，容易被当成列表项）
+_PANEL_MARK_WORD = re.compile(r"^\(([a-hj-z])\)$")
+
+# 图注保留多少字符。整段图注通常 400~600 字符，里面写着子图枚举（`(a) (b) (c)`），
+# 截短等于把「这张图有几个子图」这条信息丢掉 —— 实测只保留一行（220）时，
+# 6 张真实论文图里一张都读不出子图个数。上限只是防病态长文本，不是内容预算。
+CAPTION_MAX_CHARS = 600
+# 退回「只取一行」时的上限（老行为，保持 220 以免影响已入库的短图注口径）
+CAPTION_LINE_CHARS = 220
 
 # 渲染精度。150 DPI 对屏幕上展示足够清晰，单张通常 300KB 以内。
 FIGURE_DPI = 150
@@ -66,6 +77,10 @@ class ExtractedFigure:
     path: str
     width: int
     height: int
+    # 图上的子图标注 `(a) (b) (c)` 相对整图的 0~1 位置，按标注顺序。
+    # 切子图时用它把搜索范围收窄到「两个标注之间那条缝」（见 panels._split_by_marks）；
+    # 老数据没有这个字段，取不到就退回纯投影切法。
+    panel_marks: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -265,8 +280,55 @@ def _ink_ratio(pix) -> float:
     return dark / len(sampled)
 
 
-def _caption_text(page, rect) -> str:
-    """取图注那一行的完整文字，作为图片说明。
+def _trim_caption(text: str, *, limit: int = CAPTION_MAX_CHARS) -> str:
+    """截到上限，别把英文单词劈成两半。"""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if " " in cut and not cut.endswith(" ") and " " in text[limit - 1 : limit + 1]:
+        cut = cut[: cut.rfind(" ")]
+    return cut.rstrip()
+
+
+def _caption_block(page, rect) -> str:
+    """取图注**整段**（跨行），作为图片说明。
+
+    为什么要跨行：图注里往往写着子图枚举 —— `(a) ... (b) ... (c) ...`，
+    而这正是「这张图里有几个子图」的唯一可靠来源（`panels.panel_count_from_caption`）。
+    实测只取标签那一行时，6 张图里 0 张能读出子图个数（Figure 1 的图注只截到
+    `...(a) Recurrent state memory grows`，`(b)` 正好在第二行上）。
+
+    做法：`page.get_text("blocks")` 给的是**段落级**切分，而 LaTeX 里图注本来就
+    是一个独立段落，所以「标签起点落在哪个块里」就等于「图注是哪一段」。
+    实测两篇真实论文的 7 条图注全部命中，且结尾停在句号上、没有把后面的正文带进来。
+
+    只接受**以图注标签开头**的块：块是启发式切出来的，万一它把前面一段正文并进来，
+    文字就不以标签开头（这时退回逐行取法，宁可短也不要串进正文）。
+    """
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:  # noqa: BLE001
+        return ""
+
+    for block in blocks:
+        if len(block) >= 7 and block[6] != 0:
+            continue  # 图片块
+        x0, y0, x1, y1 = block[0], block[1], block[2], block[3]
+        if not (x0 - 2 <= rect.x0 <= x1 + 2 and y0 - 2 <= rect.y0 <= y1 + 2):
+            continue
+        text = re.sub(r"\s+", " ", block[4]).strip()
+        if not text or not _CAPTION.match(text):
+            return ""  # 找到块但不像图注段落 → 别用
+        # 块里若还夹着下一条图注，只取前面这条
+        labels = list(_CAPTION_ANYWHERE.finditer(text))
+        if len(labels) > 1:
+            text = text[: labels[1].start()].strip()
+        return _trim_caption(text)
+    return ""
+
+
+def _caption_line(page, rect) -> str:
+    """退化取法：只取标签那一行的词。
 
     ⚠️ 不能用 `page.get_text(clip=...)`：它返回的是**与裁剪框相交的整个文本块**，
     不是严格裁剪后的文字。实测会把图里的坐标轴标签一起带进来
@@ -292,7 +354,60 @@ def _caption_text(page, rect) -> str:
     line_words.sort(key=lambda w: w[0])
     # words 的排序是按阅读顺序给出的，这里再按 x 排一遍保证连贯
     text = " ".join(word[4] for word in line_words)
-    return re.sub(r"\s+", " ", text).strip()[:220]
+    return _trim_caption(re.sub(r"\s+", " ", text).strip(), limit=CAPTION_LINE_CHARS)
+
+
+def _caption_text(page, rect) -> str:
+    """图注文字：优先整段，取不到整段就退回那一行。"""
+    block = _caption_block(page, rect)
+    if block:
+        return block
+    return _caption_line(page, rect)
+
+
+def _panel_marks(page, region) -> list[dict]:
+    """图**内部**的 `(a) (b) (c)` 标注位置（相对整图 0~1，按阅读顺序）。
+
+    为什么要单独把这些标注找出来：它们是「这张图里哪一块是哪一个子图」的**唯一几何证据**。
+    图注里的 `(a) ... (b) ...` 只说了有几个、分别讲什么，没说它们在图上的哪里；
+    而纯像素投影在「子图之间夹着下一个子图的纵轴刻度」时切不开（实测 Figure 1 就是这样）。
+    标注是 PDF 里真实存在的文字，位置精确，把它当成切分的锚点最稳。
+
+    只在整幅图的范围内找，且只认**单独成词的** `(a)`：图注正文（在图外）和
+    `(a)` 出现在句子中间的情况都不会被算进来。
+    """
+    if region.is_empty:
+        return []
+    try:
+        words = page.get_text("words")
+    except Exception:  # noqa: BLE001
+        return []
+
+    found: dict[str, dict] = {}
+    for word in words:
+        token = (word[4] or "").strip()
+        match = _PANEL_MARK_WORD.match(token)
+        if not match:
+            continue
+        cx = (word[0] + word[2]) / 2
+        cy = (word[1] + word[3]) / 2
+        if not (
+            region.x0 <= cx <= region.x1 and region.y0 <= cy <= region.y1
+        ):
+            continue
+        letter = match.group(1).lower()
+        found.setdefault(
+            letter,
+            {
+                "letter": letter,
+                "x": round((word[0] - region.x0) / max(region.width, 1), 4),
+                "y": round((word[1] - region.y0) / max(region.height, 1), 4),
+            },
+        )
+    if len(found) < 2:
+        return []
+    # 阅读顺序：先按行、再按列 —— 和一横排/一竖列的排布都能对上
+    return sorted(found.values(), key=lambda mark: (round(mark["y"], 1), mark["x"]))
 
 
 def _canonical_key(kind: str, number: str) -> tuple[str, str]:
@@ -484,6 +599,8 @@ def extract_figures(
                     path=str(path),
                     width=pix.width,
                     height=pix.height,
+                    # 转正过的图坐标全变了，标注坐标就不再对得上 —— 宁可不给
+                    panel_marks=[] if rotation else _panel_marks(page, padded),
                 )
             )
             logger.info(

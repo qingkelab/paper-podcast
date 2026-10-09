@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from .audio_track import Pause, align_boundaries, detect_pauses
+from .panels import Panel, detect_panels, panel_count_from_caption, panel_labels
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +299,8 @@ FOCUS_BORDER = "#2f6fb5"
 FOCUS_BORDER_W = 3
 FOCUS_FADE_SEC = 0.25          # 聚光灯淡入（跟图片卡一样是「这一段开始了」的信号）
 FOCUS_MIN_SIDE = 0.06          # 小于这个比例的区域不值得框（多半是模型瞎给）
+# 框上那个小药丸最多放多少字（中英文都按字符算，够放下 2~3 个英文词）
+FOCUS_LABEL_CHARS = 16
 FOCUS_MIN_AREA = 0.02
 # 整张图都框住 = 什么都没突出。实测模型很爱这么干：它给不出「图里的哪一块」，
 # 就把整张图框上、再补一个图名（比如 w=1.0,h=1.0,label="四比特精度表"）。
@@ -483,16 +486,16 @@ POINTS_SYSTEM = """你在给一个「论文解读视频」做**画面强调**。
   而不是「我们接着看」这种本身没有信息量的话。
   （第一版允许留空，结果整条视频只有 18% 的时间有强调行 —— 观众感觉「这行时有时无」。）
 - 语言与原文一致（原文中文就中文，英文就英文）。
-- **每一段都必须带 `focus` 字段，一个都不能省**（省略字段和写 null 是两回事，
-  下游要靠它决定「这一句要不要在图里框一块」）：
-  - 这一段**在讲图里的某个具体部位**（一块流程、一列数字、一个模块）→ 给出那块区域的
-    **相对整张图的 0~1 比例**（`x`/`y` 是左上角，`w`/`h` 是宽高），外加不超过 8 个字的 `label`；
-  - 拿不准、或者这一段没在讲图的某一部分（总结、转折）→ 写 `null`。
-  **不要给像素坐标**（给 600 这种数字会被当成格式错误整条丢掉）；**框错地方比不框更糟**。
+- **每一段都必须带 `panel` 字段，一个都不能省**（省略字段和写 null 是两回事）：
+  - 如果这一段配的图**下面给了子图清单**（形如 `(a) …；(b) …`），并且这一段讲的就是
+    其中某一个子图 → 写那个字母，例如 `"b"`；
+  - 讲的是整张图、清单里没有对得上的、或者这一段没有子图清单 → 写 `null`。
+  **不要输出坐标**：图片里的区域位置由我们从图上量出来，你只需要指出是哪个子图。
+  指错子图比不指更糟，拿不准就写 `null`。
 
 只输出 JSON：
-{"points": [{"segment": 0, "point": "成功率 67%", "focus": {"x": 0.05, "y": 0.1, "w": 0.4, "h": 0.3, "label": "编码器"}},
-            {"segment": 1, "point": "误差会滚雪球", "focus": null}]}
+{"points": [{"segment": 0, "point": "成功率 67%", "panel": "b"},
+            {"segment": 1, "point": "误差会滚雪球", "panel": null}]}
 每个脚本段都要有一项。不要输出任何解释。"""
 
 POINTS_SYSTEM_EN = """You write the big on-screen emphasis line for a paper-explainer video.
@@ -515,19 +518,17 @@ Rules:
   line, which reads as "this line flickers on and off".)
 - **Write in English** (the whole video is English), **start with a capital letter**,
   and do not end with a period — it is a headline, not a sentence.
-- **Every segment must carry a `focus` field — never omit it** (an omitted field is not
-  the same as `null`; downstream uses it to decide whether to box a region of the figure):
-  - if the segment is about **a specific part of the figure** (one block, one column of
-    numbers, one module) → give that region as **relative 0–1 fractions** over the whole
-    image (`x`/`y` = top-left, `w`/`h` = size) plus a `label` of at most 4 words;
-  - if you are not sure, or the segment is not about a part of the image (summary,
-    transition) → write `null`.
-  **Never give pixel coordinates** (a value like 600 is treated as malformed and dropped);
-  **pointing at the wrong place is worse than not pointing**.
+- **Every segment must carry a `panel` field — never omit it**:
+  - if the image for this segment comes with a **panel list** (like `(a) …; (b) …`) and
+    this segment is genuinely about one of those panels → write that letter, e.g. `"b"`;
+  - if it is about the whole figure, nothing in the list matches, or there is no panel
+    list → write `null`.
+  **Never give coordinates**: the region of the image is measured from the pixels on our
+  side; you only say which panel. Pointing at the wrong panel is worse than not pointing.
 
 Output JSON only:
-{"points": [{"segment": 0, "point": "67% success rate", "focus": {"x": 0.05, "y": 0.1, "w": 0.4, "h": 0.3, "label": "encoder"}},
-            {"segment": 1, "point": "errors snowball", "focus": null}]}
+{"points": [{"segment": 0, "point": "67% success rate", "panel": "b"},
+            {"segment": 1, "point": "errors snowball", "panel": null}]}
 Include one entry per segment. No explanations."""
 
 # 强调行里允许出现的数字形态（用于本地兜底）
@@ -647,11 +648,17 @@ def build_points_messages(
     title: str = "",
     language: str = "zh",
     image_captions: list[str | None] | None = None,
+    panel_options: list[list[tuple[str, str]]] | None = None,
 ) -> list[dict[str, str]]:
     """为每一段脚本要一句「大字强调」。
 
     单独一次调用（而不是塞进逐段配图那次）的原因：重新合成视频时必须**复用**画面分配、
     不能重新问模型，但强调文案是可以补的、而且补一次就存下来。两件事的生命周期不同。
+
+    `panel_options[i]` 是第 i 段那张图的**子图清单**（`[(字母, 这一块讲什么), …]`）。
+    给出来是为了让模型做一件它做得对的事：**从文字里挑**「这一段在讲哪个子图」。
+    它做不对的是「给坐标」—— 它看不到图，实测两次真实调用分别只给出 8/23 和 4/16 个
+    可用框（有一集 4 个框全是同一块「左半张」，只是标签不同）。
 
     **英文版必须整段用英文 prompt**（`POINTS_SYSTEM_EN`）：中文 system 里就算写了
     「语言与原文一致」，模型给英文脚本写的强调行仍然是中文 —— 实测踩到过，
@@ -668,6 +675,15 @@ def build_points_messages(
         suffix = f"（这一段配的图：{caption}）" if caption else "（这一段没有配图）"
         if language != "zh":
             suffix = f" (image for this segment: {caption})" if caption else " (no image)"
+
+        options = panel_options[index] if panel_options and index < len(panel_options) else []
+        if options:
+            items = "；".join(f"({letter}) {body}" for letter, body in options)
+            suffix += (
+                f"（这张图有 {len(options)} 个子图：{items}）"
+                if language == "zh"
+                else f" (this figure has {len(options)} panels: {items})"
+            )
         script_lines.append(f"[{index}] {text}{suffix}")
 
     if language == "zh":
@@ -676,14 +692,14 @@ def build_points_messages(
 【脚本分段】共 {len(segments)} 段（编号 0 到 {len(segments) - 1}）
 {chr(10).join(script_lines)}
 
-请为每一段写一句不超过 14 个字的大字强调，并给出 `focus`（拿不准就写 `null`，但**字段不能省**），输出 JSON。"""
+请为每一段写一句不超过 14 个字的大字强调，并给出 `panel`（拿不准就写 `null`，但**字段不能省**），输出 JSON。"""
     else:
         user = f"""[PAPER TITLE] {title or "(not provided)"}
 
 [SCRIPT SEGMENTS] {len(segments)} segments (numbered 0 to {len(segments) - 1})
 {chr(10).join(script_lines)}
 
-Write one emphasis line of at most 8 words per segment, and include a `focus` field for
+Write one emphasis line of at most 8 words per segment, and include a `panel` field for
 every segment (use `null` when unsure — but never omit the field). Output JSON only."""
     return [
         {"role": "system", "content": system},
@@ -697,13 +713,23 @@ def normalize_point_items(
     count: int,
     max_chars: int = POINT_MAX_CHARS,
     language: str = "zh",
+    panel_letters: list[list[str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """把模型给的整份 payload 整理成每段一项：`{"point": ..., "focus": {...}|None}`。
+    """把模型给的整份 payload 整理成每段一项：`{"point", "panel", "focus"}`。
 
-    要点文案与聚光灯来自**同一次调用**（模型一边说「这段最该记住什么」，一边指「在图的哪里」），
-    所以这里一起归一化 —— 分两次调用会多花一次钱，而且两者可能对不上。
+    要点文案与「讲的是哪个子图」来自**同一次调用**（模型一边说「这段最该记住什么」，
+    一边指出在图的哪一块），所以这里一起归一化 —— 分两次调用会多花一次钱，
+    而且两者可能对不上。
+
+    `panel` 只在**这一段那张图真的有这些字母**时才保留：模型偶尔会编一个图里
+    不存在的字母（比如那张图根本没有子图），那种一律丢掉。
+
+    `focus` 是**兼容字段**：早期版本让模型直接给坐标，实测不可靠（见 `POINTS_SYSTEM`
+    的说明），现在只剩「读旧数据里已存下来的框」这一条用途。
     """
-    items: list[dict[str, Any]] = [{"point": "", "focus": None} for _ in range(max(count, 0))]
+    items: list[dict[str, Any]] = [
+        {"point": "", "panel": None, "focus": None} for _ in range(max(count, 0))
+    ]
     if not isinstance(raw, list):
         return items
     for entry in raw:
@@ -716,7 +742,13 @@ def normalize_point_items(
         if not 0 <= index < count:
             continue
         text = shorten_point(str(entry.get("point") or ""), max_chars=max_chars, language=language)
-        items[index] = {"point": text, "focus": normalize_focus(entry.get("focus"))}
+        allowed = panel_letters[index] if panel_letters and index < len(panel_letters) else []
+        letter = str(entry.get("panel") or "").strip().lower().strip("()")
+        items[index] = {
+            "point": text,
+            "panel": letter if letter and letter in allowed else None,
+            "focus": normalize_focus(entry.get("focus")),
+        }
     return items
 
 
@@ -1427,8 +1459,111 @@ def normalize_focus(raw: Any) -> dict[str, Any] | None:
         "y": round(y, 4),
         "w": round(w, 4),
         "h": round(h, 4),
-        "label": label[:16],
+        "label": label[:FOCUS_LABEL_CHARS],
     }
+
+
+@dataclass(frozen=True)
+class FigurePanels:
+    """一张论文原图切出来的子图，以及每个子图「讲什么」。
+
+    字母来自**图注**（`(a) … (b) …`），框来自**像素**（见 `panels.detect_panels`）。
+    两者必须对得上号（个数相同）才会被用：对不上时字母和块序就可能错位，
+    那还不如不框 —— 框错子图比不框更糟。
+    """
+
+    letters: list[str]
+    bodies: list[str]
+    panels: list[Panel]
+
+    def options(self) -> list[tuple[str, str]]:
+        return list(zip(self.letters, self.bodies))
+
+    def focus_for(self, letter: str) -> dict[str, Any] | None:
+        """字母 → 聚光灯用的框。认不出的字母返回 None（不框）。
+
+        过一遍 `normalize_focus`：聚光灯那几个下限（框太小、覆盖整张图）在这里也要适用，
+        否则会出现「存了一个下游必然丢掉的框」，看起来像是聚光灯莫名其妙没生效。
+        """
+        key = (letter or "").strip().lower()
+        if key not in self.letters:
+            return None
+        index = self.letters.index(key)
+        body = self.bodies[index] if index < len(self.bodies) else ""
+        return normalize_focus(self.panels[index].to_focus(_panel_label(body)))
+
+
+def _panel_label(body: str, *, limit: int = FOCUS_LABEL_CHARS) -> str:
+    """子图说明里取一小段当框上的标签（框上的小药丸只有十来个字的位置）。
+
+    英文按**词**截：`normalize_focus` 只按字符数砍，砍在词中间会得到
+    「Recurrent state 」这种带半截词的标签 —— 实测第一次就出现了。
+    判据是「**有没有中日韩字**」而不是 `isascii()`：英文图注里常有
+    `6.93×` / `–` 这类非 ASCII 符号，用 isascii 判会把它们当成中文按字符砍，
+    实测得到「Mean accuracy ac」。
+    """
+    clean = " ".join((body or "").split())
+    if not clean:
+        return ""
+    if not any("\u3400" <= char <= "\u9fff" for char in clean):
+        picked: list[str] = []
+        for word in clean.split():
+            if picked and len(" ".join([*picked, word])) > limit:
+                break
+            picked.append(word)
+            if len(picked) >= 4:
+                break
+        return " ".join(picked)[:limit]
+    return clean[:limit]
+
+
+def build_panel_catalog(
+    figures: list[dict[str, Any]] | None, pool: dict[str, "ImageAsset"]
+) -> dict[str, FigurePanels]:
+    """给每张**有多子图**的论文原图切出子图，返回 `图片 id → FigurePanels`。
+
+    只在图注里写着 `(a) (b) (c)`（`panel_count_from_caption`）时才做这件事 ——
+    那是「这张图有几个子图」的唯一可靠来源，而子图个数又决定几何怎么切。
+    **切出来的块数必须和图注说的完全一致**，否则整张图放弃（宁可没有聚光灯）。
+    """
+    catalog: dict[str, FigurePanels] = {}
+    for figure in figures or []:
+        if not isinstance(figure, dict):
+            continue
+        asset_id = str(figure.get("id") or "")
+        asset = pool.get(asset_id)
+        if asset is None or not asset.exists:
+            continue
+        caption = str(figure.get("caption") or "")
+        count = panel_count_from_caption(caption)
+        if not count:
+            continue
+        labels = panel_labels(caption, cap=count)
+        if len(labels) != count:
+            continue
+        marks = [
+            (float(mark["x"]), float(mark["y"]))
+            for mark in (figure.get("panel_marks") or [])
+            if isinstance(mark, dict) and "x" in mark and "y" in mark
+        ]
+        panels = detect_panels(asset.path, expected=count, marks=marks or None)
+        if len(panels) != count:
+            logger.info(
+                "配图 %s 的图注说有 %d 个子图，但只切出 %d 块 —— 不做聚光灯",
+                figure.get("label") or asset_id,
+                count,
+                len(panels),
+            )
+            continue
+        catalog[asset_id] = FigurePanels(
+            letters=[letter for letter, _ in labels],
+            bodies=[body for _, body in labels],
+            panels=panels,
+        )
+        logger.info(
+            "配图 %s 切成 %d 个子图，可用于聚光灯", figure.get("label") or asset_id, count
+        )
+    return catalog
 
 
 def render_focus_overlay(
@@ -2524,6 +2659,16 @@ def compose_video(
         and llm is not None
         and not getattr(llm, "mock", True)
     ):
+        # 这几张图有子图清单可给模型挑（几何已经由像素量好了，见 build_panel_catalog）
+        panel_catalog = build_panel_catalog(figures, pool)
+        panel_options = [
+            panel_catalog[asset_id].options() if asset_id in panel_catalog else []
+            for asset_id in image_for_segment
+        ]
+        panel_letters = [
+            panel_catalog[asset_id].letters if asset_id in panel_catalog else []
+            for asset_id in image_for_segment
+        ]
         # 重试一次：这一路失败不会让视频整体失败（下面有本地兜底），
         # 但结果会从「每段都有要点」退化成「只有含数字的段有」——
         # 实测踩到过一次（中文那版整集没有要点，英文那版正常），所以值得多试一次。
@@ -2538,6 +2683,7 @@ def compose_video(
                             pool[asset_id].caption if asset_id in pool else None
                             for asset_id in image_for_segment
                         ],
+                        panel_options=panel_options,
                     ),
                     max_tokens=max(900, len(segments) * 60),
                     temperature=0.3,
@@ -2547,6 +2693,7 @@ def compose_video(
                     count=len(segments),
                     max_chars=point_limit,
                     language=language,
+                    panel_letters=panel_letters,
                 )
                 filled = 0
                 boxed = 0
@@ -2554,8 +2701,16 @@ def compose_video(
                     if item["point"] and not points[index]:
                         points[index] = item["point"]
                         filled += 1
-                    if item["focus"] and focuses[index] is None:
-                        focuses[index] = item["focus"]
+                    if focuses[index] is not None:
+                        continue
+                    focus = None
+                    if item["panel"] and image_for_segment[index] in panel_catalog:
+                        focus = panel_catalog[image_for_segment[index]].focus_for(item["panel"])
+                    # 旧数据里存的「模型给的坐标框」还能读，但不能把空间让给它：
+                    # 面板框是量出来的，坐标框是猜的（见 POINTS_SYSTEM 的说明）。
+                    focus = focus or item["focus"]
+                    if focus:
+                        focuses[index] = focus
                         boxed += 1
                 if filled:
                     logger.info("强调行：模型写了 %d 段", filled)

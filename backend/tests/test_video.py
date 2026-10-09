@@ -60,7 +60,10 @@ from app.services.video import (
     heuristic_assignment,
     heuristic_per_segment,
     _normalize_points,
+    _panel_label,
+    build_panel_catalog,
     build_points_messages,
+    FigurePanels,
     local_point,
     merge_runs_to_cap,
     point_char_limit,
@@ -2287,7 +2290,7 @@ class TestFocusBox:
         focus = normalize_focus({"x": 0, "y": 0, "w": 0.5, "h": 0.5, "label": "这是一个非常长的标签超过十六个字"})
         assert focus is not None and len(focus["label"]) <= 16
 
-    def test_point_items_carry_both_point_and_focus(self):
+    def test_point_items_carry_point_and_legacy_focus(self):
         items = normalize_point_items(
             [
                 {"segment": 0, "point": "成功率 67%", "focus": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.3}},
@@ -2296,18 +2299,53 @@ class TestFocusBox:
             count=2,
         )
         assert items[0]["point"] == "成功率 67%"
+        # focus 是兼容字段：旧数据里存着模型当时给的框，还得读得出来
         assert items[0]["focus"]["w"] == pytest.approx(0.3)
-        assert items[1] == {"point": "过渡", "focus": None}
+        assert items[1] == {"point": "过渡", "panel": None, "focus": None}
 
-    def test_points_prompt_asks_for_focus_and_warns_against_guessing(self):
+    def test_panel_letter_is_kept_only_when_that_figure_has_it(self):
+        raw = [
+            {"segment": 0, "point": "要点", "panel": "B"},
+            {"segment": 1, "point": "要点", "panel": "z"},
+            {"segment": 2, "point": "要点", "panel": None},
+        ]
+        items = normalize_point_items(
+            raw, count=3, panel_letters=[["a", "b", "c"], ["a", "b", "c"], []]
+        )
+        assert items[0]["panel"] == "b", "字母统一小写"
+        assert items[1]["panel"] is None, "图里没有 z 这个子图 → 丢掉"
+        assert items[2]["panel"] is None, "这张图没有子图清单"
+
+    def test_points_prompt_asks_for_a_panel_and_warns_against_guessing(self):
         zh = build_points_messages([{"text": "第一段"}], title="T", image_captions=["Figure 1: 编码器"])
         system = zh[0]["content"]
-        assert "focus" in system and "框错地方比不框更糟" in system
+        assert "panel" in system and "指错子图比不指更糟" in system
+        assert "不要输出坐标" in system, "坐标猜不准，已经改成让模型挑子图"
         assert "Figure 1: 编码器" in zh[1]["content"], "要告诉模型这一段配的是哪张图"
 
         en = build_points_messages([{"text": "seg"}], title="T", language="en", image_captions=["Figure 1"])
-        assert "wrong place is worse" in en[0]["content"]
+        assert "wrong panel is worse" in en[0]["content"]
         assert "Figure 1" in en[1]["content"]
+        assert "panel" in en[0]["content"]
+
+    def test_panel_list_goes_into_the_prompt_for_that_segment_only(self):
+        zh = build_points_messages(
+            [{"text": "第一段"}, {"text": "第二段"}],
+            title="T",
+            image_captions=["Figure 1: memory overview", "Table 1: results"],
+            panel_options=[[("a", "内存占用"), ("b", "误差累积")], []],
+        )
+        user = zh[1]["content"]
+        assert "(a) 内存占用；(b) 误差累积" in user
+        assert user.count("个子图") == 1, "只有第一段那张图有子图清单"
+
+        en = build_points_messages(
+            [{"text": "s"}],
+            title="T",
+            language="en",
+            panel_options=[[("a", "memory footprint")]],
+        )
+        assert "(a) memory footprint" in en[1]["content"]
 
 
 @pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
@@ -2428,3 +2466,161 @@ class TestFocusRejectsUselessBoxes:
         assert normalize_focus({"x": 600, "y": 400, "w": 300, "h": 200}) is None
         assert normalize_focus({"x": "左", "y": 0, "w": 1, "h": 1}) is None
         assert normalize_focus([]) is None
+
+
+class TestPanelCatalog:
+    """「讲的是第几个子图」这套：字母从图注来，框从像素来，两者必须对得上。"""
+
+    CAPTION = (
+        "Figure 1: Why recurrent state needs structured compression. "
+        "(a) State memory footprint grows with concurrent requests. "
+        "(b) Heads with longer gate half-lives accumulate larger errors."
+    )
+
+    def _figure_png(self, path: Path) -> Path:
+        """两块横排子图，中间一条干净的白缝。"""
+        import pymupdf
+
+        size = 600
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, size, size), False)
+        pix.set_rect(pix.irect, (255, 255, 255))
+        pix.set_rect(pymupdf.IRect(40, 60, 280, 540), (30, 60, 120))
+        pix.set_rect(pymupdf.IRect(340, 60, 560, 540), (120, 60, 30))
+        pix.save(str(path))
+        return path
+
+    def _pool(self, tmp_path: Path) -> dict[str, ImageAsset]:
+        image = self._figure_png(tmp_path / "fig.png")
+        return {"f1": ImageAsset("f1", image, "figure", self.CAPTION)}
+
+    def test_cuts_panels_and_maps_letters(self, tmp_path):
+        pool = self._pool(tmp_path)
+        catalog = build_panel_catalog([{"id": "f1", "label": "Figure 1", "caption": self.CAPTION}], pool)
+        assert "f1" in catalog
+        panels = catalog["f1"]
+        assert panels.letters == ["a", "b"]
+
+        first = panels.focus_for("a")
+        second = panels.focus_for("b")
+        assert first is not None and second is not None
+        assert first["x"] < second["x"], "a 在左、b 在右"
+        assert first["w"] < 0.55 and second["w"] < 0.55, "每块只框自己那一半"
+        assert "memory" in first["label"].lower()
+
+    def test_unknown_letter_gives_no_box(self, tmp_path):
+        catalog = build_panel_catalog(
+            [{"id": "f1", "label": "Figure 1", "caption": self.CAPTION}], self._pool(tmp_path)
+        )
+        assert catalog["f1"].focus_for("c") is None
+        assert catalog["f1"].focus_for("") is None
+
+    def test_single_panel_caption_is_skipped(self, tmp_path):
+        caption = "Figure 1: an overview of the whole pipeline."
+        catalog = build_panel_catalog(
+            [{"id": "f1", "label": "Figure 1", "caption": caption}], self._pool(tmp_path)
+        )
+        assert catalog == {}, "图注没说有几个子图 → 不做聚光灯"
+
+    def test_skips_when_the_split_disagrees_with_the_caption(self, tmp_path):
+        """图注说 3 块、像素只切得出 2 块 → 整张图放弃（字母和块序会错位）。"""
+        caption = self.CAPTION.replace("(b)", "(b)").replace(
+            "(a)", "(a)"
+        ) + " (c) A third panel that is not there."
+        catalog = build_panel_catalog(
+            [{"id": "f1", "label": "Figure 1", "caption": caption}], self._pool(tmp_path)
+        )
+        assert catalog == {}
+
+    def test_missing_file_is_skipped(self, tmp_path):
+        pool = {"f1": ImageAsset("f1", tmp_path / "nope.png", "figure", self.CAPTION)}
+        assert build_panel_catalog([{"id": "f1", "caption": self.CAPTION}], pool) == {}
+
+    def test_marks_from_the_pdf_are_used(self, tmp_path):
+        """PDF 里量到的子图标注位置会传下去（图注里有、图上也有时才最准）。"""
+        pool = self._pool(tmp_path)
+        figures = [
+            {
+                "id": "f1",
+                "label": "Figure 1",
+                "caption": self.CAPTION,
+                "panel_marks": [
+                    {"letter": "a", "x": 0.08, "y": 0.9},
+                    {"letter": "b", "x": 0.58, "y": 0.9},
+                ],
+            }
+        ]
+        catalog = build_panel_catalog(figures, pool)
+        assert catalog["f1"].letters == ["a", "b"]
+        assert catalog["f1"].focus_for("b")["x"] > catalog["f1"].focus_for("a")["x"]
+
+    def test_label_is_short_enough_for_the_chip(self):
+        panels = FigurePanels(letters=["a"], bodies=["x"], panels=[])
+        assert panels.options() == [("a", "x")]
+
+    def test_boxes_survive_the_focus_guards(self, tmp_path):
+        """切出来的框要过得了聚光灯自己的下限，否则会出现「存了但永远不显示」。"""
+        catalog = build_panel_catalog(
+            [{"id": "f1", "label": "Figure 1", "caption": self.CAPTION}], self._pool(tmp_path)
+        )
+        for letter in ("a", "b"):
+            focus = catalog["f1"].focus_for(letter)
+            assert focus is not None
+            assert normalize_focus(focus) == focus, "过不了守卫的框等于白框"
+            assert len(focus["label"]) <= 16
+
+    def test_six_panel_figure_still_gives_usable_boxes(self, tmp_path):
+        """子图越多每块越小 —— 小到过不了下限时宁可不框，也别框错。"""
+        import pymupdf
+
+        path = tmp_path / "six.png"
+        size = 600
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, size, size), False)
+        pix.set_rect(pix.irect, (255, 255, 255))
+        for col in range(3):
+            for row in range(2):
+                x0, y0 = 30 + col * 190, 30 + row * 290
+                pix.set_rect(pymupdf.IRect(x0, y0, x0 + 160, y0 + 250), (30, 60, 120))
+        pix.save(str(path))
+
+        caption = "Figure 3: six variants. " + " ".join(
+            f"({letter}) variant {letter} of the pipeline." for letter in "abcdef"
+        )
+        catalog = build_panel_catalog(
+            [{"id": "f1", "label": "Figure 3", "caption": caption}],
+            {"f1": ImageAsset("f1", path, "figure", caption)},
+        )
+        assert catalog["f1"].letters == list("abcdef")
+        assert all(catalog["f1"].focus_for(letter) for letter in "abcdef")
+
+
+class TestPanelLabel:
+    """框上的标签要在**词边界**上截断。
+
+    实测第一次跑出来的是 `Recurrent state `（16 字上限砍在词中间，还带个尾空格）。
+    """
+
+    def test_english_stops_at_a_word(self):
+        label = _panel_label("Recurrent state memory grows with concurrent requests")
+        assert label == "Recurrent state", label
+        assert not label.endswith(" ")
+
+    def test_english_short_body_is_kept(self):
+        assert _panel_label("State memory") == "State memory"
+
+    def test_english_caps_at_four_words(self):
+        assert _panel_label("a bb ccc dddd eeeee").count(" ") <= 3
+
+    def test_chinese_is_cut_by_characters(self):
+        assert _panel_label("状态内存随并发请求增长而且会超过模型权重占用") == "状态内存随并发请求增长而且会超过"
+        assert len(_panel_label("状态内存随并发请求增长而且会超过模型权重占用")) == 16
+
+    def test_symbols_do_not_switch_it_to_character_cutting(self):
+        """英文图注里的 `6.93×` / `–` 不能让它退化成按字符砍（实测砍出「Mean accuracy ac」）。"""
+        assert _panel_label("Mean accuracy \u00d7 seven tasks") == "Mean accuracy \u00d7"
+
+    def test_mixed_body_uses_the_character_budget(self):
+        assert _panel_label("内存占用 memory footprint") == "内存占用 memory foot"
+
+    def test_empty_body(self):
+        assert _panel_label("") == ""
+        assert _panel_label("   ") == ""
