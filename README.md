@@ -187,7 +187,7 @@ paper-podcast/
 │   │       ├── illustration.py    生成信息图（SVG）+ 清洗 + 栅格化
 │   │       ├── video.py           视频合成（时间轴 / 配图分配 / 字幕 / 编码）
 │   │       └── pipeline.py        流水线编排 + 产物导出
-│   └── tests/                     391 项测试
+│   └── tests/                     398 项测试
 └── frontend/
     └── src/                       Vue3 应用，含浏览器端 Mock 适配器
 ```
@@ -223,7 +223,7 @@ Chrome headless 在本机会挂死，Playwright 装浏览器超时，且截图�
 
 ```bash
 cd backend
-../.venv/bin/python -m pytest          # 391 passed
+../.venv/bin/python -m pytest          # 398 passed
 ```
 
 覆盖范围：
@@ -310,6 +310,8 @@ cd ../backend && ../.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --po
 - **账号体系是「够用」级别，不是企业级**：没有邮箱验证、没有找回口令（忘了只能由管理员
   在数据库里改）、没有双因素。定位是社区内部工具，不是面向陌生用户的公开服务。
   `SIGNUP_CODE` 是唯一的注册闸门，公开部署前务必设上。
+- **生成配额是「最近 24 小时」的滑动窗口**，默认每账号 30 期
+  （`DAILY_GENERATION_LIMIT`，0 = 不限）。批量按篇数扣。
 - **登录限流是进程内内存的**：单进程部署够用；多进程 / 多实例部署要换成 Redis
   或数据库表，否则每个进程各记各的，实际阈值会被放大好几倍。
 - **权限模型是「私有 or 公开」**：一集要么只有自己看得到，要么任何拿到链接的人都能看。

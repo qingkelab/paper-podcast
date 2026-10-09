@@ -588,7 +588,35 @@ range 请求探测 moov box）。无视频时 `404`。
 
 ---
 
-## 2.9 关键词高亮（V2）
+## 2.9 生成配额（V2）
+
+一次生成要调大模型 + 语音合成 + 视频编码，是真金白银。有了多账号之后，
+不给上限就等于把账单交给任何注册进来的人。
+
+### `GET /api/usage`
+
+```json
+{ "used": 3, "limit": 30, "remaining": 27, "resets_at": "2025-01-02T12:00:00+00:00" }
+```
+
+**需要登录**。`limit = 0` 表示不限量，此时 `remaining` / `resets_at` 为 `null`。
+
+### 配额规则
+
+- 窗口是**最近 24 小时的滑动窗口**，不是自然日 ——「今天」取决于服务器时区，
+  而用户在哪都能用；午夜齐刷刷重置也更容易被集中薅。
+- `POST /api/episodes` 扣 1；`POST /api/episodes/batch` **按篇数扣**
+  （不按提交次数，否则批量就是绕过配额的后门）。
+- 超限返回 `429` + 可读的中文说明 + `X-Quota-Reset`（重置时刻）。
+- **开放模式（库里没有账号）不设限** —— 那时本来就只有部署者自己用。
+- 阈值见 `.env` 的 `DAILY_GENERATION_LIMIT`。
+
+> 前端应当在生成页显示「今天还能生成 N 期」（`GET /api/usage`）。
+> 有配额却不告诉用户还剩多少，等于让人撞 429 才知道，那是很差的体验。
+
+---
+
+## 2.10 关键词高亮（V2）
 
 **没有接口变更**。前端用 `paper_meta.keywords` 在脚本与解读正文里做高亮，
 详情页给一个开关（默认开），关掉后是纯文本。
@@ -610,7 +638,7 @@ range 请求探测 moov box）。无视频时 `404`。
 | 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../video`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md`、`POST .../share` |
 | **公开分享** | `/share/:token` | `GET /api/share/{token}`、`/api/share/{token}/…`（**免登录**） |
 | 登录 / 注册 | `/login` | `POST /api/auth/login`、`POST /api/auth/register`、`GET /api/auth/me` |
-| 设置 | `/settings` | `GET /api/options`、`GET /api/health`（本地存储偏好） |
+| 设置 | `/settings` | `GET /api/options`、`GET /api/health`、`GET /api/usage`、`POST /api/auth/password` |
 
 **登录态与路由**：`GET /api/auth/me` 返回 401 时，把用户挡在 `/login`；
 `/share/:token` 例外（免登录）。**开放模式**（`mode="open"`）下不挡、不跳转。

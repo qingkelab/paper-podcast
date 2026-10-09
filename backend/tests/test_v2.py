@@ -815,3 +815,92 @@ class TestLoginThrottle:
         assert throttle.retry_after(key) > 0
         time.sleep(1.1)
         assert throttle.retry_after(key) == 0
+
+
+class TestGenerationQuota:
+    """生成配额：一次生成要调大模型 + 语音合成 + 视频编码，是真金白银。
+
+    有了多账号之后，不给上限就等于把账单交给任何注册进来的人。
+    """
+
+    def test_limit_blocks_further_generation(self, tmp_path):
+        with TestClient(
+            make_app(tmp_path, daily_generation_limit=2)
+        ) as client:
+            register(client, "guo")
+            make_episode(client)
+            make_episode(client)
+            blocked = client.post(
+                "/api/episodes",
+                json={
+                    "source_type": "text",
+                    "text": SAMPLE_TEXT,
+                    "options": {"duration_min": 3},
+                },
+            )
+            assert blocked.status_code == 429
+            assert "最多生成 2 期" in blocked.json()["detail"]
+            assert "X-Quota-Reset" in blocked.headers
+
+    def test_usage_endpoint_reports_remaining(self, tmp_path):
+        with TestClient(make_app(tmp_path, daily_generation_limit=3)) as client:
+            register(client, "guo")
+            assert client.get("/api/usage").json() == {
+                "used": 0,
+                "limit": 3,
+                "remaining": 3,
+                "resets_at": client.get("/api/usage").json()["resets_at"],
+            }
+            make_episode(client)
+            body = client.get("/api/usage").json()
+            assert body["used"] == 1 and body["remaining"] == 2
+
+    def test_batch_counts_each_paper(self, tmp_path):
+        """批量是一次提交、多篇扣额 —— 不按「提交次数」算，否则批量就是绕过配额的后门。"""
+        with TestClient(make_app(tmp_path, daily_generation_limit=3)) as client:
+            register(client, "guo")
+            too_many = client.post(
+                "/api/episodes/batch",
+                json={
+                    "source_type": "text",
+                    "texts": [SAMPLE_TEXT] * 4,
+                    "options": {"duration_min": 3},
+                },
+            )
+            assert too_many.status_code == 429
+
+    def test_zero_means_unlimited(self, tmp_path):
+        with TestClient(make_app(tmp_path, daily_generation_limit=0)) as client:
+            register(client, "guo")
+            body = client.get("/api/usage").json()
+            assert body["limit"] == 0 and body["remaining"] is None
+            for _ in range(3):
+                make_episode(client)  # 不该被拦
+
+    def test_quota_is_per_user(self, tmp_path):
+        with as_user(tmp_path, "guo", daily_generation_limit=1) as (client, _):
+            make_episode(client)
+            assert client.post(
+                "/api/episodes",
+                json={
+                    "source_type": "text",
+                    "text": SAMPLE_TEXT,
+                    "options": {"duration_min": 3},
+                },
+            ).status_code == 429
+
+        with as_user(tmp_path, "other", daily_generation_limit=1) as (other, _):
+            body = other.get("/api/usage").json()
+            assert body["used"] == 0 and body["remaining"] == 1
+
+    def test_open_mode_is_not_limited(self, tmp_path):
+        """开放模式（库里没账号）本来就只有部署者自己用，不该被拦。"""
+        with TestClient(make_app(tmp_path, daily_generation_limit=1)) as client:
+            make_episode(client)
+            make_episode(client)
+
+    def test_usage_requires_login(self, tmp_path):
+        with as_user(tmp_path, "guo"):
+            pass
+        with as_user(tmp_path) as (anon, _):
+            assert anon.get("/api/usage").status_code == 401

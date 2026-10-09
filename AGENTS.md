@@ -260,6 +260,12 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   计数，超限返回 429。锁住期间**正确口令也进不来**（否则限流形同虚设），
   登录成功清零。**内存实现**，多进程/多实例部署必须换成 Redis 或数据库表。
 - **限流不看 `X-Forwarded-For`**：那个头客户端可以随便伪造，拿它当依据等于给了绕过办法。
+- **生成接口必须有配额**（`_check_generation_quota`）。一次生成要调大模型 + 语音合成 +
+  视频编码，是真金白银；有了多账号，不给上限就等于把账单交给任何注册进来的人。
+  窗口是**最近 24 小时的滑动窗口**（不是自然日：自然日取决于服务器时区，
+  而且午夜齐刷刷重置更容易被集中薅）。**批量按篇数扣** —— 按提交次数扣的话，
+  批量就是绕过配额的后门。开放模式（库里没账号）不设限。
+  另外要有 `GET /api/usage`：有配额却不告诉用户还剩多少，等于让人撞 429 才知道。
 - **分享链接是「开关 + 可重置的 token」**：`visibility` 决定看不看得到，
   `share_token` 是地址。取单集时必须**同时**匹配 `visibility='public'`，
   不能只看 token 在不在 —— 否则取消分享那一刻旧链接还是通的。
@@ -281,7 +287,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            391 项，改完必须全绿
+backend/tests/            398 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

@@ -388,6 +388,19 @@ class Database:
         )
         return cur.rowcount or 0
 
+    def count_episodes_since(self, user_id: str, since_iso: str) -> int:
+        """这个账号在 `since_iso` 之后建了多少集（用于每日配额）。
+
+        `created_at` 统一是 `utcnow()` 写进去的 ISO 串（带 +00:00），
+        同格式下按字符串比较等价于按时间比较，所以这里不用 SQLite 的日期函数 ——
+        那些函数对带时区偏移的串处理得并不一致。
+        """
+        row = self._query_one(
+            "SELECT COUNT(*) AS n FROM episodes WHERE user_id = ? AND created_at >= ?",
+            (user_id, since_iso),
+        )
+        return int(row["n"]) if row else 0
+
     # ---------- 会话 ----------
 
     def create_session(self, *, token: str, user_id: str, expires_at: str) -> None:

@@ -338,6 +338,16 @@ class ShareVersion(BaseModel):
     video: VideoInfo | None = None
 
 
+class UsageResponse(BaseModel):
+    """这一天的生成配额用了多少。前端拿它显示「今天还能生成几期」。"""
+
+    used: int = 0
+    limit: int = 0
+    remaining: int | None = None
+    # 配额窗口是「最近 24 小时」的滑动窗口，不是自然日 —— 所以给的是重置时刻
+    resets_at: str | None = None
+
+
 class OptionItem(BaseModel):
     value: str | int
     label: str

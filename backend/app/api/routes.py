@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+from datetime import datetime, timedelta, timezone
 import mimetypes
 import re
 from pathlib import Path
@@ -37,6 +38,7 @@ from ..models import (
     RegisterRequest,
     ShareAuthor,
     ShareView,
+    UsageResponse,
     User,
 )
 from ..services.figures import PdfAssetsError, rotate_image_file
@@ -339,6 +341,46 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
     }
 
 
+def _quota_window_start() -> str:
+    """配额窗口起点：24 小时前（滑动窗口）。
+
+    刻意用滑动窗口而不是自然日：自然日的「今天」取决于服务器时区，
+    而用户在哪都能用；而且午夜一到额度齐刷刷重置，反而更容易被集中薅。
+    """
+    return (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+
+
+def _check_generation_quota(request: Request, wants: int = 1) -> None:
+    """还有没有额度。超出抛 429，并在头里给出重置时刻。
+
+    一次生成要调大模型 + 语音合成 + 视频编码，是真金白银。有了多账号之后，
+    不给上限就等于把账单交给任何注册进来的人。
+    """
+    settings = _settings(request)
+    limit = int(settings.daily_generation_limit or 0)
+    if limit <= 0:
+        return
+    user = auth_lib.current_user(request)
+    if user is None:
+        # 开放模式（库里没有账号）：本来就只有部署者自己用，不设限
+        return
+
+    since = _quota_window_start()
+    used = _db(request).count_episodes_since(user["id"], since)
+    if used + wants > limit:
+        resets_at = (
+            datetime.fromisoformat(since) + timedelta(hours=24)
+        ).isoformat(timespec="seconds")
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"24 小时内最多生成 {limit} 期（已用 {used}）。"
+                f"额度会在 {resets_at[:16].replace('T', ' ')} UTC 前后恢复。"
+            ),
+            headers={"X-Quota-Reset": resets_at},
+        )
+
+
 def _current_user_id(request: Request) -> str | None:
     """新建单集时记归属。开放模式下没有 user，落 None（之后被第一个注册者认领）。"""
     user = auth_lib.current_user(request)
@@ -442,6 +484,7 @@ async def create_episode(request: Request):
     - application/json：链接或纯文本导入
     """
     auth_lib.user_or_401(request)
+    _check_generation_quota(request)
     settings = _settings(request)
     content_type = (request.headers.get("content-type") or "").lower()
 
@@ -623,6 +666,30 @@ def _as_str(value: Any) -> str | None:
     if value is None:
         return None
     return str(value).strip() or None
+
+
+@router.get("/usage", response_model=UsageResponse)
+async def usage(request: Request):
+    """今天还能生成几期。**需要登录**（没账号时没有配额概念）。
+
+    有配额而不告诉用户还剩多少，等于让人撞 429 才知道 —— 那是很差的体验。
+    """
+    user = auth_lib.user_or_401(request)
+    limit = int(_settings(request).daily_generation_limit or 0)
+    if user is None:
+        return UsageResponse(used=0, limit=0, remaining=None)
+
+    since = _quota_window_start()
+    used = _db(request).count_episodes_since(user["id"], since)
+    resets_at = (datetime.fromisoformat(since) + timedelta(hours=24)).isoformat(
+        timespec="seconds"
+    )
+    return UsageResponse(
+        used=used,
+        limit=limit,
+        remaining=None if limit <= 0 else max(limit - used, 0),
+        resets_at=None if limit <= 0 else resets_at,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1301,6 +1368,7 @@ async def create_batch(request: Request):
     settings = _settings(request)
     content_type = (request.headers.get("content-type") or "").lower()
     limit = _batch_limit(request)
+    _check_generation_quota(request, wants=limit)
 
     if content_type.startswith("multipart/form-data"):
         return await _batch_from_upload(request, settings, limit)

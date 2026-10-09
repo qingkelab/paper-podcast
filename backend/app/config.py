@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     login_max_attempts: int = 8
     # 锁多久（分钟）
     login_lockout_minutes: int = 15
+    # 每个账号 24 小时内最多能发起多少次生成（0 = 不限）。
+    # 一次生成要调大模型 + 语音合成 + 视频编码，是真金白银 ——
+    # 有了多账号之后，不给上限就等于把账单交给任何注册进来的人。
+    daily_generation_limit: int = 30
 
     # ---- 存储 ----
     data_dir: Path = PROJECT_ROOT / "data"
