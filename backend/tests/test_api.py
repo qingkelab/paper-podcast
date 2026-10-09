@@ -1138,3 +1138,32 @@ class TestTitleFromModel:
         assert response.status_code == 201
         finished = wait_for_completion(client, response.json()["id"])
         assert finished["title"] == "我自己起的名字"
+
+
+class TestWorkerRetryPolicy:
+    """哪些错误值得重试。
+
+    实测代价：DeepSeek 余额不足（402）曾经不在「不可重试」清单里，
+    于是一次生成被**完整重跑 3 遍** —— 每遍重新下载 PDF、重新提取配图、
+    重新调模型，最后拿到的还是同一个 402。白烧时间和带宽。
+    """
+
+    def test_balance_error_is_permanent(self):
+        from app.worker import _is_permanent
+
+        assert _is_permanent("DeepSeek 账户余额不足（402）")
+        assert _is_permanent("402 Payment Required")
+
+    def test_auth_and_parse_errors_stay_permanent(self):
+        from app.worker import _is_permanent
+
+        for message in ("鉴权失败", "无法解析这个 PDF", "论文有效正文过短", "接入点不存在"):
+            assert _is_permanent(message), message
+
+    def test_rate_limit_is_still_retryable(self):
+        """429 限流是真能靠退避等过去的 —— 不能因为怕浪费就把它也算成永久错误。"""
+        from app.worker import _is_permanent
+
+        assert not _is_permanent("请求过于频繁（429）")
+        assert not _is_permanent("连接超时")
+        assert not _is_permanent("网络抖动")

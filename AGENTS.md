@@ -260,6 +260,10 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
   计数，超限返回 429。锁住期间**正确口令也进不来**（否则限流形同虚设），
   登录成功清零。**内存实现**，多进程/多实例部署必须换成 Redis 或数据库表。
 - **限流不看 `X-Forwarded-For`**：那个头客户端可以随便伪造，拿它当依据等于给了绕过办法。
+- **余额不足（402）要归类成「不可重试」**。它曾经不在 `worker._is_permanent()` 的
+  清单里，实测代价是：一次生成被**完整重跑 3 遍** —— 每遍重新下载 PDF、重新提取配图、
+  重新调模型，最后拿到的还是同一个 402，白烧时间和带宽。
+  注意**不要**顺手把限流（429）也加进去：那个是真能靠退避等过去的。
 - **生成接口必须有配额**（`_check_generation_quota`）。一次生成要调大模型 + 语音合成 +
   视频编码，是真金白银；有了多账号，不给上限就等于把账单交给任何注册进来的人。
   窗口是**最近 24 小时的滑动窗口**（不是自然日：自然日取决于服务器时区，
@@ -287,7 +291,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            398 项，改完必须全绿
+backend/tests/            401 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言
