@@ -327,3 +327,9 @@ frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看
 
 `Settings.llm_mode` / `tts_mode` 会根据密钥是否齐全自动判断，也可用 `FORCE_MOCK=true` 强制。
 前端另有独立的浏览器端 Mock（`VITE_USE_MOCK=1`），不依赖后端，用于静态站点演示。
+
+**本地验证演示版要小心**：`VITE_USE_MOCK=1 pnpm build` 写的是同一个 `frontend/dist`，
+而后端正好托管它（`main.py::_mount_frontend`）。也就是说跑一次 mock 构建，
+**本地真实实例会当场变成演示模式**（列表里那些真实单集还在，但页面不再调后端）。
+实测踩过一次。验证完记得 `pnpm build`（不带 mock）重新还原 —— 不用重启 uvicorn，
+`StaticFiles` 是每次请求读盘的。
