@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import mimetypes
 import re
@@ -12,17 +13,31 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response, UploadFi
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from .. import auth as auth_lib
 from ..config import Settings
 from ..db import Database
 from ..models import (
+    Album,
+    AlbumAssignRequest,
+    AlbumDetail,
+    AlbumWriteRequest,
+    BatchFailure,
+    BatchRequest,
+    BatchResult,
     Episode,
     FigureRotateRequest,
     EpisodeList,
     EpisodeListItem,
     EpisodeOptions,
     HealthResponse,
+    LoginRequest,
     OptionItem,
     OptionsResponse,
+    PasswordChangeRequest,
+    RegisterRequest,
+    ShareAuthor,
+    ShareView,
+    User,
 )
 from ..services.figures import PdfAssetsError, rotate_image_file
 from ..services.video import VideoError, is_video_stale
@@ -315,16 +330,49 @@ def to_episode(record: dict[str, Any], *, include_large: bool = True) -> dict[st
         "audio_url": surface.get("audio_url"),
         "audio_duration_sec": surface.get("audio_duration_sec"),
         "audio_bytes": surface.get("audio_bytes"),
+        # V2：分享与分组。user_id 不下发 —— 前端不需要，也没法验证别人的 id。
+        "visibility": record.get("visibility") or "private",
+        "share_token": record.get("share_token"),
+        "album_id": record.get("album_id"),
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
     }
 
 
+def _current_user_id(request: Request) -> str | None:
+    """新建单集时记归属。开放模式下没有 user，落 None（之后被第一个注册者认领）。"""
+    user = auth_lib.current_user(request)
+    return user["id"] if user else None
+
+
 def _require_episode(request: Request, episode_id: str) -> dict[str, Any]:
+    """取单集，并**顺带校验归属**。别人的单集返回 404（不是 403）。
+
+    用 404 不用 403 是有意的：403 等于告诉对方「这个 id 真实存在，只是不是你的」，
+    拿它枚举一遍就能摸出别人的数据规模。404 什么都不泄漏。
+    """
     record = _db(request).get_episode(episode_id)
     if not record:
         raise HTTPException(status_code=404, detail="播客不存在")
+    user = auth_lib.user_or_401(request)
+    if user is not None and record.get("user_id") not in (None, user["id"]):
+        raise HTTPException(status_code=404, detail="播客不存在")
     return record
+
+
+def _require_album(request: Request, album_id: str) -> dict[str, Any]:
+    """取专辑（含归属校验）。
+
+    开放模式下没有 user，就按「无主专辑」处理 —— 但开放模式只在库里
+    一个用户都没有时成立，那时也不可能有专辑，所以这里实质上是要求登录。
+    """
+    user = auth_lib.user_or_401(request)
+    if user is None:
+        raise HTTPException(status_code=404, detail="专辑不存在")
+    album = _db(request).get_album(album_id, user_id=user["id"])
+    if not album:
+        raise HTTPException(status_code=404, detail="专辑不存在")
+    return album
 
 
 def _resolve_version(
@@ -351,16 +399,26 @@ def _download_filename(record: dict[str, Any], language: str, suffix: str) -> st
 
 @router.get("/health", response_model=HealthResponse)
 async def health(request: Request) -> HealthResponse:
+    """**免登录**：前端要靠它判断该不该跳登录页。
+
+    `mode="open"` 表示库里还没有任何用户（不需要登录），
+    这时前端不显示登录入口 —— 否则会出现「要求登录但没有账号可登」的死循环。
+    """
     settings = _settings(request)
     return HealthResponse(
         status="ok",
         version=settings.version,
         modes={"llm": settings.llm_mode, "tts": settings.tts_mode},
+        mode="open" if _db(request).is_open_mode() else "auth",
     )
 
 
 @router.get("/options", response_model=OptionsResponse)
 async def options() -> OptionsResponse:
+    """**免登录**：只是一份音色/时长目录，没有任何私人数据。
+
+    首页（产品介绍页）在登录前也要能显示状态，401 会让它误报「后端未连接」。
+    """
     return OptionsResponse(
         durations=DURATIONS,
         levels=LEVELS,
@@ -383,6 +441,7 @@ async def create_episode(request: Request):
     - multipart/form-data：PDF 上传（字段 file + duration_min/level/voice_a/voice_b）
     - application/json：链接或纯文本导入
     """
+    auth_lib.user_or_401(request)
     settings = _settings(request)
     content_type = (request.headers.get("content-type") or "").lower()
 
@@ -424,6 +483,7 @@ async def _create_from_upload(request: Request, settings: Settings) -> dict[str,
         source_type="pdf",
         source_ref=None,  # 落盘后再回填
         options=episode_options,
+        user_id=_current_user_id(request),
     )
 
     # 存盘：用 episode id 命名，避免同名文件互相覆盖
@@ -471,6 +531,7 @@ async def _create_from_json(request: Request, settings: Settings) -> dict[str, A
             source_type="url",
             source_ref=url,
             options=episode_options,
+            user_id=_current_user_id(request),
         )
 
     else:  # text
@@ -488,6 +549,7 @@ async def _create_from_json(request: Request, settings: Settings) -> dict[str, A
             source_type="text",
             source_ref=None,
             options=episode_options,
+            user_id=_current_user_id(request),
         )
         _db(request).update_episode(record["id"], raw_text=text)
 
@@ -564,6 +626,779 @@ def _as_str(value: Any) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# V2：账号与会话
+# --------------------------------------------------------------------------
+
+
+def _user_payload(user: dict[str, Any]) -> dict[str, Any]:
+    """对外只给这几个字段。**password_hash 绝不出现** —— 这里白名单式构造，
+    不是 `{**user}` 再删，免得以后加了字段（比如重置口令用的 token）被顺手带出去。"""
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "display_name": user.get("display_name") or "",
+        "created_at": user["created_at"],
+    }
+
+
+@router.post("/auth/register", status_code=201, response_model=User)
+async def register(request: Request, payload: RegisterRequest, response: Response):
+    """注册即登录（直接下发会话 cookie）。
+
+    **第一个注册成功的用户会认领所有无主单集** —— V1 时代的数据不会变成孤儿。
+    """
+    settings = _settings(request)
+    db = _db(request)
+
+    if settings.signup_code and not hmac.compare_digest(
+        payload.signup_code or "", settings.signup_code
+    ):
+        raise HTTPException(status_code=403, detail="邀请码不正确")
+
+    try:
+        username = auth_lib.normalize_username(payload.username)
+        password = auth_lib.normalize_password(payload.password)
+    except auth_lib.AuthError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    if db.get_user_by_username(username):
+        raise HTTPException(status_code=409, detail="这个用户名已经被用了")
+
+    first_user = db.is_open_mode()
+    user = db.create_user(
+        user_id=auth_lib.new_user_id(),
+        username=username,
+        password_hash=auth_lib.hash_password(password),
+        display_name=auth_lib.normalize_display_name(payload.display_name),
+    )
+
+    if first_user:
+        claimed = db.claim_orphan_episodes(user["id"])
+        logger.info("首个账号 %s 认领了 %d 集无主数据", username, claimed)
+
+    token = auth_lib.new_session_token()
+    db.create_session(
+        token=token,
+        user_id=user["id"],
+        expires_at=auth_lib.expiry_from_now(settings.session_ttl_days),
+    )
+    auth_lib.set_session_cookie(response, token, settings)
+    return _user_payload(user)
+
+
+@router.post("/auth/login", response_model=User)
+async def login(request: Request, payload: LoginRequest, response: Response):
+    """登录。用户名不存在与口令错误返回**同一个**提示，别告诉对方哪个错了。"""
+    settings = _settings(request)
+    db = _db(request)
+
+    try:
+        username = auth_lib.normalize_username(payload.username)
+    except auth_lib.AuthError as exc:
+        raise HTTPException(status_code=401, detail="用户名或口令不正确") from exc
+
+    user = db.get_user_by_username(username)
+    # 用户不存在时也跑一次哈希校验：否则「不存在」比「口令错」快得多，
+    # 从响应时间上就能枚举出哪些用户名是真实存在的。
+    stored = user["password_hash"] if user else auth_lib.hash_password("dummy-password")
+    ok = auth_lib.verify_password(payload.password or "", stored)
+    if not user or not ok:
+        raise HTTPException(status_code=401, detail="用户名或口令不正确")
+
+    token = auth_lib.new_session_token()
+    db.create_session(
+        token=token,
+        user_id=user["id"],
+        expires_at=auth_lib.expiry_from_now(settings.session_ttl_days),
+    )
+    auth_lib.set_session_cookie(response, token, settings)
+    return _user_payload(user)
+
+
+@router.post("/auth/logout", status_code=204)
+async def logout(request: Request) -> Response:
+    """幂等：没登录也返回 204，前端不必先判断状态。"""
+    token = auth_lib.session_cookie(request)
+    if token:
+        _db(request).delete_session(token)
+    response = Response(status_code=204)
+    auth_lib.clear_session_cookie(response)
+    return response
+
+
+@router.post("/auth/password", status_code=204)
+async def change_password(request: Request, payload: PasswordChangeRequest) -> Response:
+    """改自己的口令。
+
+    **必须验旧口令**：否则会话 cookie 被偷走就等于永久接管账号。
+    改完把**其他**会话全部删掉（保留当前这一个）——
+    口令换了之后，别处还挂着旧会话是最常见的「明明改了密码还是被盗」。
+    """
+    user = auth_lib.current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="需要登录")
+
+    if not auth_lib.verify_password(payload.current_password or "", user["password_hash"]):
+        raise HTTPException(status_code=401, detail="当前口令不正确")
+
+    try:
+        new_password = auth_lib.normalize_password(payload.new_password)
+    except auth_lib.AuthError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    db = _db(request)
+    db.update_user_password(user["id"], auth_lib.hash_password(new_password))
+
+    # 只删「其他」会话，保留当前这条 —— 不能先全删再补回，那样一旦漏补
+    # 用户改完口令自己就被踢出去了
+    db.delete_other_sessions(user["id"], auth_lib.session_cookie(request))
+    return Response(status_code=204)
+
+
+@router.get("/auth/me", response_model=User)
+async def me(request: Request):
+    """未登录 401。前端启动时用它判断登录态。"""
+    user = auth_lib.current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="需要登录")
+    return _user_payload(user)
+
+
+# --------------------------------------------------------------------------
+# V2：个人专辑
+# --------------------------------------------------------------------------
+
+
+def _cover_url_for_episode(record: dict[str, Any]) -> str | None:
+    path = record.get("cover_path")
+    if path and Path(path).exists():
+        return f"/api/episodes/{record['id']}/cover?v={_asset_version(path)}"
+    return None
+
+
+def _album_payload(request: Request, album: dict[str, Any]) -> dict[str, Any]:
+    """专辑摘要。封面取专辑里最新一集的封面。"""
+    db = _db(request)
+    episodes, _ = db.list_episodes(album_id=album["id"], limit=1, offset=0)
+    cover_url = _cover_url_for_episode(episodes[0]) if episodes else None
+    return {
+        "id": album["id"],
+        "title": album["title"],
+        "description": album.get("description"),
+        "episode_count": db.count_episodes_in_album(album["id"]),
+        "cover_url": cover_url,
+        "created_at": album["created_at"],
+        "updated_at": album["updated_at"],
+    }
+
+
+@router.get("/albums", response_model=list[Album])
+async def list_albums(request: Request):
+    user = auth_lib.user_or_401(request)
+    if user is None:
+        return []
+    return [_album_payload(request, album) for album in _db(request).list_albums(user["id"])]
+
+
+@router.post("/albums", status_code=201, response_model=Album)
+async def create_album(request: Request, payload: AlbumWriteRequest):
+    user = auth_lib.user_or_401(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="专辑名称不能为空")
+    if len(title) > 60:
+        raise HTTPException(status_code=400, detail="专辑名称最长 60 字")
+
+    description = (payload.description or "").strip() or None
+    album = _db(request).create_album(
+        album_id=auth_lib.new_album_id(),
+        user_id=user["id"],
+        title=title,
+        description=description[:200] if description else None,
+    )
+    return _album_payload(request, album)
+
+
+@router.get("/albums/{album_id}", response_model=AlbumDetail)
+async def get_album(request: Request, album_id: str):
+    album = _require_album(request, album_id)
+    payload = _album_payload(request, album)
+    records, _ = _db(request).list_episodes(album_id=album_id, limit=100, offset=0)
+    payload["episodes"] = [to_episode(r, include_large=False) for r in records]
+    return payload
+
+
+@router.patch("/albums/{album_id}", response_model=Album)
+async def update_album(request: Request, album_id: str, payload: AlbumWriteRequest):
+    album = _require_album(request, album_id)
+    user = auth_lib.current_user(request)
+    assert user is not None  # _require_album 已经保证了这一点
+
+    fields: dict[str, Any] = {}
+    if payload.title is not None:
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="专辑名称不能为空")
+        fields["title"] = title[:60]
+    if payload.description is not None:
+        fields["description"] = payload.description.strip()[:200] or None
+
+    _db(request).update_album(album_id, user_id=user["id"], **fields)
+    refreshed = _db(request).get_album(album_id, user_id=user["id"])
+    assert refreshed is not None
+    return _album_payload(request, refreshed)
+
+
+@router.delete("/albums/{album_id}", status_code=204)
+async def delete_album(request: Request, album_id: str) -> Response:
+    """只删专辑，**不删里面的单集**（单集的 album_id 置空）。"""
+    album = _require_album(request, album_id)
+    user = auth_lib.current_user(request)
+    assert user is not None
+    _db(request).delete_album(album["id"], user_id=user["id"])
+    return Response(status_code=204)
+
+
+@router.post("/albums/{album_id}/episodes", response_model=AlbumDetail)
+async def assign_album_episodes(
+    request: Request, album_id: str, payload: AlbumAssignRequest
+):
+    """把单集加入专辑。幂等：已经在里面的再传一次没有副作用。"""
+    album = _require_album(request, album_id)
+    user = auth_lib.current_user(request)
+    assert user is not None
+
+    ids = [item for item in (payload.episode_ids or []) if item]
+    if not ids:
+        raise HTTPException(status_code=400, detail="episode_ids 不能为空")
+    if len(ids) > 100:
+        raise HTTPException(status_code=400, detail="一次最多加 100 集")
+
+    db = _db(request)
+    # 只加自己的单集：别人的 id 直接忽略（不报错，也不泄漏它们存在）
+    db.assign_episodes_to_album(album["id"], ids, user_id=user["id"])
+    db.touch_album(album["id"])
+    return await get_album(request, album_id)
+
+
+@router.delete("/albums/{album_id}/episodes/{episode_id}", response_model=AlbumDetail)
+async def remove_album_episode(request: Request, album_id: str, episode_id: str):
+    album = _require_album(request, album_id)
+    user = auth_lib.current_user(request)
+    assert user is not None
+    _db(request).remove_episode_from_album(album["id"], episode_id, user_id=user["id"])
+    _db(request).touch_album(album["id"])
+    return await get_album(request, album_id)
+
+
+# --------------------------------------------------------------------------
+# V2：一键分享
+# --------------------------------------------------------------------------
+
+
+@router.post("/episodes/{episode_id}/share", response_model=Episode)
+async def enable_share(request: Request, episode_id: str):
+    """设为公开并返回分享 token。
+
+    **已有 token 时保持不变**：重复调用不能让已经发出去的链接失效 ——
+    用户点两次「分享」，第二次就把刚才发给别人的链接弄失效，是最恼人的那种 bug。
+    """
+    record = _require_episode(request, episode_id)
+    token = record.get("share_token") or auth_lib.new_share_token()
+    _db(request).update_episode(episode_id, visibility="public", share_token=token)
+    refreshed = _require_episode(request, episode_id)
+    return to_episode(refreshed)
+
+
+@router.delete("/episodes/{episode_id}/share", response_model=Episode)
+async def disable_share(request: Request, episode_id: str):
+    """取消公开：链接立即失效（token 一并清掉）。"""
+    _require_episode(request, episode_id)
+    _db(request).update_episode(episode_id, visibility="private", share_token=None)
+    refreshed = _require_episode(request, episode_id)
+    return to_episode(refreshed)
+
+
+@router.post("/episodes/{episode_id}/share/reset", response_model=Episode)
+async def reset_share(request: Request, episode_id: str):
+    """换一个新 token（旧链接立即失效）。用于「链接被传出去了想收回」。"""
+    _require_episode(request, episode_id)
+    _db(request).update_episode(
+        episode_id, visibility="public", share_token=auth_lib.new_share_token()
+    )
+    refreshed = _require_episode(request, episode_id)
+    return to_episode(refreshed)
+
+
+# --------------------------------------------------------------------------
+# V2：公开分享（**全部免登录**）
+# --------------------------------------------------------------------------
+
+
+def _share_episode(request: Request, token: str) -> dict[str, Any]:
+    record = _db(request).episode_by_share_token(token)
+    if not record:
+        raise HTTPException(status_code=404, detail="分享链接已失效")
+    return record
+
+
+def _share_asset_urls(record: dict[str, Any], token: str | None) -> dict[str, Any]:
+    """封面地址。公开链接走 `/api/share/{token}/cover`（原来的资源接口现在要登录），
+    作者自己看的时候走受保护的 `/api/episodes/{id}/cover`。"""
+    out: dict[str, Any] = {}
+    cover_path = record.get("cover_path")
+    if cover_path and Path(cover_path).exists():
+        out["cover_url"] = (
+            f"{_asset_base(record, token)}/cover?v={_asset_version(cover_path)}"
+        )
+    return out
+
+
+def _asset_base(record: dict[str, Any], token: str | None) -> str:
+    """资源 URL 的前缀。
+
+    - `token` 给了 → `/api/share/{token}`（免登录的公开通道）
+    - 否则 → `/api/episodes/{id}`（受保护通道，请求者就是作者本人）
+
+    两条路走同一套拼装代码，避免「公开页能看、作者自己看却是另一份实现」这种分叉 ——
+    那种分叉迟早会有一边忘了改。
+    """
+    if token:
+        return f"/api/share/{token}"
+    return f"/api/episodes/{record['id']}"
+
+
+def _lang_query_for(language: str | None) -> str:
+    return f"?lang={language}" if language else ""
+
+
+def _share_figures(
+    record: dict[str, Any], token: str | None
+) -> list[dict[str, Any]]:
+    base = _asset_base(record, token)
+    figures = []
+    for figure in record.get("figures") or []:
+        path = figure.get("path")
+        if not path or not Path(path).exists():
+            continue
+        figures.append(
+            {
+                "id": figure["id"],
+                "kind": figure.get("kind") or "figure",
+                "label": figure.get("label") or "",
+                "caption": figure.get("caption") or "",
+                "page": int(figure.get("page") or 1),
+                "url": f"{base}/figures/{figure['id']}?v={_asset_version(path)}",
+                "width": int(figure.get("width") or 0),
+                "height": int(figure.get("height") or 0),
+            }
+        )
+    return figures
+
+
+def _share_version_payload(
+    record: dict[str, Any], token: str | None, version: dict[str, Any]
+) -> dict[str, Any]:
+    base = _asset_base(record, token)
+    language = version.get("language") or _primary_language(record)
+    query = _lang_query_for(language)
+
+    audio_path = version.get("audio_path")
+    audio_url = None
+    if audio_path and Path(audio_path).exists():
+        audio_url = f"{base}/audio{query}&v={_asset_version(audio_path)}"
+
+    video = None
+    video_path = version.get("video_path")
+    if video_path and Path(video_path).exists():
+        stored = version.get("video") or {}
+        video = {
+            "url": f"{base}/video{query}&v={_asset_version(video_path)}",
+            "duration_sec": stored.get("duration_sec"),
+            "scene_count": stored.get("scene_count"),
+            "bytes": stored.get("bytes"),
+            "stale": False,  # 公开页不显示「可以重新合成」这类只有作者在意的状态
+        }
+
+    illustration = None
+    stored_illus = version.get("illustration") or {}
+    if stored_illus.get("png_path") and Path(stored_illus["png_path"]).exists():
+        illustration = {
+            "png_url": (
+                f"{base}/illustration.png{query}&v={_asset_version(stored_illus['png_path'])}"
+            ),
+            "svg_url": (
+                f"{base}/illustration.svg{query}"
+                f"&v={_asset_version(stored_illus.get('svg_path'))}"
+            ),
+            "width": int(stored_illus.get("width") or 0),
+            "height": int(stored_illus.get("height") or 0),
+            "source": stored_illus.get("source") or "fallback",
+        }
+
+    return {
+        "language": language,
+        "paper_meta": version.get("paper_meta"),
+        "analysis": version.get("analysis"),
+        "script": version.get("script"),
+        "illustration": illustration,
+        "audio_url": audio_url,
+        "audio_duration_sec": version.get("audio_duration_sec"),
+        "audio_bytes": version.get("audio_bytes"),
+        "video": video,
+    }
+
+
+def _build_share_view(
+    request: Request,
+    record: dict[str, Any],
+    token: str | None,
+    *,
+    include_author: bool = True,
+) -> dict[str, Any]:
+    """把一期渲染成公开视图。share 链接与首页展示共用它 ——
+
+    共用是刻意的：两处各写一份，迟早会有一边忘了加新字段（比如双语）。
+    """
+    versions = _all_versions(record)
+    payload: dict[str, Any] = {
+        "token": token,
+        "title": record["title"],
+        "language": _primary_language(record),
+        "languages": list(versions.keys()),
+        "versions": {
+            lang: _share_version_payload(record, token, version)
+            for lang, version in versions.items()
+        },
+        "figures": _share_figures(record, token),
+        "created_at": record["created_at"],
+        **_share_asset_urls(record, token),
+    }
+
+    primary = _primary_language(record)
+    surface = payload["versions"].get(primary) or (
+        next(iter(payload["versions"].values())) if payload["versions"] else {}
+    )
+    payload.update(
+        {
+            "paper_meta": surface.get("paper_meta") or record.get("paper_meta"),
+            "analysis": surface.get("analysis"),
+            "script": surface.get("script"),
+            "illustration": surface.get("illustration"),
+            "audio_url": surface.get("audio_url"),
+            "audio_duration_sec": surface.get("audio_duration_sec"),
+            "audio_bytes": surface.get("audio_bytes"),
+            "video": surface.get("video"),
+        }
+    )
+
+    if include_author:
+        owner = _db(request).get_user(record["user_id"]) if record.get("user_id") else None
+        if owner:
+            payload["author"] = ShareAuthor(
+                display_name=owner.get("display_name") or owner["username"]
+            )
+    return payload
+
+
+@router.get("/share/{token}", response_model=ShareView)
+async def get_share(request: Request, token: str):
+    """公开视图。**免登录**。
+
+    刻意不是完整 Episode：不给 id / options / source_ref / raw_text / error，
+    作者是谁也只给展示名。别人拿到链接能看能听，但看不到内部结构。
+    """
+    return _build_share_view(request, _share_episode(request, token), token)
+
+
+@router.get("/share/{token}/video")
+async def get_share_video(request: Request, token: str, lang: str | None = Query(None)):
+    record = _share_episode(request, token)
+    _, version = _resolve_version(request, record, lang)
+    path = version.get("video_path")
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="这一集还没有视频")
+    return _ranged_response(request, Path(path), "video/mp4")
+
+
+@router.get("/share/{token}/audio")
+async def get_share_audio(request: Request, token: str, lang: str | None = Query(None)):
+    record = _share_episode(request, token)
+    _, version = _resolve_version(request, record, lang)
+    path = version.get("audio_path")
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="这一集还没有音频")
+    return _ranged_response(
+        request, Path(path), mimetypes.guess_type(path)[0] or "audio/mpeg"
+    )
+
+
+@router.get("/share/{token}/cover")
+async def get_share_cover(request: Request, token: str):
+    record = _share_episode(request, token)
+    cover_path = record.get("cover_path")
+    if not cover_path:
+        raise HTTPException(status_code=404, detail="这一集还没有封面")
+    return _png_response(Path(cover_path))
+
+
+@router.get("/share/{token}/figures/{figure_id}")
+async def get_share_figure(request: Request, token: str, figure_id: str):
+    record = _share_episode(request, token)
+    for figure in record.get("figures") or []:
+        if figure.get("id") == figure_id:
+            return _png_response(Path(figure.get("path") or ""))
+    raise HTTPException(status_code=404, detail="配图不存在")
+
+
+@router.get("/share/{token}/illustration.png")
+async def get_share_illustration_png(
+    request: Request, token: str, lang: str | None = Query(None)
+):
+    record = _share_episode(request, token)
+    _, version = _resolve_version(request, record, lang)
+    stored = version.get("illustration") or {}
+    if not stored.get("png_path"):
+        raise HTTPException(status_code=404, detail="这一集还没有生成配图")
+    return _png_response(Path(stored["png_path"]))
+
+
+@router.get("/share/{token}/illustration.svg")
+async def get_share_illustration_svg(
+    request: Request, token: str, lang: str | None = Query(None)
+):
+    record = _share_episode(request, token)
+    _, version = _resolve_version(request, record, lang)
+    stored = version.get("illustration") or {}
+    svg_path = stored.get("svg_path")
+    if not svg_path or not Path(svg_path).exists():
+        raise HTTPException(status_code=404, detail="这一集还没有生成配图")
+    return FileResponse(
+        Path(svg_path),
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": _IMAGE_CACHE,
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/share/{token}/script.txt")
+async def get_share_script(request: Request, token: str, lang: str | None = Query(None)):
+    record = _share_episode(request, token)
+    language, version = _resolve_version(request, record, lang)
+    content = render_script_text({**record, **version}, language)
+    filename = _download_filename(record, language, "-脚本.txt")
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{_quote(filename)}"
+        },
+    )
+
+
+@router.get("/share/{token}/analysis.md")
+async def get_share_analysis(request: Request, token: str, lang: str | None = Query(None)):
+    record = _share_episode(request, token)
+    language, version = _resolve_version(request, record, lang)
+    content = render_analysis_markdown({**record, **version}, language)
+    filename = _download_filename(record, language, "-解读.md")
+    return Response(
+        content=content,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{_quote(filename)}"
+        },
+    )
+
+
+@router.get("/showcase", response_model=ShareView)
+async def get_showcase(request: Request):
+    """首页展示用的一期。**免登录** —— 产品介绍页要在登录前就能看到真东西。
+
+    - **登录了**：取自己最新一期已完成的（优先多语言），资源走受保护地址
+    - **没登录**：取最新一期**公开分享**的（作者点过「分享」的那些），资源走 share 地址
+    - 都没有 → `404`，前端把展示区整块隐藏
+
+    为什么不做成「谁都能看所有别人的」：那是把私有数据默认公开了。
+    想看真实产物就先点一下分享 —— 这正好也让分享功能有了用处。
+    """
+    db = _db(request)
+    user = auth_lib.current_user(request)
+
+    picked: dict[str, Any] | None = None
+    if user:
+        candidates, _ = db.list_episodes(
+            limit=20, offset=0, status="completed", user_id=user["id"]
+        )
+        # 优先多语言：一屏就能把「视频 + 双语 + 切换器」三件事讲清楚
+        def language_count(item: dict[str, Any]) -> int:
+            return len((item.get("versions") or {}))
+
+        picked = max(candidates, key=language_count, default=None)
+    else:
+        rows = db.query_public_episodes(limit=20)
+        picked = rows[0] if rows else None
+
+    if not picked:
+        raise HTTPException(status_code=404, detail="还没有可以展示的成品")
+
+    # 作者自己看：资源走 /api/episodes/{id}/…（有 cookie）
+    # 别人看：走 /api/share/{token}/…（公开通道）
+    is_owner = bool(user and picked.get("user_id") == user["id"])
+    token = None
+    if not is_owner:
+        token = picked.get("share_token")
+        if not token:
+            raise HTTPException(status_code=404, detail="还没有可以展示的成品")
+
+    return _build_share_view(request, picked, token, include_author=not is_owner)
+
+
+# --------------------------------------------------------------------------
+# V2：批量生成
+# --------------------------------------------------------------------------
+
+
+def _batch_limit(request: Request) -> int:
+    return max(int(_settings(request).max_batch_size or 20), 1)
+
+
+@router.post("/episodes/batch", status_code=201, response_model=BatchResult)
+async def create_batch(request: Request):
+    """一次提交多篇论文。
+
+    **单项失败不影响其他项**：抓不到的链接进 `failed` 并给出原因，
+    能用的照常入队。一个链接写错就让整批白等，比慢一点糟糕得多。
+    """
+    auth_lib.user_or_401(request)
+    settings = _settings(request)
+    content_type = (request.headers.get("content-type") or "").lower()
+    limit = _batch_limit(request)
+
+    if content_type.startswith("multipart/form-data"):
+        return await _batch_from_upload(request, settings, limit)
+    return await _batch_from_json(request, settings, limit)
+
+
+async def _batch_from_upload(request: Request, settings: Settings, limit: int) -> dict[str, Any]:
+    form = await request.form()
+    uploads = [
+        item
+        for item in form.getlist("files")
+        if isinstance(item, StarletteUploadFile)
+    ]
+    if not uploads:
+        raise HTTPException(status_code=400, detail="缺少 files 字段（PDF 文件，可多选）")
+    if len(uploads) > limit:
+        raise HTTPException(status_code=400, detail=f"一次最多 {limit} 篇")
+
+    episode_options = _parse_options(form, settings)
+    db = _db(request)
+    created: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for upload in uploads:
+        name = upload.filename or "paper.pdf"
+        try:
+            if not name.lower().endswith(".pdf"):
+                raise ValueError("只支持 PDF 文件")
+            data = await upload.read()
+            if not data:
+                raise ValueError("文件是空的")
+            if len(data) > MAX_PDF_BYTES:
+                raise ValueError(f"文件过大（{len(data) // 1024 // 1024}MB）")
+            if data[:5] != b"%PDF-":
+                raise ValueError("不是有效的 PDF（缺少 PDF 文件头）")
+
+            record = db.create_episode(
+                title=Path(name).stem or "未命名论文",
+                source_type="pdf",
+                source_ref=None,
+                options=episode_options,
+                user_id=_current_user_id(request),
+            )
+            target = settings.upload_dir / f"{record['id']}.pdf"
+            target.write_bytes(data)
+            db.update_episode(record["id"], source_ref=str(target))
+            await _queue(request).submit(record["id"])
+            refreshed = db.get_episode(record["id"])
+            assert refreshed is not None
+            created.append(to_episode(refreshed, include_large=False))
+        except (ValueError, OSError) as exc:
+            failed.append({"ref": name, "reason": str(exc)})
+
+    return {"created": created, "failed": failed, "total": len(created) + len(failed)}
+
+
+async def _batch_from_json(request: Request, settings: Settings, limit: int) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+    source_type = payload.get("source_type") or "url"
+    if source_type not in ("url", "text"):
+        raise HTTPException(status_code=400, detail="source_type 只能是 url 或 text")
+
+    raw_items = payload.get("urls") if source_type == "url" else payload.get("texts")
+    if not isinstance(raw_items, list) or not raw_items:
+        key = "urls" if source_type == "url" else "texts"
+        raise HTTPException(status_code=400, detail=f"缺少 {key}（非空数组）")
+    if len(raw_items) > limit:
+        raise HTTPException(status_code=400, detail=f"一次最多 {limit} 篇")
+
+    episode_options = _parse_options(payload.get("options") or {}, settings)
+    custom_title = (payload.get("title") or "").strip()
+    db = _db(request)
+    created: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for item in raw_items:
+        ref = str(item or "").strip()
+        try:
+            if source_type == "url":
+                if not re.match(r"^https?://", ref, re.I):
+                    raise ValueError("链接必须以 http:// 或 https:// 开头")
+                text, _, _ = fetch_url_text(ref)
+                title = custom_title or guess_title(text, fallback="链接论文")
+                record = db.create_episode(
+                    title=title,
+                    source_type="url",
+                    source_ref=ref,
+                    options=episode_options,
+                    user_id=_current_user_id(request),
+                )
+            else:
+                if len(ref) < 200:
+                    raise ValueError("文本太短（少于 200 字）")
+                record = db.create_episode(
+                    title=custom_title or guess_title(ref, fallback="粘贴的论文"),
+                    source_type="text",
+                    source_ref=None,
+                    options=episode_options,
+                    user_id=_current_user_id(request),
+                )
+                db.update_episode(record["id"], raw_text=ref)
+
+            await _queue(request).submit(record["id"])
+            refreshed = db.get_episode(record["id"])
+            assert refreshed is not None
+            created.append(to_episode(refreshed, include_large=False))
+        except (IngestError, ValueError) as exc:
+            failed.append({"ref": ref[:120], "reason": str(exc)})
+
+    return {"created": created, "failed": failed, "total": len(created) + len(failed)}
+
+
+# --------------------------------------------------------------------------
 # 查询 / 管理
 # --------------------------------------------------------------------------
 
@@ -575,16 +1410,33 @@ async def list_episodes(
     offset: int = Query(0, ge=0),
     status: str | None = Query(None),
     q: str | None = Query(None),
+    album: str | None = Query(None),
+    album_id: str | None = Query(None),
 ):
+    """**只返回自己的单集**。开放模式下没有 user，返回全部（那时也没别人）。
+
+    `album=` 传专辑 id 只看那一辑；传 `none` 看没归辑的。
+    """
     valid_status = {"queued", "parsing", "analyzing", "scripting", "synthesizing", "completed", "failed"}
     if status and status not in valid_status:
         raise HTTPException(status_code=400, detail=f"未知状态：{status}")
+
+    user = auth_lib.user_or_401(request)
+    wants_album = album_id or album
+
+    if wants_album and wants_album != "none":
+        # 先校验专辑归属：否则拿别人的专辑 id 会得到一个「空列表」，
+        # 看起来像「这辑里没东西」，实际是「这不是你的辑」
+        _require_album(request, wants_album)
 
     records, total = _db(request).list_episodes(
         limit=limit,
         offset=offset,
         status=status or None,
         q=(q or "").strip() or None,
+        user_id=user["id"] if user else None,
+        album_id=None if wants_album in (None, "none") else wants_album,
+        unassigned_only=wants_album == "none",
     )
     return {"items": [to_episode(r, include_large=False) for r in records], "total": total}
 

@@ -6,6 +6,8 @@
 豆包方舟（Ark）作为大模型备选，用 `LLM_PROVIDER` 切换。
 **无密钥也能跑**：缺哪个密钥，哪一步就自动降级为 Mock。
 **同一集可以内嵌中英两版**（`LANGUAGES=zh,en`），前端切换器切语言，配图跨语言共用。
+**V2 起有账号**：每集归属个人、默认只有自己可见；点「分享」拿到免登录公开链接。
+另有个人专辑与批量生成。认证实现在 `backend/app/auth.py`。
 
 ## 常用命令
 
@@ -33,8 +35,17 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 
 ## 关键约定
 
-- **`docs/API.md` 是前后端的唯一契约**。改接口先改它，字段名不许各自发明。
+- **`docs/API.md` 是前后端的唯一契约**（当前 v2）。改接口先改它，字段名不许各自发明。
   列表接口要省略 `analysis`/`script` 大字段（否则列表响应会到 MB 级）。
+- **新增受保护接口时必须挂鉴权**。`auth_lib.user_or_401(request)` 是统一入口：
+  已登录返回 user、未登录且库里一个用户都没有（开放模式）返回 None 放行、否则 401。
+  单集/专辑一律用 `_require_episode()` / `_require_album()` 取 —— 它们**顺带校验归属**。
+  漏一个资源接口就是一条免费的下载通道，加接口时先想清楚这条。
+- **越权返回 404，不返回 403**。403 等于告诉对方「这个 id 真实存在，只是不是你的」，
+  拿它枚举一遍就能摸出别人的数据规模。
+- **免登录白名单只有这几个**：`/api/health`（前端要靠它判该不该跳登录页）、
+  `/api/options`（音色目录，首页登录前也要能显示）、`/api/auth/{me,login,register,logout}`、
+  `/api/share/*`、`/api/showcase`。往这个名单里加东西前先问一句「这真的可以公开吗」。
 - **密钥只在后端**（`.env`，已被 gitignore）。前端任何地方不得出现
   `DEEPSEEK_API_KEY` / `ARK_API_KEY` / `DOUBAO_*`。
 - **Prompt 改动要跑测试**。`backend/app/services/prompts.py` 是本产品的核心资产，
@@ -216,14 +227,47 @@ cd frontend && pnpm typecheck && VITE_USE_MOCK=1 pnpm build
 - **`_voices_for()` 按语言换音色**。中文音色念英文虽然也能出声，但口音很明显；
   用户只在前端选过一次音色（主语言那一档），英文版必须换 `DEFAULT_VOICE_A_EN/B_EN`。
 
+### 账号与分享（V2）
+
+- **口令用标准库 `hashlib.scrypt`**，不引 bcrypt/argon2。存 `scrypt$n$r$p$salt$hash`，
+  每用户独立 salt。比对必须用 `hmac.compare_digest` —— 用 `==` 会因为提前返回
+  而泄漏前缀匹配长度，这是几行代码就能堵上的洞。
+- **用户名要显式判 `isascii()`**。`str.isalnum()` 对中日韩字符也返回 True，
+  只写 `isalnum()` 的话「中文名」会被当成合法用户名放过去（写测试时逮到的）。
+- **登录失败时，用户不存在也要跑一次哈希校验**。否则「用户名不存在」比「口令错」
+  快得多，从响应时间上就能枚举出哪些用户名真实存在。
+  两种失败的提示必须一模一样。
+- **注册即登录**，会话只用 **httpOnly cookie**（`SameSite=Lax`，30 天）。前端拿不到 token，
+  XSS 也偷不走。`COOKIE_SECURE=true` 只能在 HTTPS 下开，本地 http 开了会一直登不上。
+- **开放模式**：库里一个用户都没有时不需要登录。这样刚部署完能直接用。
+  **第一个注册的用户认领所有无主单集**（`claim_orphan_episodes`）——
+  没有这一步，V1 时代攒的数据在升级后会变成「文件还在磁盘上、接口永远不返回」的孤儿。
+- **`is_open_mode()` 每次都查一次 COUNT**，不做缓存。SQLite 上这是微秒级，
+  而缓存需要一个必须手动维护的失效逻辑 —— 那才是真正容易出错的地方。
+- **改口令只能删「其他」会话**（`delete_other_sessions`）。第一版写成「先全删再补回当前这条」，
+  结果漏了补回那步，用户改完口令自己就被踢出去了 —— 被测试逮住。
+- **分享链接是「开关 + 可重置的 token」**：`visibility` 决定看不看得到，
+  `share_token` 是地址。取单集时必须**同时**匹配 `visibility='public'`，
+  不能只看 token 在不在 —— 否则取消分享那一刻旧链接还是通的。
+- **重复点「分享」不能换 token**。用户点两次就把刚发给别人的链接弄失效，是最恼人的那种 bug。
+- **公开视图是单独构造的**，不是把 Episode 删几个字段：不含 `id`/`options`/`source_ref`/
+  `raw_text`/`error`/`user_id`，作者也只给展示名。白名单式构造，不是黑名单式删减。
+- **公开页的资源必须另开一条路**（`/api/share/{token}/…`）。原来的资源接口现在要登录，
+  公开页拿不到 cookie。两条路的 URL 拼装**共用同一套函数**（`_asset_base`），
+  否则迟早有一边忘了加新字段（比如双语）。
+- **专辑是分组不是容器**：删专辑只把单集的 `album_id` 置空，绝不删单集。
+- **批量生成要「单项失败不影响其他项」**。一个链接写错就让整批白等，比慢一点糟糕得多。
+  抓不到的进 `failed` 并给出原因，能用的照常入队。
+
 ## 结构
 
 ```
 backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟) podcast_tts(语音)
                           figures(PDF封面+论文原图) illustration(生成信息图)
                           video(视频合成) pipeline(编排) branding(社区话术)
+backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            325 项，改完必须全绿
+backend/tests/            384 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

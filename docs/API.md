@@ -1,4 +1,4 @@
-# 前后端接口契约（冻结版 v1）
+# 前后端接口契约（冻结版 v2）
 
 后端：FastAPI，默认 `http://127.0.0.1:8000`，所有业务接口前缀 `/api`。
 前端：Vue3 + Vite，开发态用 Vite proxy 把 `/api` 转发到后端。
@@ -138,6 +138,33 @@
 详情接口才返回完整内容。但 **`cover_url` 在列表里保留**，
 因为列表卡片要显示封面缩略图。
 
+### 账号、归属与可见性（V2）
+
+V2 起每集属于一个用户，并且可以对外分享。三个字段：
+
+```jsonc
+{
+  "user_id": "u_3f2a1b",        // 归属用户；null = 无主（V1 时代留下的数据）
+  "visibility": "private",        // "private" | "public"
+  "share_token": null             // visibility=public 时才有值，公开分享用的随机串
+}
+```
+
+- **归属**：`GET /api/episodes` 只返回**自己的**（`user_id` 等于当前用户）单集。
+  别人的单集一律 404 —— 不用 403，避免把「存在但不是你的」这个信息漏出去。
+- **可见性**：`private` 只有作者能看；`public` 任何人拿到 `share_token` 都能看（免登录）。
+- **分享链接**：`/api/share/{token}`，`token` 可以重置（换链接等于失效旧链接）。
+
+### 开放模式（bootstrap）
+
+**库里一个用户都没有时，应用处于开放模式**：不需要登录，所有单集对所有访问者可见，
+行为与 V1 完全一致。这是为了「刚部署完、还没建账号」时能直接用。
+
+**第一个注册成功的用户会认领所有无主单集**（`user_id IS NULL` → 归他）。
+认领之后应用立刻进入需要登录的状态，其他人访问会拿到 401。
+
+这样 V1 时代攒下的数据不会因为上 V2 而变成谁也看不到的孤儿。
+
 ### 状态机
 
 | status | progress | stage_label（示例） | 含义 |
@@ -161,13 +188,18 @@
 ### `GET /api/health`
 
 ```json
-{ "status": "ok", "version": "0.1.0",
-  "modes": { "llm": "deepseek", "tts": "doubao" } }
+{ "status": "ok", "version": "0.2.0",
+  "modes": { "llm": "deepseek", "tts": "doubao" },
+  "mode": "auth" }
 ```
 
 `modes.llm` 取值 `"deepseek"` | `"doubao"` | `"mock"`。
 `modes.tts` 取值 `"doubao"` | `"mock"`。
 前端在顶栏显示对应角标（Mock 时提示「Mock 模式」）。
+
+`mode`（V2）取值 `"open"` | `"auth"`：库里还没有任何用户时是 `"open"`（见「开放模式」），
+此时前端不显示登录入口、也不带 cookie 直接访问。**这个接口本身免登录**，
+否则前端没法知道该不该跳登录页。
 
 ### `GET /api/options`
 
@@ -353,16 +385,229 @@ range 请求探测 moov box）。无视频时 `404`。
 
 ---
 
+---
+
+## 2.5 账号与会话（V2）
+
+### `POST /api/auth/register`
+
+```jsonc
+{ "username": "guo", "password": "至少 8 位", "display_name": "Guo", "signup_code": "可选" }
+```
+
+- `201` → `{ "user": User }`，响应同时 `Set-Cookie: pp_session=...`（等于注册即登录）。
+- `409` 用户名已被占用；`400` 参数不合法；`403` 邀请码不对。
+- 服务端设了 `SIGNUP_CODE` 时 `signup_code` 必填且必须一致；没设则开放注册。
+- **第一个用户会认领所有无主单集**（见「开放模式」）。
+
+### `POST /api/auth/login`
+
+`{ "username": "...", "password": "..." }` → `200 { "user": User }` + `Set-Cookie`。
+用户名或口令错都是 `401 {"detail": "用户名或口令不正确"}`（不区分，别提示是哪一个错）。
+
+### `POST /api/auth/logout`
+
+`204`，清除 cookie 并删除会话。未登录时也返回 `204`（幂等）。
+
+### `POST /api/auth/password`
+
+`{ "current_password": "...", "new_password": "..." }` → `204`。
+
+必须带旧口令（否则会话 cookie 被偷就等于永久接管账号）。
+改完**删除该用户的其他所有会话，只保留当前这一个** ——
+口令换了但别处还挂着旧会话，是最常见的「明明改了密码还是被盗」。
+
+### `GET /api/auth/me`
+
+`200 { "user": User }`；未登录 `401`。前端启动时用它判断登录态。
+
+```jsonc
+// User
+{
+  "id": "u_3f2a1b",
+  "username": "guo",
+  "display_name": "Guo",
+  "created_at": "2025-01-01T12:00:00+00:00"
+}
+```
+
+### 鉴权规则
+
+- 会话走 **httpOnly cookie** `pp_session`（`SameSite=Lax`，`Path=/`，有效期 30 天）。
+  前端拿不到 token，也不该拿 —— XSS 偷不走。
+- **需要登录的接口**：除了下面这几个，其余全部。包括音频/视频/配图这些资源接口 ——
+  否则别人猜个 id 就能下载全部内容。
+- **免登录接口**：`GET /api/health`、`GET /api/options`、`GET /api/auth/me`、
+  `POST /api/auth/login`、`POST /api/auth/register`、`POST /api/auth/logout`、
+  `GET /api/share/*`、`GET /api/showcase`。
+- 未登录访问受保护接口 → `401 {"detail": "需要登录"}`；开放模式下不返回 401。
+- 登录后 `GET /api/health` 会多一个 `"mode": "open" | "auth"` 字段，
+  前端据此决定要不要显示登录入口（开放模式下不显示，避免误导）。
+
+### 用户信息
+
+| 字段 | 说明 |
+|---|---|
+| `id` | `u_` + 6 位十六进制 |
+| `username` | 登录名，3-32 位，只允许字母数字下划线连字符，唯一 |
+| `display_name` | 展示名，可为空（前端回退到 `username`） |
+
+口令**永不返回**。服务端用标准库 `hashlib.scrypt` 加盐哈希（每个用户独立 salt），
+不引入 bcrypt/argon2 依赖。
+
+---
+
+## 2.6 个人专辑（V2）
+
+专辑是「把几期播客归到一起」的简单分组，用于做主题合集。
+
+```jsonc
+// Album
+{
+  "id": "al_9c1d2e",
+  "title": "Transformer 系列",
+  "description": "从 Attention 到后续跟进工作",   // 可空
+  "episode_count": 3,
+  "cover_url": "/api/episodes/xxx/cover?v=...",  // 取专辑里最新一集的封面，没单集时为 null
+  "created_at": "...",
+  "updated_at": "..."
+}
+```
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/albums` | 自己的专辑列表，按 `updated_at` 倒序 |
+| `POST /api/albums` | `{ "title": "...", "description": null }` → `201 Album` |
+| `GET /api/albums/{id}` | `200 Album`（**附带 `episodes: Episode[]`**，只含 `include_large=false` 的摘要） |
+| `PATCH /api/albums/{id}` | `{ "title"?, "description"? }` → `200 Album` |
+| `DELETE /api/albums/{id}` | `204`。**只删专辑，不删里面的单集**（单集的 `album_id` 置空） |
+| `POST /api/albums/{id}/episodes` | `{ "episode_ids": ["a", "b"] }` → `200 Album`（批量加入，幂等） |
+| `DELETE /api/albums/{id}/episodes/{episode_id}` | `200 Album`（移出） |
+
+别的用户的专辑一律 404。往专辑里加别人的单集 → `404`。
+
+---
+
+## 2.7 一键分享（V2）
+
+作者把自己的某一集设为公开，拿到一条免登录链接。
+
+### `POST /api/episodes/{id}/share`
+
+`200 Episode`。副作用：`visibility` 置 `public`；
+`share_token` 为空时生成一个（已有则**保持不变**，重复调用不会让已发出去的链接失效）。
+
+### `DELETE /api/episodes/{id}/share`
+
+`200 Episode`。`visibility` 置 `private`，`share_token` 置 `null`（链接立即失效）。
+
+### `POST /api/episodes/{id}/share/reset`
+
+`200 Episode`。换一个新 token（旧链接立即失效，用于「链接被传出去了想收回」）。
+
+### `GET /api/share/{token}` （免登录）
+
+`200`，返回一个**精简**的公开视图（不是完整 Episode）：
+
+```jsonc
+{
+  "token": "…",
+  "title": "Attention Is All You Need",
+  "paper_meta": { … },
+  "language": "zh",
+  "languages": ["zh", "en"],
+  "cover_url": "/api/share/{token}/cover?v=…",
+  "video": { "url": "/api/share/{token}/video?lang=zh", "duration_sec": 191.7, … },
+  "audio_url": "/api/share/{token}/audio?lang=zh",
+  "audio_duration_sec": 191.7,
+  "script": { "segments": [...], "word_count": 1146, "est_duration_sec": 190 },
+  "analysis": { … },
+  "figures": [ { "id": "f1", "label": "Figure 1", "url": "/api/share/{token}/figures/f1?v=…" } ],
+  "versions": { "zh": { … }, "en": { … } },
+  "author": { "display_name": "Guo" },     // 展示用，不含 username/id
+  "created_at": "…"
+}
+```
+
+公开视图里**不含**：`options`（音色/参数）、`source_ref`（可能带内部路径）、`raw_text`、
+`error`、`id`（用 token 代替）、作者 id。
+
+### 公开资源（免登录）
+
+`GET /api/share/{token}/cover`、`/video`、`/audio`、`/figures/{fid}`、
+`/illustration.png`、`/illustration.svg`、`/script.txt`、`/analysis.md`
+
+都支持 `?lang=`，语义与受保护版本完全一致（含 Range 请求）。token 失效或那一集不再公开 → `404`。
+
+---
+
+## 2.8 批量生成（V2）
+
+一次提交多篇论文，串行入队（worker 本来就是串行消费，批量只是省掉重复操作）。
+
+### `POST /api/episodes/batch`
+
+两种 Content-Type，与 `POST /api/episodes` 一致：
+
+**A. `multipart/form-data`**：`files` 字段**可以出现多次**（多选 PDF），
+外加 `duration_min` / `level` / `language` / `languages` 等同 `POST /api/episodes`。
+
+**B. `application/json`**：
+
+```jsonc
+{
+  "source_type": "url",           // "url" | "text"
+  "urls": ["https://arxiv.org/pdf/1706.03762", "…"],
+  "texts": null,                  // source_type=text 时用，每个元素是一篇
+  "options": { "duration_min": 5, "level": "intro", "languages": ["zh"] }
+}
+```
+
+响应 `201`：
+
+```jsonc
+{
+  "created": [ /* Episode（include_large=false 的摘要），status="queued" */ ],
+  "failed": [ { "ref": "https://…", "reason": "链接不可抓取" } ],
+  "total": 3
+}
+```
+
+- **单项失败不影响其他项**：抓不到的链接进 `failed`，好的照常入队。
+- 上限 **20 篇/次**，超了返回 `400`。
+- 单篇参数沿用 `options`；每篇的标题各自推断。
+
+---
+
+## 2.9 关键词高亮（V2）
+
+**没有接口变更**。前端用 `paper_meta.keywords` 在脚本与解读正文里做高亮，
+详情页给一个开关（默认开），关掉后是纯文本。
+
+关键词是模型从论文里抽的，可能是英文而正文是中文（或反过来），
+所以匹配规则是**大小写不敏感的原文包含**，不做翻译映射 —— 对不上就不高亮，
+不要为了实现高亮去编造对应词。
+
 ## 3. 前端页面与接口映射
 
 | 页面 | 路由 | 用到的接口 |
 |---|---|---|
 | 首页（产品介绍） | `/` | `GET /api/episodes?status=completed`、`GET /api/episodes/{id}`（拿一期真实产物做展示）、`GET /api/health` |
-| 生成新播客 | `/create` | `POST /api/episodes`、`GET /api/options`、`GET /api/health` |
+| 生成新播客 | `/create` | `POST /api/episodes`、`POST /api/episodes/batch`、`GET /api/options` |
 | 任务进度 | `/task/:id` | `GET /api/episodes/{id}`（轮询）、`POST .../retry` |
-| 播客库 | `/library` | `GET /api/episodes`、`DELETE /api/episodes/{id}` |
-| 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../video`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md` |
+| 播客库 | `/library` | `GET /api/episodes`、`DELETE /api/episodes/{id}`、`PATCH`（改可见性/专辑） |
+| 专辑列表 | `/albums` | `GET /api/albums`、`POST /api/albums` |
+| 专辑详情 | `/albums/:id` | `GET /api/albums/{id}`、`PATCH`、`DELETE`、`POST .../episodes` |
+| 详情播放 | `/episode/:id` | `GET /api/episodes/{id}`、`.../video`、`.../audio`、`.../cover`、`.../figures/{fid}`、`.../illustration.svg`、`.../script.txt`、`.../analysis.md`、`POST .../share` |
+| **公开分享** | `/share/:token` | `GET /api/share/{token}`、`/api/share/{token}/…`（**免登录**） |
+| 登录 / 注册 | `/login` | `POST /api/auth/login`、`POST /api/auth/register`、`GET /api/auth/me` |
 | 设置 | `/settings` | `GET /api/options`、`GET /api/health`（本地存储偏好） |
+
+**登录态与路由**：`GET /api/auth/me` 返回 401 时，把用户挡在 `/login`；
+`/share/:token` 例外（免登录）。开放模式（库里还没用户）下不跳登录页。
+
+**前端启动顺序**：先 `GET /api/health` 拿 `mode`，再 `GET /api/auth/me`。
+`mode="open"` 时不请求 `/login`、不显示用户区 —— 此时后端还没建账号。
 
 **首页是产品介绍页，不是表单**：导入表单在 `/create`。
 首页的产品展示区读库里最近一期**已完成**的播客，把真实的视频/音频/脚本/解读/配图摆出来；

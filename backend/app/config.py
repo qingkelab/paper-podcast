@@ -24,12 +24,24 @@ class Settings(BaseSettings):
 
     # ---- 基础 ----
     app_name: str = "论文解读 AI 播客"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     host: str = "127.0.0.1"
     port: int = 8000
 
     # 允许的前端来源，逗号分隔；"*" 表示不限制（仅本地开发用）
     cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+
+    # ---- 账号与会话（V2）----
+    # 注册邀请码。留空 = 开放注册；设了就必填且必须一致 ——
+    # 公开部署时这是挡住陌生人的第一道门，比「每天限次数」直接。
+    signup_code: str = ""
+    # 会话有效期（天）
+    session_ttl_days: int = 30
+    # 会话 cookie 是否只在 HTTPS 下发送。本地 http 调试必须关掉，否则 cookie 根本存不下。
+    # 生产环境（有域名 + 证书）应当置 true。
+    cookie_secure: bool = False
+    # 单次批量生成的论文数上限
+    max_batch_size: int = 20
 
     # ---- 存储 ----
     data_dir: Path = PROJECT_ROOT / "data"

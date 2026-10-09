@@ -154,6 +154,13 @@ class Episode(BaseModel):
     created_at: str
     updated_at: str
 
+    # --- V2：归属 / 可见性 / 专辑 -------------------------------------------
+    # user_id 故意**不下发**（前端不需要知道，也没法验证别人的 id）。
+    # 分享链接的 token；private 时为 null
+    share_token: str | None = None
+    visibility: Visibility = "private"
+    album_id: str | None = None
+
 
 class EpisodeListItem(Episode):
     """列表接口：省略 analysis / script / versions 大字段。
@@ -193,6 +200,142 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str
     modes: dict[str, str]
+    # V2："open" = 库里还没用户，不需要登录；"auth" = 需要登录。
+    # 前端据此决定要不要跳登录页 —— 所以这个接口本身免登录。
+    mode: Literal["open", "auth"] = "open"
+
+
+# --------------------------------------------------------------------------
+# V2：账号 / 专辑 / 分享 / 批量
+# --------------------------------------------------------------------------
+
+Visibility = Literal["private", "public"]
+
+
+class User(BaseModel):
+    """对外的用户信息。**永远不含 password_hash**。"""
+
+    id: str
+    username: str
+    display_name: str = ""
+    created_at: str
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    display_name: str = ""
+    signup_code: str = ""
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class Album(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    episode_count: int = 0
+    # 用专辑里最新一集的封面当专辑封面；没有单集时为 null
+    cover_url: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class AlbumDetail(Album):
+    """专辑详情：附带里面单集的摘要列表。
+
+    用 `EpisodeListItem` 而不是完整 Episode —— 一个专辑可能装十几期，
+    带全量 analysis/script/figures/video 会让响应到 MB 级。
+    """
+
+    episodes: list["EpisodeListItem"] = Field(default_factory=list)
+
+
+class AlbumWriteRequest(BaseModel):
+    title: str | None = None
+    description: str | None = None
+
+
+class AlbumAssignRequest(BaseModel):
+    episode_ids: list[str] = Field(default_factory=list)
+
+
+class BatchRequest(BaseModel):
+    """批量生成。urls 与 texts 二选一（由 source_type 决定）。"""
+
+    source_type: Literal["url", "text"] = "url"
+    urls: list[str] | None = None
+    texts: list[str] | None = None
+    title: str | None = None
+    options: EpisodeOptions = Field(default_factory=EpisodeOptions)
+
+
+class BatchFailure(BaseModel):
+    ref: str
+    reason: str
+
+
+class BatchResult(BaseModel):
+    """批量结果。**单项失败不影响其他项** —— failed 里逐条给出原因。"""
+
+    created: list["EpisodeListItem"] = Field(default_factory=list)
+    failed: list[BatchFailure] = Field(default_factory=list)
+    total: int = 0
+
+
+class ShareAuthor(BaseModel):
+    """公开页只露展示名，不给 username / id。"""
+
+    display_name: str
+
+
+class ShareView(BaseModel):
+    """免登录的公开视图。
+
+    刻意**不是**完整 Episode：不含 id / options / source_ref / raw_text / error /
+    figures 的磁盘路径。别人拿到 token 能看内容，但看不到内部结构。
+    """
+
+    # 公开分享时是 share token；首页展示「自己的那一期」时为 null
+    token: str | None = None
+    title: str
+    paper_meta: PaperMeta | None = None
+    language: Language = "zh"
+    languages: list[Language] = Field(default_factory=list)
+    versions: dict[str, "ShareVersion"] = Field(default_factory=dict)
+    cover_url: str | None = None
+    cover_width: int | None = None
+    cover_height: int | None = None
+    figures: list[Figure] = Field(default_factory=list)
+    illustration: Illustration | None = None
+    video: VideoInfo | None = None
+    audio_url: str | None = None
+    audio_duration_sec: float | None = None
+    audio_bytes: int | None = None
+    script: Script | None = None
+    analysis: Analysis | None = None
+    author: ShareAuthor | None = None
+    created_at: str
+
+
+class ShareVersion(BaseModel):
+    language: Language
+    script: Script | None = None
+    analysis: Analysis | None = None
+    paper_meta: PaperMeta | None = None
+    illustration: Illustration | None = None
+    audio_url: str | None = None
+    audio_duration_sec: float | None = None
+    audio_bytes: int | None = None
+    video: VideoInfo | None = None
 
 
 class OptionItem(BaseModel):
