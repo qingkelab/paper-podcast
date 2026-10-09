@@ -20,6 +20,7 @@ from app.services.video import (
     FADE_IN_SEC,
     IMAGE_BOX_H,
     IMAGE_BOX_LEFT,
+    IMAGE_BOX_W,
     IMAGE_TOP,
     TRANSITION_MAX_RATIO,
     TRANSITION_MIN_SEC,
@@ -65,9 +66,12 @@ from app.services.video import (
     point_char_limit,
     progress_bar_svg,
     layout_for,
+    normalize_focus,
+    normalize_point_items,
     plan_transitions,
     render_caption_band,
     render_chrome,
+    render_focus_overlay,
     render_endcard,
     render_image_card,
     render_point_row,
@@ -2244,3 +2248,183 @@ class TestLandscapeApi:
             )
             assert response.status_code == 400
             assert "未知画幅" in response.json()["detail"]
+
+
+class TestFocusBox:
+    """图内聚光灯的坐标整理。
+
+    这是「让图跟着讲解动」的第一步，但它**必须框对地方** ——
+    框错了观众会以为那块真的在讲那个，比不框更糟。所以边界收得很紧。
+    """
+
+    def test_accepts_a_normal_box(self):
+        focus = normalize_focus({"x": 0.05, "y": 0.1, "w": 0.4, "h": 0.3, "label": "编码器"})
+        assert focus == {"x": 0.05, "y": 0.1, "w": 0.4, "h": 0.3, "label": "编码器"}
+
+    def test_rejects_pixel_coordinates(self):
+        """模型偶尔会给像素坐标。
+
+        归一化里没法反推「这张图有多大」，所以宁可这一帧不框 ——
+        猜错会框到画面的角落，而框错地方比不框更糟。
+        """
+        assert normalize_focus({"x": 120, "y": 80, "w": 600, "h": 400}) is None
+        assert normalize_focus({"x": 0.2, "y": 0.3, "w": 0.6, "h": 0.7})["w"] == pytest.approx(0.6)
+
+    def test_clamps_to_the_image(self):
+        focus = normalize_focus({"x": 0.8, "y": 0.8, "w": 0.9, "h": 0.9})
+        assert focus is not None
+        assert focus["x"] + focus["w"] <= 1.0001
+        assert focus["y"] + focus["h"] <= 1.0001
+
+    def test_rejects_tiny_or_invalid(self):
+        assert normalize_focus({"x": 0.1, "y": 0.1, "w": 0.01, "h": 0.01}) is None
+        assert normalize_focus({"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}) is None, "面积太小也不框"
+        assert normalize_focus({"x": "a", "y": 0, "w": 1, "h": 1}) is None
+        assert normalize_focus(None) is None
+        assert normalize_focus("别框了") is None
+
+    def test_label_is_trimmed(self):
+        focus = normalize_focus({"x": 0, "y": 0, "w": 0.5, "h": 0.5, "label": "这是一个非常长的标签超过十六个字"})
+        assert focus is not None and len(focus["label"]) <= 16
+
+    def test_point_items_carry_both_point_and_focus(self):
+        items = normalize_point_items(
+            [
+                {"segment": 0, "point": "成功率 67%", "focus": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.3}},
+                {"segment": 1, "point": "过渡", "focus": None},
+            ],
+            count=2,
+        )
+        assert items[0]["point"] == "成功率 67%"
+        assert items[0]["focus"]["w"] == pytest.approx(0.3)
+        assert items[1] == {"point": "过渡", "focus": None}
+
+    def test_points_prompt_asks_for_focus_and_warns_against_guessing(self):
+        zh = build_points_messages([{"text": "第一段"}], title="T", image_captions=["Figure 1: 编码器"])
+        system = zh[0]["content"]
+        assert "focus" in system and "框错地方比不框更糟" in system
+        assert "Figure 1: 编码器" in zh[1]["content"], "要告诉模型这一段配的是哪张图"
+
+        en = build_points_messages([{"text": "seg"}], title="T", language="en", image_captions=["Figure 1"])
+        assert "wrong place is worse" in en[0]["content"]
+        assert "Figure 1" in en[1]["content"]
+
+
+@pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
+class TestFocusIsRendered:
+    """聚光灯要真的压暗了「不是重点」的地方，而且没有把重点本身压暗。"""
+
+    FOCUS = {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5, "label": "重点"}
+
+    def _encode(self, tmp_path: Path, *, with_focus: bool = True) -> tuple[Path, Path]:
+        import wave
+
+        image = self._pattern(tmp_path / "fig.png")
+        scene = Scene(
+            start=0,
+            end=3.0,
+            image=image,
+            kind="figure",
+            speaker="A",
+            text="第一段。",
+            focus=dict(self.FOCUS) if with_focus else None,
+        )
+        chrome = render_chrome(scene, tmp_path / "chrome.png", title="测试")
+        card = render_image_card(scene, tmp_path / "card.png")
+        rows: list[Path | None] = [None]
+        if with_focus:
+            rows = [render_focus_overlay(scene, tmp_path / "focus.png", focus=dict(self.FOCUS))]
+
+        audio = tmp_path / "a.wav"
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 3)
+
+        out = tmp_path / "focus.mp4"
+        encode_video(
+            [scene],
+            [chrome],
+            audio,
+            out,
+            target_duration=3.0,
+            image_cards=[card],
+            focus_overlays=rows,
+            waveform=False,
+            transitions=plan_transitions([scene], ["x"], cards=[card]),
+        )
+        return out, card
+
+    @staticmethod
+    def _pattern(path: Path) -> Path:
+        """整张图都是深色：压暗白蒙版一盖就明显变亮，方不方便量。"""
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 700, 500), False)
+        pix.set_rect(pix.irect, (40, 40, 40))
+        pix.save(str(path))
+        return path
+
+    def _frame(self, video: Path, seconds: float, out: Path) -> Path:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(video), "-ss", f"{seconds:.3f}",
+             "-frames:v", "1", str(out)],
+            capture_output=True, text=True, check=True,
+        )
+        return out
+
+    @staticmethod
+    def _at(frame: Path):
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(frame))
+        n, width = pix.n, pix.width
+        samples = pix.samples
+
+        def at(x: int, y: int):
+            index = (y * width + x) * n
+            return (samples[index], samples[index + 1], samples[index + 2])
+
+        return at
+
+    def test_outside_is_dimmed_and_inside_is_not(self, tmp_path):
+        video, _ = self._encode(tmp_path)
+        at = self._at(self._frame(video, 1.5, tmp_path / "f.png"))
+        # 图片在卡里居中：700×500 的图放进 896×742 → 居中，四周留白
+        img_left = IMAGE_BOX_LEFT + (IMAGE_BOX_W - 700) / 2
+        img_top = IMAGE_TOP + (IMAGE_BOX_H - 500) / 2
+        inside = at(int(img_left + 0.5 * 700), int(img_top + 0.5 * 500))
+        outside = at(int(img_left + 0.08 * 700), int(img_top + 0.08 * 500))
+        assert outside[0] > 150, f"框外应当被白蒙版压亮：{outside}"
+        assert inside[0] < 80, f"框内应当保持原图（深色）：{inside}"
+        assert outside[0] > inside[0] + 60, "框内外的明暗差不够，聚光灯没生效"
+
+    def test_no_focus_means_no_dimming(self, tmp_path):
+        video, _ = self._encode(tmp_path, with_focus=False)
+        at = self._at(self._frame(video, 1.5, tmp_path / "n.png"))
+        img_left = IMAGE_BOX_LEFT + (IMAGE_BOX_W - 700) / 2
+        img_top = IMAGE_TOP + (IMAGE_BOX_H - 500) / 2
+        corner = at(int(img_left + 0.08 * 700), int(img_top + 0.08 * 500))
+        assert corner[0] < 80, f"没有聚光灯时不该压暗：{corner}"
+
+
+class TestFocusRejectsUselessBoxes:
+    """实测出来的两种「没用的框」，都要挡掉。
+
+    模型（DeepSeek，纯文本、看不到图）第一次给回的是**整张图**（`w=1,h=1`）外加一个图名，
+    第二次给了像素坐标。两种都等于没框，甚至更糟：整张图盖上蒙版只是把图压暗一圈。
+    """
+
+    def test_rejects_full_frame(self):
+        assert normalize_focus({"x": 0, "y": 0, "w": 1, "h": 1, "label": "四比特精度表"}) is None
+        assert normalize_focus({"x": 0.02, "y": 0.02, "w": 0.96, "h": 0.96}) is None
+
+    def test_accepts_a_real_sub_region(self):
+        focus = normalize_focus({"x": 0.55, "y": 0.1, "w": 0.4, "h": 0.5, "label": "右侧曲线"})
+        assert focus is not None and focus["w"] == pytest.approx(0.4)
+
+    def test_rejects_pixels_and_garbage(self):
+        assert normalize_focus({"x": 600, "y": 400, "w": 300, "h": 200}) is None
+        assert normalize_focus({"x": "左", "y": 0, "w": 1, "h": 1}) is None
+        assert normalize_focus([]) is None

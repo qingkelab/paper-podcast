@@ -31,6 +31,7 @@ import base64
 import html
 import re
 import logging
+import math
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -282,6 +283,26 @@ WAVEFORM_WIDTH = PORTRAIT.waveform_width
 WAVEFORM_HEIGHT = 18
 WAVEFORM_RENDER_SIZE = "800x60"   # 见上面第 1 条坑：别改这个宽度
 WAVEFORM_COLOR = "#2f6fb5"
+
+# ---------------------------------------------------------------------------
+# 图内聚光灯：讲到哪一块就把那一块框出来、其余压暗
+# ---------------------------------------------------------------------------
+#
+# 用户否掉过「整张图推拉镜头」，理由是跟内容无关。这个不一样：**框的是正在讲的那一块**，
+# 所以它跟「本段要点」是同一类东西 —— 讲内容，不装饰。
+# 参考片里的图其实是静止的（每 9~10 秒整页换一次、只做一次快速淡化），
+# 所以这一步是超出参考的：让图本身跟着讲解推进。
+FOCUS_DIM = "#ffffff"          # 压暗用白：论文图本来就是白底，白蒙版比黑蒙版干净
+FOCUS_DIM_ALPHA = 0.72
+FOCUS_BORDER = "#2f6fb5"
+FOCUS_BORDER_W = 3
+FOCUS_FADE_SEC = 0.25          # 聚光灯淡入（跟图片卡一样是「这一段开始了」的信号）
+FOCUS_MIN_SIDE = 0.06          # 小于这个比例的区域不值得框（多半是模型瞎给）
+FOCUS_MIN_AREA = 0.02
+# 整张图都框住 = 什么都没突出。实测模型很爱这么干：它给不出「图里的哪一块」，
+# 就把整张图框上、再补一个图名（比如 w=1.0,h=1.0,label="四比特精度表"）。
+# 那不是聚光灯，是把图压暗一圈，所以直接丢掉。
+FOCUS_MAX_AREA = 0.85
 SPEAKER_WAVE_COLORS = {"A": "#d3a24a", "B": "#79a9c9"}
 
 # 伪 id：模型用它表示「这一段没有对应原图，需要现场生成一张」
@@ -305,6 +326,8 @@ class Scene:
     caption: str = ""  # 图片说明（图注），显示在图片下方
     # 「本段要点」：一句不超过 14 个字的大字强调（模型写，兜底从原文抠数字）
     point: str = ""
+    # 图内聚光灯：这一段在讲图里的哪一块（相对 0~1 比例 + 短标签）。None = 不框
+    focus: dict[str, Any] | None = None
     # "outro" 表示这是片尾品牌段 —— 视频层会把它渲染成品牌卡片而不是普通配图页
     brand: str = ""
 
@@ -460,9 +483,16 @@ POINTS_SYSTEM = """你在给一个「论文解读视频」做**画面强调**。
   而不是「我们接着看」这种本身没有信息量的话。
   （第一版允许留空，结果整条视频只有 18% 的时间有强调行 —— 观众感觉「这行时有时无」。）
 - 语言与原文一致（原文中文就中文，英文就英文）。
+- **每一段都必须带 `focus` 字段，一个都不能省**（省略字段和写 null 是两回事，
+  下游要靠它决定「这一句要不要在图里框一块」）：
+  - 这一段**在讲图里的某个具体部位**（一块流程、一列数字、一个模块）→ 给出那块区域的
+    **相对整张图的 0~1 比例**（`x`/`y` 是左上角，`w`/`h` 是宽高），外加不超过 8 个字的 `label`；
+  - 拿不准、或者这一段没在讲图的某一部分（总结、转折）→ 写 `null`。
+  **不要给像素坐标**（给 600 这种数字会被当成格式错误整条丢掉）；**框错地方比不框更糟**。
 
 只输出 JSON：
-{"points": [{"segment": 0, "point": "成功率 67%"}, {"segment": 1, "point": ""}]}
+{"points": [{"segment": 0, "point": "成功率 67%", "focus": {"x": 0.05, "y": 0.1, "w": 0.4, "h": 0.3, "label": "编码器"}},
+            {"segment": 1, "point": "误差会滚雪球", "focus": null}]}
 每个脚本段都要有一项。不要输出任何解释。"""
 
 POINTS_SYSTEM_EN = """You write the big on-screen emphasis line for a paper-explainer video.
@@ -485,9 +515,19 @@ Rules:
   line, which reads as "this line flickers on and off".)
 - **Write in English** (the whole video is English), **start with a capital letter**,
   and do not end with a period — it is a headline, not a sentence.
+- **Every segment must carry a `focus` field — never omit it** (an omitted field is not
+  the same as `null`; downstream uses it to decide whether to box a region of the figure):
+  - if the segment is about **a specific part of the figure** (one block, one column of
+    numbers, one module) → give that region as **relative 0–1 fractions** over the whole
+    image (`x`/`y` = top-left, `w`/`h` = size) plus a `label` of at most 4 words;
+  - if you are not sure, or the segment is not about a part of the image (summary,
+    transition) → write `null`.
+  **Never give pixel coordinates** (a value like 600 is treated as malformed and dropped);
+  **pointing at the wrong place is worse than not pointing**.
 
 Output JSON only:
-{"points": [{"segment": 0, "point": "67% success rate"}, {"segment": 1, "point": "why errors snowball"}]}
+{"points": [{"segment": 0, "point": "67% success rate", "focus": {"x": 0.05, "y": 0.1, "w": 0.4, "h": 0.3, "label": "encoder"}},
+            {"segment": 1, "point": "errors snowball", "focus": null}]}
 Include one entry per segment. No explanations."""
 
 # 强调行里允许出现的数字形态（用于本地兜底）
@@ -602,7 +642,11 @@ def shorten_point(text: str, *, max_chars: int = POINT_MAX_CHARS, language: str 
 
 
 def build_points_messages(
-    segments: list[dict[str, Any]], *, title: str = "", language: str = "zh"
+    segments: list[dict[str, Any]],
+    *,
+    title: str = "",
+    language: str = "zh",
+    image_captions: list[str | None] | None = None,
 ) -> list[dict[str, str]]:
     """为每一段脚本要一句「大字强调」。
 
@@ -614,10 +658,17 @@ def build_points_messages(
     英文那一版的画面上整行中文。这跟当初解读/脚本 prompt 踩的是同一个坑。
     """
     system = POINTS_SYSTEM if language == "zh" else POINTS_SYSTEM_EN
+    captions = image_captions or []
     script_lines = []
     for index, segment in enumerate(segments):
         text = (segment.get("text") or "").strip().replace("\n", " ")
-        script_lines.append(f"[{index}] {text}")
+        caption = (captions[index] if index < len(captions) else None) or ""
+        caption = " ".join(str(caption).split())[:120]
+        # 把「这一段配的是哪张图」一并给模型，否则它没法判断该框图里的哪一块
+        suffix = f"（这一段配的图：{caption}）" if caption else "（这一段没有配图）"
+        if language != "zh":
+            suffix = f" (image for this segment: {caption})" if caption else " (no image)"
+        script_lines.append(f"[{index}] {text}{suffix}")
 
     if language == "zh":
         user = f"""【论文标题】{title or "（未提供）"}
@@ -625,18 +676,48 @@ def build_points_messages(
 【脚本分段】共 {len(segments)} 段（编号 0 到 {len(segments) - 1}）
 {chr(10).join(script_lines)}
 
-请为每一段写一句不超过 14 个字的大字强调，输出 JSON。"""
+请为每一段写一句不超过 14 个字的大字强调，并给出 `focus`（拿不准就写 `null`，但**字段不能省**），输出 JSON。"""
     else:
         user = f"""[PAPER TITLE] {title or "(not provided)"}
 
 [SCRIPT SEGMENTS] {len(segments)} segments (numbered 0 to {len(segments) - 1})
 {chr(10).join(script_lines)}
 
-Write one emphasis line of at most 8 words for every segment. Output JSON only."""
+Write one emphasis line of at most 8 words per segment, and include a `focus` field for
+every segment (use `null` when unsure — but never omit the field). Output JSON only."""
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+
+def normalize_point_items(
+    raw: Any,
+    *,
+    count: int,
+    max_chars: int = POINT_MAX_CHARS,
+    language: str = "zh",
+) -> list[dict[str, Any]]:
+    """把模型给的整份 payload 整理成每段一项：`{"point": ..., "focus": {...}|None}`。
+
+    要点文案与聚光灯来自**同一次调用**（模型一边说「这段最该记住什么」，一边指「在图的哪里」），
+    所以这里一起归一化 —— 分两次调用会多花一次钱，而且两者可能对不上。
+    """
+    items: list[dict[str, Any]] = [{"point": "", "focus": None} for _ in range(max(count, 0))]
+    if not isinstance(raw, list):
+        return items
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            index = int(entry.get("segment", entry.get("index")))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < count:
+            continue
+        text = shorten_point(str(entry.get("point") or ""), max_chars=max_chars, language=language)
+        items[index] = {"point": text, "focus": normalize_focus(entry.get("focus"))}
+    return items
 
 
 def _normalize_points(
@@ -756,6 +837,7 @@ def build_scenes(
     image_for_segment: list[str],
     fallback_id: str,
     points: list[str] | None = None,
+    focuses: list[dict[str, Any] | None] | None = None,
 ) -> list[Scene]:
     """把脚本、时间戳和逐段配图拼成画面时间轴。
 
@@ -814,6 +896,7 @@ def build_scenes(
                 text=str(segment.get("text") or ""),
                 caption=asset.caption,
                 point=(points[index] if points and index < len(points) else ""),
+                focus=(focuses[index] if focuses and index < len(focuses) else None),
                 brand=str(segment.get("brand") or ""),
             )
         )
@@ -1307,6 +1390,110 @@ def render_point_row(
     return output_path
 
 
+def normalize_focus(raw: Any) -> dict[str, Any] | None:
+    """整理模型给的「这一段在讲图的哪一块」。
+
+    坐标是**相对图片的 0~1 比例**（不是像素）：图片在画面里是等比缩放居中的，
+    用比例才能跟 `_prepare_image` 的结果对齐。认不出的、太小的、越界的一律丢掉 ——
+    框错地方比不框更糟（观众会以为那一块真的在讲那个）。
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        x = float(raw.get("x"))
+        y = float(raw.get("y"))
+        w = float(raw.get("w"))
+        h = float(raw.get("h"))
+    except (TypeError, ValueError):
+        return None
+    if not all(map(math.isfinite, (x, y, w, h))):
+        return None
+    # 契约是 0~1 的**比例**。给了像素（比如 600）说明模型没按格式来 ——
+    # 归一化里没法反推像素对应的图有多大，宁可这一帧不框，也不要框到角落里去。
+    if any(value < -1e-6 or value > 1.0 + 1e-6 for value in (x, y, w, h)):
+        return None
+    x, y = max(0.0, min(x, 0.98)), max(0.0, min(y, 0.98))
+    w, h = min(w, 1.0 - x), min(h, 1.0 - y)
+    if w < FOCUS_MIN_SIDE or h < FOCUS_MIN_SIDE:
+        return None
+    if w * h < FOCUS_MIN_AREA:
+        return None
+    if w * h > FOCUS_MAX_AREA:
+        # 覆盖 85% 以上：等于没框（见上面 FOCUS_MAX_AREA 的说明）
+        return None
+    label = str(raw.get("label") or "").strip().replace("\n", " ")
+    return {
+        "x": round(x, 4),
+        "y": round(y, 4),
+        "w": round(w, 4),
+        "h": round(h, 4),
+        "label": label[:16],
+    }
+
+
+def render_focus_overlay(
+    scene: Scene,
+    output_path: Path,
+    *,
+    focus: dict[str, Any],
+    layout: Layout = PORTRAIT,
+) -> Path:
+    """渲染「聚光灯」图层：图卡大小，除了要讲的那一块之外全部压上半透明白。
+
+    图层与图片卡**同一个画幅、同一个坐标系**（图片在卡里是等比居中放好的），
+    所以这里只要按比例算出那块区域的像素位置即可 —— 不需要回头去动 PDF。
+    """
+    data_uri, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, layout.image_box_h)
+    img_x = (layout.width - img_w) / 2 - layout.image_box_left
+    img_y = (layout.image_box_h - img_h) / 2
+
+    fx = img_x + float(focus["x"]) * img_w
+    fy = img_y + float(focus["y"]) * img_h
+    fw = float(focus["w"]) * img_w
+    fh = float(focus["h"]) * img_h
+    pad = FOCUS_BORDER_W + 2
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.image_box_w}" '
+        f'height="{layout.image_box_h}" viewBox="0 0 {layout.image_box_w} {layout.image_box_h}">',
+        # 四条压暗边（围绕那块「洞」），比用 mask 简单，也不依赖渲染器对 mask 的支持
+        f'<g fill="{FOCUS_DIM}" fill-opacity="{FOCUS_DIM_ALPHA}">',
+        f'<rect x="0" y="0" width="{layout.image_box_w}" height="{max(fy - pad, 0):.1f}"/>',
+        f'<rect x="0" y="{fy + fh + pad:.1f}" width="{layout.image_box_w}" '
+        f'height="{max(layout.image_box_h - fy - fh - pad, 0):.1f}"/>',
+        f'<rect x="0" y="{max(fy - pad, 0):.1f}" width="{max(fx - pad, 0):.1f}" '
+        f'height="{fh + pad * 2:.1f}"/>',
+        f'<rect x="{fx + fw + pad:.1f}" y="{max(fy - pad, 0):.1f}" '
+        f'width="{max(layout.image_box_w - fx - fw - pad, 0):.1f}" height="{fh + pad * 2:.1f}"/>',
+        "</g>",
+        # 框线：把「正在讲的是这里」说清楚
+        f'<rect x="{fx:.1f}" y="{fy:.1f}" width="{fw:.1f}" height="{fh:.1f}" rx="6" '
+        f'fill="none" stroke="{FOCUS_BORDER}" stroke-width="{FOCUS_BORDER_W}"/>',
+    ]
+    label = str(focus.get("label") or "").strip()
+    if label:
+        size = 26.0 if not layout.landscape else 30.0
+        chip_h = size * 1.9
+        chip_w = (len(label) + 2) * size * 0.62
+        chip_x = min(max(fx, 8), layout.image_box_w - chip_w - 8)
+        chip_y = max(fy - chip_h - 6, 6)
+        chip_y = chip_y if chip_y + chip_h < layout.image_box_h else min(fy + fh + 6, layout.image_box_h - chip_h - 6)
+        parts.append(
+            f'<rect x="{chip_x:.1f}" y="{chip_y:.1f}" width="{chip_w:.1f}" height="{chip_h:.1f}" '
+            f'rx="8" fill="{FOCUS_BORDER}"/>'
+        )
+        parts.append(
+            f'<text x="{chip_x + size * 0.5:.1f}" y="{chip_y + chip_h * 0.68:.1f}" '
+            f'font-family="{FONT_STACK}" font-size="{size:.0f}" fill="#ffffff">{html.escape(label)}</text>'
+        )
+    parts.append("</svg>")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _rasterize_custom(
+        "\n".join(parts), output_path, width=layout.image_box_w, height=layout.image_box_h
+    )
+    return output_path
+
+
 def render_caption_band(
     text: str, output_path: Path, *, layout: Layout = PORTRAIT
 ) -> Path:
@@ -1723,6 +1910,7 @@ def encode_video(
     pauses: list[Pause] | None = None,
     image_cards: list[Path | None] | None = None,
     transitions: list[Transition] | None = None,
+    focus_overlays: list[Path | None] | None = None,
     waveform: bool = True,
     layout: Layout = PORTRAIT,
 ) -> VideoResult:
@@ -1776,6 +1964,7 @@ def encode_video(
     bands = caption_bands or [[] for _ in scenes]
     rows = point_rows or [None] * len(scenes)
     cards = image_cards or [None] * len(scenes)
+    foci = focus_overlays or [None] * len(scenes)
     plan = transitions or [Transition() for _ in scenes]
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
@@ -1885,6 +2074,23 @@ def encode_video(
                 graph.append(f"[{cur_in}:v]format=rgba[ca{node}]")
                 graph.append(
                     f"[{last}][ca{node}]overlay={layout.image_box_left}:{layout.image_top}[v{node}]"
+                )
+                last = f"v{node}"
+
+            # ---- 图内聚光灯：讲到哪一块就把那一块框出来，其余压暗 ----
+            #
+            # 必须画在图片卡之后（它盖在图上），但要排在强调行/字幕/进度条之前 ——
+            # 那些是画面上的独立信息，不该被压暗。
+            focus_row = foci[index] if index < len(foci) else None
+            if focus_row is not None:
+                focus_in = add_image(focus_row)
+                node += 1
+                graph.append(
+                    f"[{focus_in}:v]format=rgba,"
+                    f"fade=t=in:st=0:d={FOCUS_FADE_SEC:.2f}:alpha=1[fo{node}]"
+                )
+                graph.append(
+                    f"[{last}][fo{node}]overlay={layout.image_box_left}:{layout.image_top}[v{node}]"
                 )
                 last = f"v{node}"
 
@@ -2291,16 +2497,26 @@ def compose_video(
     point_limit = point_char_limit(language)
 
     points: list[str] = [""] * len(segments)
+    focuses: list[dict[str, Any] | None] = [None] * len(segments)
     if preset_scenes:
         reused = 0
+        reused_focus = 0
         for entry in preset_scenes:
             index = entry.get("index")
             point = str(entry.get("point") or "").strip()
-            if isinstance(index, int) and 0 <= index < len(points) and point:
-                points[index] = point
-                reused += 1
+            if isinstance(index, int) and 0 <= index < len(points):
+                if point:
+                    points[index] = point
+                    reused += 1
+                # 聚光灯也复用：重新合成时画面分配与「框哪里」都不该变
+                focus = normalize_focus(entry.get("focus"))
+                if focus:
+                    focuses[index] = focus
+                    reused_focus += 1
         if reused:
             logger.info("强调行：复用上次的 %d 段", reused)
+        if reused_focus:
+            logger.info("聚光灯：复用上次的 %d 段", reused_focus)
 
     if (
         allow_point_llm
@@ -2314,23 +2530,37 @@ def compose_video(
         for attempt in (1, 2):
             try:
                 data = llm._chat_json(
-                    build_points_messages(segments, title=title, language=language),
-                    max_tokens=max(800, len(segments) * 40),
+                    build_points_messages(
+                        segments,
+                        title=title,
+                        language=language,
+                        image_captions=[
+                            pool[asset_id].caption if asset_id in pool else None
+                            for asset_id in image_for_segment
+                        ],
+                    ),
+                    max_tokens=max(900, len(segments) * 60),
                     temperature=0.3,
                 )
-                written = _normalize_points(
+                written = normalize_point_items(
                     data.get("points"),
                     count=len(segments),
                     max_chars=point_limit,
                     language=language,
                 )
                 filled = 0
-                for index, point in enumerate(written):
-                    if point and not points[index]:
-                        points[index] = point
+                boxed = 0
+                for index, item in enumerate(written):
+                    if item["point"] and not points[index]:
+                        points[index] = item["point"]
                         filled += 1
+                    if item["focus"] and focuses[index] is None:
+                        focuses[index] = item["focus"]
+                        boxed += 1
                 if filled:
                     logger.info("强调行：模型写了 %d 段", filled)
+                if boxed:
+                    logger.info("聚光灯：模型指了 %d 段", boxed)
                 break
             except Exception as exc:  # noqa: BLE001
                 if attempt == 1:
@@ -2361,6 +2591,7 @@ def compose_video(
         image_for_segment=image_for_segment,
         fallback_id=default_id,
         points=points,
+        focuses=focuses,
     )
 
     layout = layout_for(orientation)
@@ -2372,6 +2603,8 @@ def compose_video(
     point_paths: list[Path] = []
     image_cards: list[Path | None] = []
     card_paths: list[Path] = []
+    focus_rows: list[Path | None] = []
+    focus_paths: list[Path] = []
     image_ids: list[str] = []
     endcard_count = 0
     beat_count = 0
@@ -2416,6 +2649,21 @@ def compose_video(
         # 不该做无意义的溶解（观众只会觉得画面卡了一下）
         image_ids.append(str(scene.image))
 
+        # 聚光灯只框**论文原图**：我们生成的信息图/段落图是矢量示意图，
+        # 下一步会给它们做「逐元素长出来」，两套动效叠在一起反而乱。
+        if (
+            scene.focus
+            and scene.brand != "outro"
+            and card_path is not None
+            and scene.kind in ("figure", "table", "cover")
+        ):
+            focus_path = work_dir / f"focus-{index:04d}.png"
+            render_focus_overlay(scene, focus_path, focus=scene.focus, layout=layout)
+            focus_rows.append(focus_path)
+            focus_paths.append(focus_path)
+        else:
+            focus_rows.append(None)
+
         if scene.point and scene.brand != "outro":
             point_path = work_dir / f"point-{index:04d}.png"
             render_point_row(scene.point, point_path, layout=layout)
@@ -2447,6 +2695,7 @@ def compose_video(
         pauses=pauses,
         image_cards=image_cards,
         transitions=transitions,
+        focus_overlays=focus_rows,
         layout=layout,
     )
     result.assignment = strategy
@@ -2454,8 +2703,9 @@ def compose_video(
         {
             "index": index,
             "image": image_for_segment[index],
-            # 强调文案存下来，重新合成时复用（见上面三级来源的说明）
+            # 强调文案与聚光灯都存下来，重新合成时复用（见上面三级来源的说明）
             "point": points[index] if index < len(points) else "",
+            "focus": focuses[index] if index < len(focuses) else None,
         }
         for index in range(min(len(segments), len(image_for_segment)))
     ]
@@ -2464,7 +2714,7 @@ def compose_video(
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
     }
 
-    for temp_path in [*slide_paths, *band_paths, *point_paths, *card_paths]:
+    for temp_path in [*slide_paths, *band_paths, *point_paths, *card_paths, *focus_paths]:
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
