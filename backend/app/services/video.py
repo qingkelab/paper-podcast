@@ -630,8 +630,10 @@ def normalize_hook(raw: Any, *, language: str = "zh") -> str:
     封面上的大字出现引号非常出戏。
     """
     def clean(line: str) -> str:
-        # 先去 markdown 强调符：`**反差型：…**` 里的 `**` 会挡住下面那些前缀规则
-        line = line.strip().strip("*_`").strip()
+        # 先去**外层装饰**（引号、markdown 强调符）：它们会挡住下面那些以「行首」为锚的
+        # 前缀规则 —— 实测 `"封面标题：…"` 这种「引号 + 前缀」的组合就是漏网的
+        # （模型很爱这么写，而封面上的大字顶着「封面标题：」四个字非常出戏）。
+        line = line.strip().strip('"\'“”「」《》【】*_`').strip()
         line = re.sub(
             r"^[\s\-•*\d.、)）:：]*(封面标题|标题|headline|title)\s*[:：]?",
             "",

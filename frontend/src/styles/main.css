@@ -1508,6 +1508,63 @@ pre {
 
 /* 标题与正文各占一行（.alert__title 本身是 inline，正文跟着它走会挤成一坨） */
 .alert--warning .alert__title,
+/* 封面标题的自定义（单集页视频区）。用 details 折叠起来：它是「偶尔改一次」的东西，
+   不该跟画幅切换、播放器抢注意力。 */
+.cover-edit {
+  margin-bottom: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(9, 13, 19, 0.4);
+}
+
+.cover-edit__summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 11px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  list-style: none;
+}
+
+.cover-edit__summary::-webkit-details-marker {
+  display: none;
+}
+
+/* 摘要里带出当前标题：不展开也能一眼看到封面上写的是什么 */
+.cover-edit__current {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+.cover-edit__body {
+  display: grid;
+  gap: 12px;
+  padding: 0 14px 14px;
+}
+
+.cover-edit__field {
+  display: grid;
+  gap: 6px;
+}
+
+.cover-edit__label {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.cover-edit__actions {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .video-stale__text {
   display: block;
 }

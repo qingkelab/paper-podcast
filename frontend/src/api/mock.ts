@@ -122,7 +122,7 @@ const MOCK_VIDEO_SEC = 6
 /**
  * 重新合成视频的模拟耗时。
  *
- * 真实后端复用画面分配、不调模型，实测约 11 秒。Mock 里有两点不同：
+ * 真实后端复用画面分配、不调模型，实测约 1 分钟。Mock 里有两点不同：
  *   - 画面根本不含真实配图（是 Canvas 画的通用占位场景），没有「按新配图重渲染」这回事，
  *     所以不必真的重录一遍（重录一次要 6 秒实时时间，纯浪费）；
  *   - 演示时要看得清「loading 态」，也不宜太快。
@@ -2246,6 +2246,39 @@ export async function deleteFigure(id: string, figureId: string): Promise<Episod
   return copyEpisode(episode)
 }
 
+/**
+ * 改封面上的标题（契约 §2：PATCH /cover?lang=xx）。
+ *
+ * Mock 里视频只是占位的 Canvas 场景，没有「把标题画进画面」这一步，所以这里
+ * 只复刻契约语义：写进该版本的 `video.hook`（空串 = 清掉自定义）。和真实后端一样，
+ * **不重新合成** —— 界面改完再调 rebuildVideo。
+ */
+export async function updateCover(
+  id: string,
+  input: { headline?: string; paperTitle?: string; lang?: EpisodeLanguage },
+): Promise<Episode> {
+  ensureLoaded()
+  requireAccount()
+  await delay(120)
+  const episode = requireEpisode(id)
+  if (input.lang && !versionFor(episode, input.lang)) {
+    throw new ApiError(`这一集没有 ${input.lang} 语言版本`, 404)
+  }
+  const target = input.lang ?? primaryLanguage(episode)
+  const version = versionFor(episode, target)
+
+  if (input.paperTitle !== undefined && input.paperTitle.trim()) {
+    episode.title = input.paperTitle.trim().slice(0, 200)
+  }
+  if (input.headline !== undefined) {
+    // 真实后端按分句收短；Mock 只做长度截断，够复刻「返回值和传进去的可能不一样」
+    const trimmed = input.headline.trim().replace(/\s+/g, ' ').slice(0, 16)
+    if (version?.video) version.video.hook = trimmed
+    if (episode.video) episode.video.hook = trimmed
+  }
+  return episode
+}
+
 export function scriptTxtUrl(id: string, lang?: EpisodeLanguage): string {
   ensureLoaded()
   const episode = findEpisode(id)
@@ -2308,6 +2341,7 @@ const adapter: ApiAdapter = {
   rotateFigure,
   deleteFigure,
   rebuildVideo,
+  updateCover,
   scriptTxtUrl,
   analysisMdUrl,
   getMe,

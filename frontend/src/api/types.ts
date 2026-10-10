@@ -126,6 +126,13 @@ export interface VideoInfo {
   stale?: boolean
   /** 画幅：竖版（936×1210，默认）/ 横版（1920×1080）。老后端不返回，缺失按竖版处理 */
   orientation?: VideoOrientation
+  /**
+   * 封面上的大字标题（爆款标题，逐语言各一份）。
+   *
+   * 空串表示「没有自定义过」——视频封面会退回显示论文原题。用户可以在单集页改它，
+   * **改完要重新合成视频才生效**（标题是烘焙进 MP4 的画面，不是播放器上的浮层）。
+   */
+  hook?: string
 }
 
 /**
@@ -571,7 +578,7 @@ export interface ApiAdapter {
    * 用现有素材**重新合成视频**（契约 §2：POST /video/rebuild?lang=xx）。
    *
    * 为什么需要它：视频是把配图烘焙进 MP4 的，人工校正配图后已生成的视频里还是旧画面。
-   * 它复用上次的画面分配、不调用模型，所以只要十几秒（实测约 11 秒），
+   * 它复用上次的画面分配、不调用模型，所以只要一分钟上下（实测 40~95 秒），
    * 而且画面不会因为「我只转了一张图」就全变。返回更新后的完整 Episode
    * （`video.url` 带上了新的 `?v=` 版本号，`video.stale` 归位为 false）。
    *
@@ -582,6 +589,20 @@ export interface ApiAdapter {
     id: string,
     lang?: EpisodeLanguage,
     orientation?: VideoOrientation,
+  ): Promise<Episode>
+  /**
+   * 改封面上的标题（契约 §2：PATCH /cover）。
+   *
+   * - `headline`：封面上的大字（爆款标题），逐语言一份；传空串 = 清掉自定义、退回论文原题
+   * - `paperTitle`：封面下方那行小字的论文原题（也是这一集的名字），跨语言共用；
+   *   省略 = 不动
+   *
+   * **只写数据、不重新合成**：调用方改完要再调 `rebuildVideo` 才看得到新标题。
+   * 分开两个接口是因为重新合成要几十秒，用户可能想先把标题改满意了再合成一次。
+   */
+  updateCover(
+    id: string,
+    input: { headline?: string; paperTitle?: string; lang?: EpisodeLanguage },
   ): Promise<Episode>
   /** 脚本 txt 的下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */
   scriptTxtUrl(id: string, lang?: EpisodeLanguage): string

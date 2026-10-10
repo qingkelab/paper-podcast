@@ -94,6 +94,9 @@ class VideoInfo(BaseModel):
     stale: bool = False
     # 画幅：`portrait`（936×1210，默认）/ `landscape`（1920×1080）。老数据没有这个字段
     orientation: Literal["portrait", "landscape"] = "portrait"
+    # **封面上的大字标题**（爆款标题，逐语言各一份）。空串表示没有自定义过 ——
+    # 视频里的封面会退回显示论文原题。用户可以在单集页改它（改完要重新合成才生效）。
+    hook: str = ""
 
 
 class Illustration(BaseModel):

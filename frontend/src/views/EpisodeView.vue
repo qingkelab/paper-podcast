@@ -16,6 +16,7 @@ import {
   VIDEO_ORIENTATIONS,
   // 组件里已经有一个 video 计算属性，这个请求函数换个名字，避免撞名
   rebuildVideo as requestVideoRebuild,
+  updateCover as requestUpdateCover,
   resetShare,
   retryEpisode,
   rotateFigure,
@@ -379,7 +380,7 @@ function resetVideoState(): void {
 const videoStale = computed(() => video.value?.stale === true)
 
 /**
- * 重新合成是 **11 秒级** 的操作（真实后端复用画面分配、不调模型），
+ * 重新合成是 **1 分钟级** 的操作（真实后端复用画面分配、不调模型，但要逐帧渲染 + 编码），
  * 按钮必须进 loading 态并禁用，否则用户会以为没反应而连点。
  */
 const rebuildingVideo = ref(false)
@@ -389,8 +390,8 @@ const rebuildError = ref<string | null>(null)
 const rebuildElapsed = ref(0)
 let rebuildTimer: number | undefined
 
-/** 真实后端实测约 11 秒；Mock 只模拟 3 秒，文案必须跟着说实话 */
-const rebuildEtaText = computed(() => (IS_MOCK ? '约 3 秒' : '约 11 秒'))
+/** 真实后端实测 40~95 秒（每帧一块 936×1210 的画面要渲染 + 编码）；Mock 只模拟 3 秒 */
+const rebuildEtaText = computed(() => (IS_MOCK ? '约 3 秒' : '约 1 分钟'))
 
 function startRebuildClock(): void {
   stopRebuildClock()
@@ -431,6 +432,53 @@ async function rebuildVideoNow(): Promise<void> {
   } finally {
     stopRebuildClock()
     rebuildingVideo.value = false
+  }
+}
+
+// --- 封面标题：可自定义（契约 §2：PATCH /cover） ----------------------------
+
+/**
+ * 当前语言版本的封面大字。空串 = 没自定义过，视频封面会显示论文原题。
+ *
+ * 取的是**当前在看的那一版**：中英两版的封面标题是各一份的（图上写着字）。
+ */
+const coverHeadline = computed(() => currentVideo.value?.hook ?? '')
+
+const coverHeadlineDraft = ref('')
+const coverPaperTitleDraft = ref('')
+const savingCover = ref(false)
+/** 有没有改过（没改就不让点保存 —— 一个点了没反应的按钮比没有按钮更糟） */
+const coverDirty = computed(
+  () =>
+    coverHeadlineDraft.value.trim() !== coverHeadline.value.trim() ||
+    coverPaperTitleDraft.value.trim() !== (episode.value?.title ?? '').trim(),
+)
+
+function resetCoverDraft(): void {
+  coverHeadlineDraft.value = coverHeadline.value
+  coverPaperTitleDraft.value = episode.value?.title ?? ''
+}
+
+async function saveCoverTitle(): Promise<void> {
+  if (savingCover.value || !coverDirty.value) return
+  const targetId = id.value
+  savingCover.value = true
+  try {
+    const updated = await requestUpdateCover(targetId, {
+      headline: coverHeadlineDraft.value,
+      paperTitle: coverPaperTitleDraft.value,
+      lang: activeLanguage.value ?? undefined,
+    })
+    if (id.value !== targetId) return
+    episode.value = updated
+    // 显示**后端收短之后**的那一份：它可能和你敲的不完全一样（超长会断在分句处）
+    resetCoverDraft()
+    showToast('ok', '封面标题已保存，点「重新合成视频」后生效')
+  } catch (cause) {
+    if (id.value !== targetId) return
+    showToast('error', errorMessage(cause, '保存封面标题失败'))
+  } finally {
+    savingCover.value = false
   }
 }
 
@@ -858,6 +906,7 @@ watch(id, () => {
   // 重新合成的状态同样不能跨集残留（在途请求由 rebuildVideoNow 里的 id 比对丢弃）
   rebuildError.value = null
   rebuildingVideo.value = false
+  resetCoverDraft()
   stopRebuildClock()
   // 分享区的状态也不能跨集残留：上一集停在「换新链接」的确认框里，
   // 换了单集还挂着，点确认就会对错误的单集生效
@@ -1406,6 +1455,58 @@ onBeforeUnmount(() => {
               {{ formatBytes(landscapeVideo.bytes) }}
             </span>
           </div>
+
+          <!--
+            封面标题：视频封面上的大字（爆款标题）+ 下方那行论文原题。
+            为什么让用户改：封面大字是模型写的一句话，它拿不到你想要的语气和重点，
+            而那是整条视频最显眼的一行。**改完要重新合成**才看得到（标题是画进画面的，
+            不是播放器上的浮层），所以这里把「保存」和「重新合成」分开：
+            先把两条标题改满意，再合成一次 —— 而不是每敲一个字都重跑一遍编码。
+          -->
+          <details v-if="currentVideo" class="cover-edit">
+            <summary class="cover-edit__summary">
+              封面标题
+              <span class="cover-edit__current">{{ coverHeadline || '（未设置，显示论文原题）' }}</span>
+            </summary>
+            <div class="cover-edit__body">
+              <label class="cover-edit__field">
+                <span class="cover-edit__label">封面大字（爆款标题）</span>
+                <input
+                  v-model="coverHeadlineDraft"
+                  class="input"
+                  type="text"
+                  maxlength="24"
+                  placeholder="例如：并发到 70，模型就装不下了"
+                  :disabled="savingCover"
+                />
+              </label>
+              <label class="cover-edit__field">
+                <span class="cover-edit__label">论文原题（封面下方小字，也是这一集的名字）</span>
+                <input
+                  v-model="coverPaperTitleDraft"
+                  class="input"
+                  type="text"
+                  maxlength="200"
+                  :disabled="savingCover"
+                />
+              </label>
+              <div class="row cover-edit__actions">
+                <button
+                  type="button"
+                  class="btn btn--sm btn--primary"
+                  :disabled="savingCover || !coverDirty"
+                  @click="saveCoverTitle"
+                >
+                  <span v-if="savingCover" class="spinner" aria-hidden="true" />
+                  {{ savingCover ? '保存中…' : '保存' }}
+                </button>
+                <span class="section__hint">
+                  保存后点「重新合成视频」才会生效 —— 标题是画进画面里的。
+                  超长会按分句自动收短（中文 16 字 / 英文 9 个词）。
+                </span>
+              </div>
+            </div>
+          </details>
 
           <div class="vplayer__body">
             <!--

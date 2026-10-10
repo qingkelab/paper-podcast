@@ -447,6 +447,27 @@ cd frontend && pnpm test:units
 `rebuild_video` 通过 `preset_hook` 传回来 —— 重新合成时不该换一句话。
 它由 `allow_point_llm` 这个开关统一管（没模型时退回论文原题兜底，见 `_cover_fallback_headline`）。
 
+**封面标题用户能自己改**（`PATCH /api/episodes/{id}/cover`，前端在单集页的视频区）。
+留出这个口子的理由很直接：封面大字是模型写的一句话，它拿不到用户想要的语气和重点，
+而这是整条视频最显眼的一行。两个字段、两种作用域：
+
+| 字段 | 作用域 | 说明 |
+|---|---|---|
+| `headline` | **逐语言一份**（`versions[lang].video.hook`） | 空串 = 清掉自定义、退回显示论文原题 |
+| `paper_title` | 整集（`record.title`，跨语言共用） | 省略/空串 = 不动（标题不能是空的） |
+
+- **只写数据、不重新合成**：封面是烘焙进 MP4 的画面，改完要再调 `POST /video/rebuild`。
+  分两步是有意的 —— 重新合成要一分钟上下，用户想先把标题改满意再合成一次。
+- 写进去的值过和模型那条**同一套清理**（`normalize_hook`），所以返回值和传入值可能不同，
+  **界面要显示返回值**（前端保存后会用返回的 `video.hook` 回填输入框）。
+- 实测抓到过一个真 bug：模型（和用户）很爱写 `"封面标题：…"` 这种「引号 + 前缀」组合，
+  而当时的顺序是「先去前缀、再去引号」—— 引号挡住了以行首为锚的前缀正则，
+  结果「封面标题：4 比特状态量化」整个存了进去。现在先去外层装饰（引号、markdown 星号）
+  再剥前缀。**改这段时注意顺序**。
+- **重新合成的耗时说法要跟着实测走**：前端文案原来写「约 11 秒」，那是取消推拉镜头、
+  片子还短的时候；现在每帧一块 936×1210 的画面都要渲染 + 编码，实测 40~95 秒。
+  这类「预计多久」的文案属于**会被改动作废**的东西，改渲染管线时顺手量一次。
+
 ### 图内聚光灯：**几何由像素定、语义由模型定**
 
 做法：模型在写「本段要点」的**同一次调用**里再指出「这一段讲的是哪个子图」（一个字母，
@@ -696,7 +717,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            547 项，改完必须全绿
+backend/tests/            554 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

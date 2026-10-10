@@ -84,7 +84,7 @@ export function deleteFigure(id: string, figureId: string) {
 
 /**
  * 用现有素材重新合成视频（契约 §2：POST /video/rebuild?lang=xx）。
- * 复用上次的画面分配、不调用模型，实测约 11 秒 —— 调用方必须给 loading 反馈，别当它瞬间返回。
+ * 复用上次的画面分配、不调用模型，实测约 1 分钟（40~95 秒，片长越长越久）—— 调用方必须给 loading 反馈，别当它瞬间返回。
  * `lang` 指定重新合成哪个语言版本（中英两版的视频是两个独立产物），省略时取主语言。
  */
 export function rebuildVideo(
@@ -93,6 +93,14 @@ export function rebuildVideo(
   orientation?: Parameters<ApiAdapter['rebuildVideo']>[2],
 ) {
   return adapter.rebuildVideo(id, lang, orientation)
+}
+
+/** 改封面上的标题（契约 §2：PATCH /cover）。改完要再调 rebuildVideo 才看得到。 */
+export function updateCover(
+  id: string,
+  input: Parameters<ApiAdapter['updateCover']>[1],
+) {
+  return adapter.updateCover(id, input)
 }
 
 /** 脚本 txt 下载地址（mock 下是 Blob URL）。`lang` 省略时取主语言。 */

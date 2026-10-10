@@ -248,7 +248,8 @@ export function deleteFigure(id: string, figureId: string): Promise<Episode> {
  * 用现有素材重新合成视频（契约 §2：POST /video/rebuild）。
  *
  * 音频、脚本、解读都不动，只重新渲染画面并编码；**复用上次的画面分配**，不再调用模型，
- * 所以实测约 11 秒（5 分钟片长）—— 这个请求本来就该慢，不要给它加超时。
+ * 所以实测约 1 分钟（40~95 秒：每帧一块 936×1210 的 SVG 要渲染 + H.264 编码）
+ * —— 这个请求本来就该慢，不要给它加超时。
  * 返回更新后的完整 Episode：`video.url` 上带着新的 `?v=` 版本号（内容变了，缓存自动失效），
  * `video.stale` 归位为 false。没有视频时后端返回 409，由 ApiError 带到界面上。
  */
@@ -262,6 +263,27 @@ export function rebuildVideo(
   return request<Episode>(`/episodes/${encodeURIComponent(id)}/video/rebuild${query}`, {
     method: 'POST',
   })
+}
+
+/**
+ * 改封面上的标题（契约 §2：PATCH /cover?lang=xx）。
+ *
+ * 只写数据、**不重新合成** —— 视频是把画面烘焙进 MP4 的，改完标题要再调
+ * `rebuildVideo` 才看得到。后端会把标题按和模型写的那条同样的规则收短
+ * （去引号/「封面标题：」前缀、超长在分句处断），所以返回的 `video.hook`
+ * 可能和你传进去的不完全一样 —— 界面要显示返回值，而不是自己传的那一份。
+ */
+export function updateCover(
+  id: string,
+  input: { headline?: string; paperTitle?: string; lang?: EpisodeLanguage },
+): Promise<Episode> {
+  const body: Record<string, string> = {}
+  if (input.headline !== undefined) body.headline = input.headline
+  if (input.paperTitle !== undefined) body.paper_title = input.paperTitle
+  return request<Episode>(
+    `/episodes/${encodeURIComponent(id)}/cover${langQuery(input.lang)}`,
+    { method: 'PATCH', body: JSON.stringify(body) },
+  )
 }
 
 export function scriptTxtUrl(id: string, lang?: EpisodeLanguage): string {
@@ -445,6 +467,7 @@ const adapter: ApiAdapter = {
   rotateFigure,
   deleteFigure,
   rebuildVideo,
+  updateCover,
   scriptTxtUrl,
   analysisMdUrl,
   getMe,

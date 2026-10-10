@@ -13,6 +13,7 @@ from typing import Any, Iterator
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .. import auth as auth_lib
@@ -43,7 +44,7 @@ from ..models import (
     User,
 )
 from ..services.figures import PdfAssetsError, rotate_image_file
-from ..services.video import VideoError, is_video_stale
+from ..services.video import VideoError, is_video_stale, normalize_hook
 from ..services.ingest import IngestError, fetch_url_text, guess_title
 from ..services.pipeline import (
     LanguageNotFound,
@@ -161,6 +162,8 @@ def _version_payload(
             "bytes": stored_video.get("bytes"),
             "stale": is_video_stale(stored_video)
             or _video_provenance_unknown(stored_video, record, version),
+            # 封面大字标题（逐语言一份，用户可以改，见 PATCH /cover）
+            "hook": str(stored_video.get("hook") or ""),
         }
 
     # 横版：与竖版并存的一份（`?orientation=landscape`，1920×1080）
@@ -183,6 +186,8 @@ def _version_payload(
                 "stale": is_video_stale(stored_landscape)
                 or _video_provenance_unknown(stored_landscape, record, version),
                 "orientation": "landscape",
+                # 两种画幅共用同一句封面标题（它属于这个语言版本，不属于某一份文件）
+                "hook": str((version.get("video") or {}).get("hook") or ""),
             }
 
     illustration = None
@@ -1790,6 +1795,63 @@ async def rebuild_video(
     except VideoError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    refreshed = _db(request).get_episode(episode_id)
+    assert refreshed is not None
+    return to_episode(refreshed)
+
+
+class CoverTitleRequest(BaseModel):
+    """封面标题的自定义（两条都只影响**封面帧**）。
+
+    - `headline`：封面上的大字（爆款标题）。**逐语言一份**，空串表示清掉自定义、
+      退回显示论文原题；超长会被 `normalize_hook` 按分句收短（和模型写的那条同一套规则）。
+    - `paper_title`：封面下方那行小字的论文原题，也就是这一集的名字（全站都用它）。
+      不传 = 不动；传空串 = 不动（标题不能是空的）。
+    """
+
+    headline: str | None = None
+    paper_title: str | None = None
+
+
+@router.patch("/episodes/{episode_id}/cover", response_model=Episode)
+async def update_cover_title(request: Request, episode_id: str, payload: CoverTitleRequest):
+    """改封面上的标题（大字爆款标题 / 论文原题）。
+
+    **只写数据、不重新合成**：视频是把画面烘焙进 MP4 的，改完标题要调
+    `POST /video/rebuild` 才看得到新标题。分开两个接口是因为重新合成要几十秒，
+    用户可能想先把标题改满意了再合成一次，而不是每敲一次字就重跑一遍。
+
+    双语集的 `headline` 逐语言各一份，用 `?lang=` 指定改哪一版；
+    `paper_title` 是这一集的名字（跨语言共用），改它对两种语言都生效。
+    """
+    record = _require_episode(request, episode_id)
+    version = _resolve_version(request, record, lang=None)[1]
+
+    fields: dict[str, Any] = {}
+    if payload.paper_title is not None and payload.paper_title.strip():
+        fields["title"] = payload.paper_title.strip()[:200]
+
+    if payload.headline is not None:
+        # 语言取这一版自己的语言：中文标题按 16 字收、英文按词数收
+        language = str(version.get("language") or record.get("language") or "zh")
+        headline = normalize_hook(payload.headline, language=language)
+        stored_video = dict(version.get("video") or {})
+        stored_video["hook"] = headline
+        versions = dict(record.get("versions") or {})
+        if versions:
+            primary = _primary_language(record)
+            entry = dict(versions.get(language) or {})
+            entry["video"] = {**(entry.get("video") or {}), "hook": headline}
+            versions[language] = entry
+            fields["versions"] = versions
+            # 顶层字段镜像主语言那一版（老前端和分享页读的是它）
+            if language == primary:
+                fields["video"] = stored_video
+        else:
+            fields["video"] = stored_video
+
+    if fields:
+        _db(request).update_episode(episode_id, **fields)
     refreshed = _db(request).get_episode(episode_id)
     assert refreshed is not None
     return to_episode(refreshed)

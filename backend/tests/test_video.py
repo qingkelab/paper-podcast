@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import subprocess
 from dataclasses import dataclass
@@ -2970,3 +2971,128 @@ class TestFrostedGlassIsActuallyBlurred:
         assert span > 5, f"玻璃面糊成纯色了（跨度 {span}）—— 看不出是隔着玻璃看论文"
         assert mean > 160, f"玻璃面太暗（{mean:.0f}），上面的深色字会读不清"
         assert self._title_dark(frosted) > 200, "标题没画上去"
+
+
+class TestCoverTitleCanBeEdited:
+    """封面标题用户可以自己改（改完要重新合成才看得到）。
+
+    为什么要有这个接口：封面上的大字是**模型写的一句「爆款标题」**，它拿不到
+    用户想要的语气和重点；而这句话是整条视频最显眼的一行。所以必须能改。
+    论文原题（封面下方那行小字、也是这一集的名字）同理 —— 模型认标题认错
+    （arXiv 首页的授权声明被当成标题）在这个项目里是踩过的坑。
+    """
+
+    HEADLINE = "并发到 70，模型就装不下了"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _client(tmp_path):
+        """注意要用 `with`：app.state.queue 是在 lifespan 里建的，不进上下文就没有。"""
+        from fastapi.testclient import TestClient
+
+        from app.config import Settings
+        from app.main import create_app
+
+        settings = Settings(
+            force_mock=True,
+            enable_video=True,
+            data_dir=tmp_path / "data",
+            database_path=tmp_path / "data" / "cover.db",
+        )
+        with TestClient(create_app(settings)) as client:
+            yield client
+
+    @staticmethod
+    def _seed(client) -> str:
+        """造一集「已经有视频」的数据：直接写库，不走流水线（省掉几十秒）。"""
+        settings = client.app.state.settings
+        db = client.app.state.db
+        record = db.create_episode(
+            source_type="pdf",
+            source_ref="/tmp/x.pdf",
+            title="STEPQuant: When and Where Errors Matter",
+            options={"duration_min": 3, "level": "intro"},
+        )
+        episode_id = record["id"]
+        video_path = Path(settings.video_dir) / f"{episode_id}.mp4"
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        video_path.write_bytes(b"\x00" * 128)
+        audio_path = Path(settings.video_dir) / f"{episode_id}.mp3"
+        audio_path.write_bytes(b"\x00" * 64)
+        db.update_episode(
+            episode_id,
+            status="completed",
+            # `_all_versions` 的老数据兜底要求有 script 或 audio_path：
+            # 只有 video 的集不是一个真实存在的状态，接口会当它「没有版本」。
+            script={"title": "T", "segments": [{"speaker": "A", "text": "第一段"}]},
+            audio_path=str(audio_path),
+            audio_duration_sec=12.0,
+            video_path=str(video_path),
+            video={"duration_sec": 12.0, "scene_count": 3, "bytes": 128, "hook": "旧标题"},
+        )
+        return episode_id
+
+    def test_headline_is_saved_and_returned(self, tmp_path):
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            response = client.patch(
+                f"/api/episodes/{episode_id}/cover", json={"headline": self.HEADLINE}
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["video"]["hook"] == self.HEADLINE
+
+    def test_headline_is_normalized_like_the_model_written_one(self, tmp_path):
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            client.patch(
+                f"/api/episodes/{episode_id}/cover",
+                json={"headline": '"封面标题：4 比特状态量化，反超均匀 INT8 基准"'},
+            )
+            hook = client.get(f"/api/episodes/{episode_id}").json()["video"]["hook"]
+            assert hook == "4 比特状态量化，反超均匀", hook
+
+    def test_empty_headline_clears_it(self, tmp_path):
+        """清空 = 回到「封面显示论文原题」，而不是留一个空标题。"""
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            client.patch(f"/api/episodes/{episode_id}/cover", json={"headline": ""})
+            assert client.get(f"/api/episodes/{episode_id}").json()["video"]["hook"] == ""
+
+    def test_paper_title_is_episode_level(self, tmp_path):
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            client.patch(
+                f"/api/episodes/{episode_id}/cover", json={"paper_title": "改过的论文标题"}
+            )
+            assert client.get(f"/api/episodes/{episode_id}").json()["title"] == "改过的论文标题"
+
+    def test_empty_paper_title_is_ignored(self, tmp_path):
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            client.patch(f"/api/episodes/{episode_id}/cover", json={"paper_title": "  "})
+            assert "STEPQuant" in client.get(f"/api/episodes/{episode_id}").json()["title"]
+
+    def test_missing_episode_is_404(self, tmp_path):
+        with self._client(tmp_path) as client:
+            response = client.patch("/api/episodes/nope/cover", json={"headline": "x"})
+            assert response.status_code == 404
+
+    def test_someone_elses_episode_is_not_editable(self, tmp_path):
+        """别人的单集改不动（越权一律 404，见 AGENTS.md）。"""
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            registered = client.post(
+                "/api/auth/register",
+                json={"username": "owner", "password": "pw-owner-123"},
+            )
+            assert registered.status_code in (200, 201), registered.text
+            owner_id = registered.json()["id"]
+            client.app.state.db.update_episode(episode_id, user_id=owner_id)
+            # 换一个没有 cookie 的客户端（未登录）
+            from fastapi.testclient import TestClient
+
+            with TestClient(client.app) as anon:
+                response = anon.patch(
+                    f"/api/episodes/{episode_id}/cover", json={"headline": "x"}
+                )
+            assert response.status_code in (401, 404), response.text
