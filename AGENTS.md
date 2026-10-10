@@ -760,7 +760,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           htmlpage(HTML 画面) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            624 项，改完必须全绿
+backend/tests/            627 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

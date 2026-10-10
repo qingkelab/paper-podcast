@@ -907,3 +907,57 @@ class TestSubtitleFitsTheBand:
         info = self._measure(session, tmp_path, "这套方法在 16 个任务上把精度保住了 67%。")
         assert info["size"] == 30, f"一句话的字幕被缩小了：{info['size']}px"
         assert info["lines"] == 1
+
+
+_POINT_JS = """(() => {
+  const p = document.querySelector('.point-text');
+  const row = document.querySelector('.point-row');
+  if (!p || !row) return null;
+  const pr = p.getBoundingClientRect(), rr = row.getBoundingClientRect();
+  return JSON.stringify({
+    size: parseFloat(getComputedStyle(p).fontSize),
+    spill: Math.round(pr.right - rr.right),
+    pageSpill: Math.round(pr.right - innerWidth),
+  });
+})()"""
+
+
+@requires_chrome
+class TestPointRowFitsTheBox:
+    """强调行「一行放下、放不下就缩字号」也必须真的生效。
+
+    它用的是 `scrollWidth <= clientWidth`，而 `.point-text` 原来是 flex 子项、宽度由内容决定
+    —— 两个值**一起长**，判据恒为真，字号自适应永远不触发。
+    后果：一段 27 字的强调行在竖版里量到 900px，直接越出 856px 的浅蓝底、连画面右边缘都越过了。
+
+    **判据不能用 `scrollWidth`**（就是它骗了我一次）：要量**边界矩形** ——
+    文字右边缘 vs 底框右边缘。真实数据里 216 条强调行都没溢出（产品自己的 20 字上限挡住了），
+    所以这条测试用的是**超过上限**的文案：约束失效时它会溢出，失效与否一眼看得出。
+    """
+
+    LONG = "在 16 个任务上把精度保住了 67%，显存却只要三分之一，这是它最反常的地方"
+
+    def _measure(self, session, tmp_path, point, layout=None):
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import scene_page
+
+        scene = _scene(tmp_path, caption="", text="", point=point)
+        session.open_page(scene_page(scene, layout or PORTRAIT), work_dir=tmp_path)
+        return json.loads(session._evaluate(_POINT_JS))
+
+    def test_long_point_shrinks_and_stays_inside(self, session, tmp_path):
+        info = self._measure(session, tmp_path, self.LONG)
+        assert info["size"] < 40, f"放不下就该缩字号，实际还是 {info['size']}px"
+        assert info["pageSpill"] <= 1, f"强调行越过了画面右边缘：{info['pageSpill']}px"
+        assert info["spill"] <= 1, f"强调行溢出了浅蓝底：{info['spill']}px"
+
+    def test_normal_point_keeps_the_max_font(self, session, tmp_path):
+        info = self._measure(session, tmp_path, "6.93 倍压缩，精度不掉")
+        assert info["size"] == 40, f"正常长度的强调行被缩小了：{info['size']}px"
+
+    def test_landscape_does_not_shrink_what_fits(self, session, tmp_path):
+        """横版底框 1792 宽，同样是这段话不该被缩 —— 约束生效之后别反噬。"""
+        from app.services.design import LANDSCAPE
+
+        info = self._measure(session, tmp_path, self.LONG, layout=LANDSCAPE)
+        assert info["size"] == 44, f"横版放得下却缩了字号：{info['size']}px"

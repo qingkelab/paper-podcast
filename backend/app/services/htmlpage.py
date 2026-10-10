@@ -284,6 +284,11 @@ html, body {
 .point-text {
   font-size: var(--point-font); font-weight: 600; color: %(point_text)s;
   margin: 0 18px; white-space: nowrap;
+  /* ⚠️ 必须给一个**有限宽度**：`flex: 1 1 auto` + `min-width: 0` 之后
+     这个元素的 clientWidth 才是「可用宽度」，而不是「内容宽度」。
+     否则 `scrollWidth <= clientWidth` 恒为真（两者一起长），
+     字号自适应永远不会触发，超长文案会直接溢出浅蓝底、甚至溢出画面。 */
+  flex: 1 1 auto; min-width: 0; overflow: hidden;
 }
 
 /* 数字高亮：论文解读里真正有信息量的往往就是那个「67%%」 */
