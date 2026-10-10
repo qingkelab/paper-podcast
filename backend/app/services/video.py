@@ -2283,6 +2283,7 @@ def encode_video(
     image_cards: list[Path | None] | None = None,
     transitions: list[Transition] | None = None,
     focus_overlays: list[Path | None] | None = None,
+    focus_animations: list[list[Path]] | None = None,
     waveform: bool = True,
     layout: Layout = PORTRAIT,
 ) -> VideoResult:
@@ -2337,6 +2338,9 @@ def encode_video(
     rows = point_rows or [None] * len(scenes)
     cards = image_cards or [None] * len(scenes)
     foci = focus_overlays or [None] * len(scenes)
+    # Tier B：某些段的聚光灯是**逐帧抓下来的帧序列**（而不是一张静态图）。
+    # 与 foci 互斥 —— 同一段要么叠静态图，要么叠序列。
+    focus_anims = focus_animations or [[] for _ in scenes]
     plan = transitions or [Transition() for _ in scenes]
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
@@ -2370,6 +2374,21 @@ def encode_video(
             def add_image(path: Path) -> int:
                 nonlocal counter
                 inputs.extend(["-loop", "1", "-framerate", str(FPS), "-i", str(path)])
+                position = counter
+                counter += 1
+                return position
+
+            def add_sequence(paths: list[Path]) -> int:
+                """挂一路图片序列（Tier B 逐帧抓下来的动画帧）。
+
+                序列是**有限**的：播完就该停在最后一帧，而 `overlay` 的
+                `eof_action` 默认正是 `repeat` —— 所以「先动一段、之后定住」
+                不用额外做什么，片段总长仍由 `-frames:v` 说了算（长度对齐不受影响）。
+                """
+                nonlocal counter
+                first = paths[0]
+                pattern = first.parent / f"{first.stem.rsplit('-', 1)[0]}-%04d.png"
+                inputs.extend(["-framerate", str(FPS), "-i", str(pattern)])
                 position = counter
                 counter += 1
                 return position
@@ -2454,7 +2473,19 @@ def encode_video(
             # 必须画在图片卡之后（它盖在图上），但要排在强调行/字幕/进度条之前 ——
             # 那些是画面上的独立信息，不该被压暗。
             focus_row = foci[index] if index < len(foci) else None
-            if focus_row is not None:
+            focus_frames = focus_anims[index] if index < len(focus_anims) else []
+            if focus_frames:
+                # Tier B：整层是逐帧重画出来的（压暗蒙版 + 框线 + 标签贴在一起，
+                # 整层平移会让「洞」跟着跑出画外，所以只能用帧序列）。
+                # 序列自带过程，**不再叠 fade** —— 叠了会把「移过去」糊成一团。
+                focus_in = add_sequence(focus_frames)
+                node += 1
+                graph.append(f"[{focus_in}:v]format=rgba[fo{node}]")
+                graph.append(
+                    f"[{last}][fo{node}]overlay={layout.image_box_left}:{layout.image_top}[v{node}]"
+                )
+                last = f"v{node}"
+            elif focus_row is not None:
                 focus_in = add_image(focus_row)
                 node += 1
                 graph.append(
@@ -2872,6 +2903,72 @@ def _render_endcard_layer(scene: Scene, path: Path, *, layout: Layout, session: 
     return path
 
 
+def _focus_morph_origin(
+    scenes: list[Scene], index: int
+) -> dict[str, Any] | None:
+    """这一段的聚光灯该**从哪儿移过来**；没有可移的就返回 None。
+
+    条件缺一不可：
+    - 上一段也框了同一张图（图都不一样，就没有「移动」可言）；
+    - 两处位置**确实不同**（差不到半个像素就没什么可移的，白花 14 次渲染）。
+
+    返回的是上一段的 focus（相对坐标），`focus_overlay_page` 会自己换算成像素。
+    """
+    if index <= 0:
+        return None
+    current, previous = scenes[index], scenes[index - 1]
+    if not current.focus or not previous.focus:
+        return None
+    if previous.image != current.image:
+        return None
+    if previous.brand == "outro" or current.brand == "outro":
+        return None
+    a, b = previous.focus, current.focus
+    moved = sum(
+        abs(float(a.get(key, 0)) - float(b.get(key, 0))) for key in ("x", "y", "w", "h")
+    )
+    if moved < FOCUS_MORPH_MIN_MOVE:
+        return None
+    return dict(a)
+
+
+# 位置差小于这个数（x/y/w/h 四个量加起来）就不做「移动」——
+# 差一两个像素的移动看不出来，却要花十几次渲染
+FOCUS_MORPH_MIN_MOVE = 0.02
+
+
+def _render_focus_animation(
+    scene: Scene,
+    focus: dict[str, Any],
+    origin: dict[str, Any],
+    *,
+    index: int,
+    layout: Layout,
+    work_dir: Path,
+    session: Any,
+) -> list[Path]:
+    """把「聚光灯从上一处移到这一处」逐帧抓下来（**Tier B**）。
+
+    只抓动画窗口那点帧（`FOCUS_MORPH_SEC × 30`），之后由 ffmpeg 让序列停在末帧
+    （`overlay` 的 `eof_action` 默认就是 repeat）。整片逐帧是 7500 帧 ≈ 15 分钟，
+    这里只要 14 帧 ≈ 1 秒 —— 这就是「只在动画窗口逐帧」的意思。
+    """
+    from .htmlpage import FOCUS_MORPH_SEC, focus_overlay_page
+
+    page = focus_overlay_page(scene, layout, focus, origin=origin)
+    count = max(int(round(FOCUS_MORPH_SEC * FPS)), 2)
+    times = [step / FPS for step in range(count)]
+    prefix = f"focus-{index:04d}"
+    frames = session.render_frames(page, times, work_dir, prefix=prefix, work_dir=work_dir)
+    logger.info(
+        "聚光灯移动：第 %d 段从上一处移过来（%d 帧 / %.2f 秒）",
+        index,
+        len(frames),
+        FOCUS_MORPH_SEC,
+    )
+    return frames
+
+
 @dataclass
 class RenderedLayers:
     """一次出片渲染出来的所有图层文件（编码阶段要用）。
@@ -2889,6 +2986,8 @@ class RenderedLayers:
     card_paths: list[Path]
     focus_rows: list[Path | None]
     focus_paths: list[Path]
+    # 逐帧抓下来的聚光灯动画（Tier B）：第 i 段是这一段的帧序列，没有就是空列表
+    focus_frames: list[list[Path]]
     image_ids: list[str]
     endcard_count: int = 0
     beat_count: int = 0
@@ -2907,7 +3006,8 @@ def _render_scene_layers(
     work_dir.mkdir(parents=True, exist_ok=True)
     result = RenderedLayers(
         slides=[], caption_bands=[], band_paths=[], point_rows=[], point_paths=[],
-        cards=[], card_paths=[], focus_rows=[], focus_paths=[], image_ids=[],
+        cards=[], card_paths=[], focus_rows=[], focus_paths=[], focus_frames=[],
+        image_ids=[],
     )
 
     with render_session(work_dir) as session:
@@ -2955,25 +3055,46 @@ def _render_scene_layers(
             result.image_ids.append(str(scene.image))
 
             # 聚光灯只框**论文原图**：我们生成的信息图/段落图是矢量示意图，
-            # 下一步会给它们做「逐元素长出来」，两套动效叠在一起反而乱。
-            if (
+            # 它们有自己的动效路线，两套叠在一起反而乱。
+            wants_focus = (
                 scene.focus
                 and scene.brand != "outro"
                 and card_path is not None
                 and scene.kind in ("figure", "table", "cover")
-            ):
-                focus_path = work_dir / f"focus-{index:04d}.png"
-                _render_focus_layer(
-                    scene,
-                    focus_path,
-                    focus=scene.focus,
-                    layout=layout,
-                    session=session,
-                )
-                result.focus_rows.append(focus_path)
-                result.focus_paths.append(focus_path)
+            )
+            frames: list[Path] = []
+            if wants_focus:
+                # Tier B：上一段也框了同一张图、而且位置不同 → 让聚光灯**移过去**
+                # （只有 HTML 路径做得到；退回 SVG 时就退回原来的淡入）
+                origin = _focus_morph_origin(scenes, index) if session is not None else None
+                if origin is not None:
+                    frames = _render_focus_animation(
+                        scene,
+                        scene.focus,
+                        origin,
+                        index=index,
+                        layout=layout,
+                        work_dir=work_dir,
+                        session=session,
+                    )
+                    # 帧序列自己带结尾状态（末帧就是目标位置），所以不再叠静态图：
+                    # 多叠一层会在序列播完后「跳」一下
+                    result.focus_rows.append(None)
+                    result.focus_paths.extend(frames)
+                else:
+                    focus_path = work_dir / f"focus-{index:04d}.png"
+                    _render_focus_layer(
+                        scene,
+                        focus_path,
+                        focus=scene.focus,
+                        layout=layout,
+                        session=session,
+                    )
+                    result.focus_rows.append(focus_path)
+                    result.focus_paths.append(focus_path)
             else:
                 result.focus_rows.append(None)
+            result.focus_frames.append(frames)
 
             if scene.point and scene.brand != "outro":
                 point_path = work_dir / f"point-{index:04d}.png"
@@ -3337,6 +3458,11 @@ def compose_video(
     image_ids = layers.image_ids
 
     transitions = plan_transitions(scenes, image_ids, cards=layers.cards, slides=layers.slides)
+    # 有「聚光灯移过来」的那一段**取消溶解**：入场交给聚光灯的运动。
+    # 两套动效同时演（图在溶、框在走）看着就是「画面在抖」，而且观众不知道该看哪。
+    for frame_index, frames in enumerate(layers.focus_frames):
+        if frames and frame_index < len(transitions):
+            transitions[frame_index] = Transition()
     moved = sum(1 for item in transitions if item.kind not in ("", "none"))
     logger.info(
         "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧，字幕分句 %d 段，转场 %d 处）",
@@ -3360,6 +3486,7 @@ def compose_video(
         image_cards=layers.cards,
         transitions=transitions,
         focus_overlays=layers.focus_rows,
+        focus_animations=layers.focus_frames,
         layout=layout,
     )
     result.assignment = strategy

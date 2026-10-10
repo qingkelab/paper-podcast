@@ -91,6 +91,9 @@ if TYPE_CHECKING:  # 只为类型注解；运行时不导入，避免与 video.p
 # 字幕带里「数字高亮」的观感（和强调行同一套浅蓝底）。
 # 老路径是「先算这一段文字的像素宽、再在它下面垫一个圆角矩形」，
 # 这里一个 `<span>` 的内联背景就够了。
+# 压暗的「洞」比框线本身大一圈：框线是压着边界画的，不大一圈的话框线自己会被压暗
+FOCUS_PAD = 5
+
 NUMBER_BG = POINT_BG
 NUMBER_TEXT = POINT_TEXT
 
@@ -594,50 +597,125 @@ def caption_band_page(text: str, layout: Layout) -> Page:
     return Page(html=_document(css, _layout_vars(layout), body), width=layout.width, height=band_h)
 
 
-def focus_overlay_page(scene: "Scene", layout: Layout, focus: dict[str, Any]) -> Page:
-    """图内聚光灯那一层（透明底）：图卡大小、与图片卡**同一坐标系**。
+# 聚光灯从上一处**移到**这一处要用多久。这个数字不大是有原因的：
+# 它是「讲解移动到了图里的另一块」，属于标记内容推进的那一类动效，
+# 只需要让眼睛跟得上；再慢就变成观众在等动画。
+FOCUS_MORPH_SEC = 0.45
 
-    做法上最能说明「HTML 换掉了什么」：老路径要用**四条压暗边**把中间那块「洞」围出来
-    （左上右下各算一次坐标，还得减去边框那圈 pad），框上的药丸标签还要
-    `(len(label) + 2) * size * 0.62` 这样估宽度。
-    这里压暗是一次 `box-shadow` 的扩散、标签宽度由浏览器量 —— 代码短一半，也不会算错。
 
-    聚光灯只框**论文原图**（信息图/段落图是矢量示意图，另有「逐元素长出来」那条路），
-    所以这里的定位逻辑跟图片卡里的图片摆放一致：等比居中。
-    """
+def _focus_rect(scene: "Scene", layout: Layout, focus: dict[str, Any]) -> tuple[float, float, float, float]:
+    """聚光灯框在图片卡里的像素位置（图片是等比居中的，所以要先算出图片的落点）。"""
     from .video import _prepare_image
 
-    _, img_w, img_h = _prepare_image(
-        scene.image, layout.image_box_w, layout.image_box_h
-    )
+    _, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, layout.image_box_h)
     img_x = (layout.image_box_w - img_w) / 2
     img_y = (layout.image_box_h - img_h) / 2
-    fx = img_x + float(focus["x"]) * img_w
-    fy = img_y + float(focus["y"]) * img_h
-    fw = float(focus["w"]) * img_w
-    fh = float(focus["h"]) * img_h
-    # 洞要比框本身大一圈：框线是**压着边界**画的，不大一圈的话框线自己会被压暗
-    pad = 5
+    return (
+        img_x + float(focus["x"]) * img_w,
+        img_y + float(focus["y"]) * img_h,
+        float(focus["w"]) * img_w,
+        float(focus["h"]) * img_h,
+    )
 
+
+def focus_overlay_page(
+    scene: "Scene",
+    layout: Layout,
+    focus: dict[str, Any],
+    *,
+    origin: dict[str, Any] | None = None,
+) -> Page:
+    """聚光灯图层；给了 `origin` 就做成「从上一处**移过来**」的动画页（Tier B）。
+
+    为什么这是一个值得逐帧抓的动效（而不是直接切过去）：
+    连着两段都在讲同一张图的**不同子图**时，聚光灯从 a 滑到 b 讲的是
+    「讲解走到这里了」—— 和强调行的滑入是同一类信号，只是对象换成了图里的位置。
+    而它**做不成 ffmpeg 表达式**：这一层是「压暗蒙版 + 框线 + 药丸标签」三件事贴在一起，
+    整层平移会让蒙版跟着走（洞跑到画外），只有逐帧重画才对。
+
+    没有 `origin` 时就是**一张静态图**（Tier A）：这一段的聚光灯是淡入进来的，
+    没有「从哪儿来」可言。
+    """
+    fx, fy, fw, fh = _focus_rect(scene, layout, focus)
     label = str(focus.get("label") or "").strip()
-    chip = (
-        f'<div class="focus-chip" data-clamp>{html_lib.escape(label)}</div>' if label else ""
+
+    if origin is None:
+        chip = f'<div class="focus-chip" data-clamp>{html_lib.escape(label)}</div>' if label else ""
+        body = (
+            f'<div class="focus-frame" style="left:{fx:.1f}px; top:{fy:.1f}px; '
+            f'width:{fw:.1f}px; height:{fh:.1f}px; --pad:{FOCUS_PAD}px">'
+            '<div class="focus-border"></div>'
+            f"{chip}"
+            "</div>"
+        )
+        return Page(
+            html=_document(BASE_CSS + LAYER_CSS + FOCUS_CSS, _layout_vars(layout), body),
+            width=layout.image_box_w,
+            height=layout.image_box_h,
+            transparent=True,
+        )
+
+    ox, oy, ow, oh = _focus_rect(scene, layout, origin)
+    old_label = str(origin.get("label") or "").strip()
+    # 旧框要是和新的完全重合，就没什么可移的（标签不同也一样：位置没动就别演动画）
+    moving = abs(ox - fx) > 0.5 or abs(oy - fy) > 0.5 or abs(ow - fw) > 0.5 or abs(oh - fh) > 0.5
+
+    new_chip = f'<div class="focus-chip chip-in" data-clamp>{html_lib.escape(label)}</div>' if label else ""
+    # 旧标签**留在原地**淡出：它是 `.focus-frame` 的子元素，所以不能挂在正在移动的那个框上
+    # （挂上去会跟着滑走，看起来像标签自己飞过去了）。这里单独用一个不带边框/蒙版的
+    # 同尺寸容器把它钉在旧位置。
+    old_chip = (
+        f'<div class="focus-frame chip-host" style="left:{ox:.1f}px; top:{oy:.1f}px; '
+        f'width:{ow:.1f}px; height:{oh:.1f}px; --pad:0px">'
+        f'<div class="focus-chip chip-out" data-clamp>{html_lib.escape(old_label)}</div>'
+        "</div>"
+        if old_label and old_label != label
+        else ""
+    )
+    frame_style = (
+        f"left:{ox:.1f}px; top:{oy:.1f}px; width:{ow:.1f}px; height:{oh:.1f}px; "
+        f"--pad:{FOCUS_PAD}px; --to-x:{fx:.1f}px; --to-y:{fy:.1f}px; "
+        f"--to-w:{fw:.1f}px; --to-h:{fh:.1f}px"
     )
     body = (
-        f'<div class="focus-frame" style="left:{fx:.1f}px; top:{fy:.1f}px; '
-        f'width:{fw:.1f}px; height:{fh:.1f}px; --pad:{pad}px">'
+        f'<div class="focus-frame {"focus-morph" if moving else ""}" '
+        f'style="{frame_style}; animation-duration:{FOCUS_MORPH_SEC}s">'
         '<div class="focus-border"></div>'
-        f"{chip}"
+        f"{new_chip}"
         "</div>"
+        f"{old_chip}"
     )
     return Page(
         html=_document(
-            BASE_CSS + LAYER_CSS + FOCUS_CSS, _layout_vars(layout), body
+            # ⚠️ 不要 `.format()`：这段 CSS 里全是 `{}`，会被当成占位符
+            BASE_CSS + LAYER_CSS + FOCUS_CSS + FOCUS_MORPH_CSS,
+            _layout_vars(layout),
+            body,
         ),
         width=layout.image_box_w,
         height=layout.image_box_h,
         transparent=True,
     )
+
+
+# 「移过去」只用一份样式：关键帧里**只写目标值**，起点自动取元素当下的
+# `left/top/width/height`（它们在行内样式里）——所以不必在 Python 里逐帧插值。
+FOCUS_MORPH_CSS = """
+.focus-morph {
+  animation-name: focus-morph;
+  animation-timing-function: cubic-bezier(.3,.7,.3,1);
+  animation-fill-mode: both;
+}
+@keyframes focus-morph {
+  to { left: var(--to-x); top: var(--to-y); width: var(--to-w); height: var(--to-h); }
+}
+/* 钉在旧位置的那个容器：只用来装「旧标签」，不画边框也不压暗 */
+.chip-host::before { display: none; }
+.chip-in { animation: chip-in .3s ease-out both; }
+.chip-out { animation: chip-out .3s ease-in both; }
+@keyframes chip-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes chip-out { from { opacity: 1; } to { opacity: 0; } }
+"""
 
 
 FOCUS_CSS = """
@@ -775,6 +853,7 @@ __all__ = [
     "SUBTITLE_MIN_FONT",
     "ENDCARD_CSS",
     "FOCUS_CSS",
+    "FOCUS_MORPH_SEC",
     "caption_band_page",
     "endcard_page",
     "focus_overlay_page",

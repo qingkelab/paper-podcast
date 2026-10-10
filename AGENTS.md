@@ -171,7 +171,8 @@ cd frontend && pnpm test:units
   所以是「轮询到文件再 kill」，不是失败。Playwright 装浏览器确实超时，别走它。
   实测 936×1210 ≈ 56~90 ms/帧；动画用 WAAPI seek（`a.currentTime = t` + 2 帧 rAF）可复现。
   **画面渲染现在默认就走这条路**（所有整页与图层都迁完了，SVG 降级为保底）：
-  两条路径怎么共存、踩过的坑、下一步搬什么 —— 见 **`docs/RENDERING.md`**。
+  两条路径怎么共存、Tier B（内容驱动动画页）怎么做与**为什么只做了聚光灯移动**、
+  踩过的坑 —— 见 **`docs/RENDERING.md`**。
 - **视频合成必须分两步**（先出纯视频轨，再用 `-c:v copy` 封音频）。
   一条命令把 concat 幻灯片和音频一起编码**无法对齐长度**：
   `-r 30 -shortest` 会多 2.4 秒，不加 `-r` 会少 12 秒，输入端 `-r 30` 直接崩到 0.8 秒。
@@ -759,7 +760,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           htmlpage(HTML 画面) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            605 项，改完必须全绿
+backend/tests/            616 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

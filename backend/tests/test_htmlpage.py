@@ -455,3 +455,272 @@ class TestEndcardAndFocusRendering:
         corner = alpha(6, 6)
         assert inside < 60, f"框内不该被压暗（alpha={inside}）"
         assert corner > 120, f"框外应当被压暗（alpha={corner}）"
+
+
+# ---------------------------------------------------------------------------
+# Tier B：内容驱动动画页（只对动画窗口逐帧抓取）
+# ---------------------------------------------------------------------------
+
+
+class TestFocusMorphPage:
+    """聚光灯「从上一处移过来」的页面：结构层面的检查（不启 Chrome）。"""
+
+    def test_static_page_has_no_animation(self, tmp_path):
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import focus_overlay_page
+
+        page = focus_overlay_page(
+            _scene(tmp_path), PORTRAIT, {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3, "label": "A"}
+        )
+        assert 'class="focus-frame focus-morph"' not in page.html
+
+    def test_morph_page_carries_both_labels(self, tmp_path):
+        """「移过去」时旧标签要**留在原地**淡出，新标签跟着框走。
+
+        所以旧标签必须挂在另一个容器上 —— 挂在正在移动的那个框上会跟着滑走，
+        看起来像标签自己飞过去了。
+        """
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import focus_overlay_page
+
+        page = focus_overlay_page(
+            _scene(tmp_path),
+            PORTRAIT,
+            {"x": 0.6, "y": 0.3, "w": 0.3, "h": 0.4, "label": "右侧"},
+            origin={"x": 0.05, "y": 0.1, "w": 0.3, "h": 0.4, "label": "左侧"},
+        )
+        assert 'class="focus-frame focus-morph"' in page.html, "移动动画的类没加上"
+        assert "chip-out" in page.html and "chip-in" in page.html
+        assert "左侧" in page.html and "右侧" in page.html
+        assert "chip-host" in page.html
+
+    def test_identical_rects_do_not_animate(self, tmp_path):
+        """位置没动就别演动画（同位置的两个标签不同也不该动）。"""
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import focus_overlay_page
+
+        rect = {"x": 0.2, "y": 0.2, "w": 0.3, "h": 0.3}
+        page = focus_overlay_page(
+            _scene(tmp_path),
+            PORTRAIT,
+            {**rect, "label": "B"},
+            origin={**rect, "label": "A"},
+        )
+        assert 'class="focus-frame focus-morph"' not in page.html, "位置没动却加了移动动画"
+
+
+class TestFocusMorphTrigger:
+    """什么时候该「移过来」：条件缺一不可（这条决定要不要花十几次渲染）。"""
+
+    def _scenes(self, tmp_path, *, second_focus, second_image=None, second_brand=""):
+        from app.services.video import Scene
+
+        image = make_png(tmp_path / "fig.png")
+        other = make_png(tmp_path / "other.png", 300, 300)
+        first = Scene(
+            start=0, end=5, image=image, kind="figure", text="第一段",
+            focus={"x": 0.05, "y": 0.1, "w": 0.3, "h": 0.4, "label": "左侧"},
+        )
+        second = Scene(
+            start=5, end=10, image=second_image or image, kind="figure", text="第二段",
+            focus=second_focus, brand=second_brand,
+        )
+        return [first, second]
+
+    def test_moves_when_the_same_figure_is_framed_elsewhere(self, tmp_path):
+        from app.services.video import _focus_morph_origin
+
+        scenes = self._scenes(
+            tmp_path, second_focus={"x": 0.6, "y": 0.3, "w": 0.3, "h": 0.4, "label": "右侧"}
+        )
+        origin = _focus_morph_origin(scenes, 1)
+        assert origin is not None and origin["label"] == "左侧"
+
+    def test_no_move_without_a_previous_spotlight(self, tmp_path):
+        from app.services.video import _focus_morph_origin
+
+        scenes = self._scenes(tmp_path, second_focus={"x": 0.6, "y": 0.3, "w": 0.3, "h": 0.4})
+        scenes[0].focus = None
+        assert _focus_morph_origin(scenes, 1) is None
+
+    def test_no_move_across_different_figures(self, tmp_path):
+        """换了一张图就没有「移动」可言 —— 框在另一张图上的位置毫无关系。"""
+        from app.services.video import _focus_morph_origin
+
+        scenes = self._scenes(
+            tmp_path,
+            second_focus={"x": 0.6, "y": 0.3, "w": 0.3, "h": 0.4},
+            second_image=make_png(tmp_path / "another.png", 320, 320),
+        )
+        assert _focus_morph_origin(scenes, 1) is None
+
+    def test_no_move_when_the_box_barely_changed(self, tmp_path):
+        from app.services.video import _focus_morph_origin
+
+        scenes = self._scenes(
+            tmp_path, second_focus={"x": 0.051, "y": 0.101, "w": 0.3, "h": 0.4}
+        )
+        assert _focus_morph_origin(scenes, 1) is None
+
+    def test_no_move_from_or_into_the_endcard(self, tmp_path):
+        from app.services.video import _focus_morph_origin
+
+        scenes = self._scenes(
+            tmp_path,
+            second_focus={"x": 0.6, "y": 0.3, "w": 0.3, "h": 0.4},
+            second_brand="outro",
+        )
+        assert _focus_morph_origin(scenes, 1) is None
+
+    def test_first_scene_has_nothing_to_move_from(self, tmp_path):
+        from app.services.video import _focus_morph_origin
+
+        scenes = self._scenes(tmp_path, second_focus={"x": 0.6, "y": 0.3, "w": 0.3, "h": 0.4})
+        assert _focus_morph_origin(scenes, 0) is None
+
+
+@requires_chrome
+class TestFocusMorphRendering:
+    def test_the_frame_actually_travels_and_ends_on_target(self, session, tmp_path):
+        """逐帧抓下来之后：框**真的在移动**，而且末帧**就是**静态版那一张。
+
+        后半句是关键：序列播完要接上「定住」的那段画面，末帧和静态版差一点，
+        观众就会看到画面跳一下。
+        """
+        import pymupdf
+
+        from app.services.design import FOCUS_BORDER, PORTRAIT
+        from app.services.htmlpage import FOCUS_MORPH_SEC, focus_overlay_page
+
+        scene = _scene(tmp_path, image=make_png(tmp_path / "fig2.png", 640, 480))
+        target = {"x": 0.62, "y": 0.30, "w": 0.30, "h": 0.45, "label": "右侧的结果"}
+        origin = {"x": 0.02, "y": 0.10, "w": 0.26, "h": 0.35, "label": "左侧"}
+        want = _hex(FOCUS_BORDER)
+
+        def border_left(path):
+            pix = pymupdf.Pixmap(str(path))
+            n, width, height = pix.n, pix.width, pix.height
+            data = pix.samples
+            xs = [
+                x
+                for y in range(0, height, 2)
+                for x in range(0, width, 2)
+                if data[(y * width + x) * n + 3] > 200
+                and all(abs(data[(y * width + x) * n + k] - want[k]) < 20 for k in range(3))
+            ]
+            return min(xs) if xs else None
+
+        page = focus_overlay_page(scene, PORTRAIT, target, origin=origin)
+        count = int(round(FOCUS_MORPH_SEC * 30))
+        frames = session.render_frames(
+            page, [i / 30 for i in range(count)], tmp_path / "morph", work_dir=tmp_path
+        )
+        positions = [border_left(path) for path in frames]
+        assert all(pos is not None for pos in positions), positions
+        assert positions[0] < positions[-1], f"框没有移动：{positions}"
+        assert all(
+            positions[i] <= positions[i + 1] + 2 for i in range(len(positions) - 1)
+        ), f"移动不单调：{positions}"
+
+        static_path = session.render(
+            focus_overlay_page(scene, PORTRAIT, target),
+            tmp_path / "static.png",
+            work_dir=tmp_path,
+        )
+        assert abs(border_left(frames[-1]) - border_left(static_path)) <= 1, (
+            "动画末帧和静态版对不上，接上去会跳一下"
+        )
+
+
+@requires_chrome
+class TestFocusMorphReachesTheVideo:
+    """端到端：帧序列真的进了 MP4，而且**长度对齐没破**。
+
+    这是 Tier B 唯一不能靠单测糊过去的地方 —— ffmpeg 那边多挂了一路图片序列输入，
+    一旦帧数或时间基没对上，整条片子就会比声音长/短，或者画面卡在错误的位置。
+    """
+
+    def _compose(self, tmp_path, monkeypatch):
+        import wave
+
+        from app.services.video import compose_video
+
+        monkeypatch.setenv("RENDER_BACKEND", "html")
+        assets = tmp_path / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        figure = make_png(assets / "fig.png", 640, 480, (245, 245, 245))
+        audio = tmp_path / "a.wav"
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 4)
+
+        class Timing:
+            def __init__(self, index, start, end):
+                self.index, self.speaker, self.start, self.end = index, "A", start, end
+
+        return compose_video(
+            segments=[
+                {"speaker": "A", "text": "先看左边这一块，它讲的是误差从哪里来。"},
+                {"speaker": "A", "text": "再看右边这一块，这里是它最终的结果。"},
+            ],
+            timings=[Timing(0, 0.0, 2.0), Timing(1, 2.0, 4.0)],
+            audio_path=audio,
+            audio_duration=4.0,
+            cover_path=None,
+            figures=[{"id": "f1", "path": str(figure), "kind": "figure", "caption": "Figure 1"}],
+            illustration_png=None,
+            work_dir=tmp_path / "work",
+            output_path=tmp_path / "out.mp4",
+            title="Morph",
+            llm=None,
+            preset_scenes=[
+                {"index": 0, "image": "f1", "point": "误差从哪里来",
+                 "focus": {"x": 0.03, "y": 0.10, "w": 0.26, "h": 0.35, "label": "左侧"}},
+                {"index": 1, "image": "f1", "point": "最终的结果",
+                 "focus": {"x": 0.62, "y": 0.30, "w": 0.30, "h": 0.45, "label": "右侧"}},
+            ],
+            preset_assets={"f1": str(figure)},
+            orientation="portrait",
+        )
+
+    def test_spotlight_moves_inside_the_encoded_video(self, tmp_path, monkeypatch):
+        import subprocess
+
+        import pymupdf
+
+        from app.services.design import FOCUS_BORDER
+        from app.services.video import probe_media_duration
+
+        result = self._compose(tmp_path, monkeypatch)
+        assert result.renderer == "html"
+        duration = probe_media_duration(tmp_path / "out.mp4")
+        assert duration is not None and abs(duration - 4.0) <= 0.3, (
+            f"多挂了一路序列输入之后长度对不上了：{duration}"
+        )
+
+        want = _hex(FOCUS_BORDER)
+
+        def border_left(at: float):
+            frame = tmp_path / f"f{at}.png"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", str(at), "-i", str(tmp_path / "out.mp4"),
+                 "-frames:v", "1", "-y", str(frame)],
+                check=True,
+            )
+            pix = pymupdf.Pixmap(str(frame))
+            n, width, height = pix.n, pix.width, pix.height
+            data = pix.samples
+            xs = [
+                x
+                for y in range(int(height * 0.1), int(height * 0.7), 2)
+                for x in range(0, width, 2)
+                if all(abs(data[(y * width + x) * n + k] - want[k]) < 30 for k in range(3))
+            ]
+            return min(xs) if xs else None
+
+        # 第二段从 2.0s 开始，动画窗口是它开头的 0.45 秒
+        early, late = border_left(2.05), border_left(2.45)
+        assert early is not None and late is not None, (early, late)
+        assert early < late - 40, f"成片里聚光灯没移动：{early} → {late}"
