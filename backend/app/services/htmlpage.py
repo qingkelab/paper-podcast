@@ -262,6 +262,10 @@ html, body {
 .subtitle-text {
   position: absolute; left: var(--subtitle-left); top: var(--subtitle-text-top);
   width: var(--subtitle-w);
+  /* ⚠️ 高度必须**显式给**：字号自适应靠 `scrollHeight <= clientHeight` 判断放不放得下，
+     而 height:auto 的元素这两者恒等 —— 约束会静默失效（检查永远为真）。
+     给死高度之后，放不下才会真的缩字号。 */
+  height: calc(var(--page-h) - var(--subtitle-text-top));
   font-size: %(subtitle_font).0fpx; line-height: 1.36; color: %(subtitle_text)s;
 }
 

@@ -140,6 +140,25 @@ with render_session(work_dir) as session:      # HTML 可用 → ChromeSession�
 `<span class="num">`，「6比特方案…」这种句子第一个子节点是元素不是文本节点 ——
 必须用 TreeWalker 走所有文本节点。
 
+## 两条「约束静默失效」的教训
+
+字号自适应那套判据（`scrollHeight <= clientHeight` / 行数 ≤ N）依赖一个前提：
+**被量的元素有确定的高度**。踩了两次同一个坑：
+
+1. `window.prepare()` 压根没被调用 → 所有判据都没跑（详见上面那条坑）；
+2. `.subtitle-text` 是 `height: auto` → 高度不限，`scrollHeight == clientHeight` 恒成立，
+   「放不下就缩字号」这条约束**永远为真**，等于没有。
+
+第 2 条的后果量得出来：136 字的字幕本来该缩到 29px，实际停在 30px，
+5 行的末行越过页面底边 6px（被 `.page` 的 `overflow: hidden` 裁掉）。
+把高度写死成「字幕区顶端 → 页面底边」之后就对了。
+
+**所以给这类约束写测试时，不能只断言「有没有缩」**，要断言**结果落在边界内**
+（`末行底边 <= 页高`）—— 前者在元素没有确定高度时会愉快地通过。
+
+量的时候还有个小坑：元素给了固定高度之后，`scrollHeight` 会被钳到盒高，
+短文本会被误报成「5 行」。**要量真实行盒**（逐字 `Range.getClientRects()` 按 top 分组）。
+
 ## 踩过的坑（都是实测）
 
 - **必须 `--no-sandbox`**：默认沙箱在本机报

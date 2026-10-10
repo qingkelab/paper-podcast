@@ -838,3 +838,72 @@ class TestTextNeverOverflowsItsBox:
             "parseFloat(getComputedStyle(document.querySelector('.caption')).fontSize)"
         )
         assert 14 <= size < 18, f"长图注应当把字号压到 18 以下（实际 {size}）"
+
+
+_SUBTITLE_LINES_JS = """(() => {
+  const el = document.querySelector('.subtitle-text');
+  if (!el) return null;
+  // 用真实行盒量，**不要**用 `scrollHeight`：元素给了固定高度之后它会被钳到盒高，
+  // 短文本会被误报成「5 行」（这个坑我在量的时候踩过一次）。
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const tops = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    for (let i = 0; i < node.length; i++) {
+      const r = document.createRange(); r.setStart(node, i); r.setEnd(node, i + 1);
+      const rects = r.getClientRects();
+      if (!rects.length) continue;
+      const top = Math.round(rects[0].top);
+      if (!tops.some(t => Math.abs(t.top - top) <= 2)) {
+        tops.push({ top: top, bottom: Math.round(rects[0].bottom) });
+      }
+    }
+  }
+  tops.sort((a, b) => a.top - b.top);
+  return JSON.stringify({
+    size: parseFloat(getComputedStyle(el).fontSize),
+    lines: tops.length,
+    lastBottom: tops.length ? tops[tops.length - 1].bottom : 0,
+    pageH: innerHeight,
+  });
+})()"""
+
+
+@requires_chrome
+class TestSubtitleFitsTheBand:
+    """整页字幕「放不下就缩字号」这条约束必须真的生效。
+
+    它靠 `scrollHeight <= clientHeight` 判断，而 `.subtitle-text` 原来是 `height: auto` ——
+    auto 高度下这两个值恒等，检查**永远为真**，等于没有约束。
+    改法是把高度写死成「字幕区顶端到页面底部」，量出来才对得上：
+
+    | 字幕长度 | 修之前 | 修之后 |
+    |---|---|---|
+    | 136 字 | 30px / 5 行，末行底边**超出页面** 6px | 29px / 5 行，正好落在页面内 |
+    | 375 字（超出 TTS 单轮上限，理论上不会有） | 越界 47px | 缩到 20px 下限后仍越界 —— 这是**明面上的**残留，不是静默出错 |
+    """
+
+    def _measure(self, session, tmp_path, text):
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import scene_page
+
+        scene = _scene(tmp_path, caption="", text=text)
+        session.open_page(scene_page(scene, PORTRAIT), work_dir=tmp_path)
+        return json.loads(session._evaluate(_SUBTITLE_LINES_JS))
+
+    def test_long_subtitle_shrinks_to_stay_inside_the_page(self, session, tmp_path):
+        text = (
+            "线性注意力模型会把历史信息压成一个固定大小的状态矩阵，不像传统注意力那样"
+            "随上下文越变越大，这是它省显存的原因，也是并发服务上的麻烦来源。"
+        ) * 2
+        info = self._measure(session, tmp_path, text)
+        assert info["size"] < 30, f"放不下就该缩字号，实际还是 {info['size']}px"
+        assert info["lastBottom"] <= info["pageH"], (
+            f"末行越过了页面底边：{info['lastBottom']} > {info['pageH']}"
+        )
+
+    def test_short_subtitle_keeps_the_max_font(self, session, tmp_path):
+        """短字幕不该被误缩 —— 约束生效之后要确认它没有反噬。"""
+        info = self._measure(session, tmp_path, "这套方法在 16 个任务上把精度保住了 67%。")
+        assert info["size"] == 30, f"一句话的字幕被缩小了：{info['size']}px"
+        assert info["lines"] == 1
