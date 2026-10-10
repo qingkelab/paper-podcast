@@ -248,9 +248,17 @@ def build_assign_messages(
 # Quantization」）在封面大字上既长又没有钩子，观众扫一眼就走了。封面要的是
 # 「**跟我有关 / 有意思**」的一句话，原题放在它下面那行小字里（见 build_scenes 的
 # cover_caption）—— 两行各司其职：一行抓人，一行交代出处。
-HOOK_MAX_CHARS = 16
+# 20 是「竖版封面大字 @54px 一行放得下」的上限附近：面板内宽 732px，
+# 54px 的中文一行约 13 字、两行约 27 字 —— 20 个字排两行（每行 10 字）绰绰有余，
+# 而且标题长了还能靠 HTML 的 `fitText` 自动缩字号，不会挤破面板。
+# 提示词里写 18、这里写 20，是**故意留的余量**：模型偶尔多写一两个字不该被截。
+HOOK_MAX_CHARS = 20
 # 断在标点处至少要保留多少比例的内容，否则宁可不按标点断
 HOOK_BREAK_KEEP = 0.6
+# 超出上限**这么多字以内**就整句留着，不做任何截断。
+# 中文词之间没有空格，截断必然落在词中间；而封面的字号是自适应的，
+# 多两三个字只是缩一点字号。宁可略长，也不要砍出半个词。
+HOOK_TAIL_GRACE = 3
 HOOK_MAX_WORDS_EN = 9
 
 HOOK_SYSTEM = """你在给一个「论文解读视频」写**封面标题**。
@@ -259,7 +267,7 @@ HOOK_SYSTEM = """你在给一个「论文解读视频」写**封面标题**。
 你要写的不是论文的名字，而是**让人想点开的那一句话**。
 
 规则：
-- **不超过 14 个字**（写到 16 个字就已经是上限，超了会被我们截断 —— 与其被截，
+- **不超过 18 个字**（写到 20 个字就已经是上限，超了会被我们截断 —— 与其被截，
   不如一开始就把话说短）。封面上的字号很大，长一点就挤成两行小字。
 - 必须来自这篇论文**真实的内容**：它解决了什么、发现了什么、结果有多反常。
   **不许编造**数字或结论，论文里没有的别写。
@@ -323,7 +331,7 @@ def build_hook_messages(
 - 实验与结果：{joined("experiments", limit=200) or "（未提供）"}
 - 核心结论：{joined("conclusion", limit=160) or "（未提供）"}
 
-请写一句不超过 14 个字的封面标题，只输出这一行字。"""
+请写一句不超过 18 个字的封面标题，只输出这一行字。"""
     else:
         user = f"""[PAPER TITLE] {title or "(not provided)"}
 
@@ -358,8 +366,9 @@ def normalize_hook(raw: Any, *, language: str = "zh") -> str:
             flags=re.IGNORECASE,
         )
         # 模型爱把风格名一起写出来（「反差型：省了显存却更容易崩」）——那是给它自己看的，
-        # 顶到封面上很出戏。只认「XX型：」这一种形态，真实标题里极少这么开头。
-        line = re.sub(r"^[\u4e00-\u9fffA-Za-z]{2,5}型\s*[:：]\s*", "", line)
+        # 顶到封面上很出戏。只认「XX型」这一种形态，真实标题里极少这么开头。
+        # 分隔符要认全：`:：` 之外还有 `|`（「数字结论型 | 6.93 倍压缩」这种也实测出现过）。
+        line = re.sub(r"^[\u4e00-\u9fffA-Za-z]{2,5}型\s*[:：|｜]\s*", "", line)
         line = re.sub(r"^[（(]\s*[1-4]\s*[)）]\s*", "", line)
         line = line.strip().strip('"\'“”「」《》【】`').replace("**", "").strip()
         line = re.sub(r"\s+", " ", line).rstrip("。．.,，;；!！?？~～")
@@ -385,7 +394,12 @@ def normalize_hook(raw: Any, *, language: str = "zh") -> str:
 # 硬砍到第 16 个字是不行的 —— 实测砍出来过「4 比特状态量化，反超均匀 IN」（把 INT8 砍成 IN）、
 # 「4-bit 反超 INT8，显存」（半句）。封面上的大字出现半句比短一句难看得多，
 # 所以优先在**标点/分句处**断开，其次至少不要把一个词砍成两半。
-_HOOK_BREAKS = "，。、；：！？；,.;:!?/|"
+#
+# ⚠️ **不要**把 `/`、`|` 放进来。它们看着像分隔符，实际是**词中间的分隔符**
+# （「Qwen/Kimi 同款」是一个整体），拿它当断句点会砍出
+# 「显存直降 68.7%！Qwen」—— 正好丢掉最有信息量的那半句（实测就是这么砍的）。
+# 模型那种「数字结论型 | …」的前缀由 `normalize_hook` 单独剥，不靠这里。
+_HOOK_BREAKS = "，。、；：！？,.;:!?"
 
 
 def _trim_hook(text: str, *, language: str) -> str:
@@ -404,13 +418,26 @@ def _trim_hook(text: str, *, language: str) -> str:
 
     if len(text) <= HOOK_MAX_CHARS:
         return text
+    # 只超出一两个字就**整句留着**：中文的词之间没有空格，硬砍在第 20 个字上
+    # 会把结尾那个词砍成两半（实测：「…INT8 基准」→「…INT8 基」）。
+    # 而封面上那行大字现在是 HTML 按真实字形自适应的（`fitText`），
+    # 多一两个字只会让它缩一点字号 —— 比砍出半个词体面得多。
+    if len(text) <= HOOK_MAX_CHARS + HOOK_TAIL_GRACE:
+        return text
     window = text[:HOOK_MAX_CHARS]
     cut = max(window.rfind(ch, HOOK_MAX_CHARS // 2) for ch in _HOOK_BREAKS)
     # 只在「断在标点处仍然保留了大部分内容」时才用标点断句：
     # 否则会砍成「4 比特状态量化」这种只剩前半句的标题（实测出现过）。
     if cut >= HOOK_MAX_CHARS * HOOK_BREAK_KEEP:
         return window[:cut].strip()
-    # 没有合适的标点：至少别把结尾那个词砍成两半（「反超均匀 IN」→「反超均匀」）
+    # 窗口里没有合适的标点，就看看**后面第一个**标点在哪：断在那儿读起来是一句完整的话，
+    # 代价是多几个字。封面那行大字是自适应的，多这三五个字只是缩一点字号 ——
+    # 比硬砍在词中间（「…INT8 基准」→「…INT8 基」）体面得多。
+    ahead = [index for ch in _HOOK_BREAKS if (index := text.find(ch, HOOK_MAX_CHARS)) >= 0]
+    if ahead and min(ahead) <= HOOK_MAX_CHARS + HOOK_TAIL_GRACE * 2:
+        return text[: min(ahead)].strip()
+    # 后面也没有标点（或者离得太远）：硬砍，至少别把结尾的英文/数字词砍成两半
+    # （「反超均匀 IN」→「反超均匀」）
     trimmed = re.sub(r"[A-Za-z0-9.%+\-]+$", "", window).strip()
     return _strip_trailing_stopwords(trimmed or window, language=language, floor=HOOK_MAX_CHARS // 2)
 

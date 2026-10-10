@@ -398,6 +398,25 @@ V2 起每集属于一个用户，并且可以对外分享。三个字段：
 画出来的。两条路径现在同时在（HTML 是默认，SVG 是保底 —— 没装 Chrome 就自动降级），
 所以「同一篇论文两台机器出的画面不一样」这类问题得有一句话可查。见 `RENDERING.md`。
 
+### 写接口必须带 `Content-Type: application/json`
+
+**踩过的坑**：`PATCH /cover` 的前端请求少写了这个头，body 以 `text/plain` 发出去，
+FastAPI 只把 `application/json` 当对象解析，于是回：
+
+```json
+{"detail":[{"type":"model_attributes_type","loc":["body"],
+  "msg":"Input should be a valid dictionary or object to extract fields from",
+  "input":"{\"headline\":\"显存直降 68.7%！Qwen/Kimi 同款 \"}"}]}
+```
+
+**那个 `input` 回显的是整段 JSON 字符串**，所以第一眼像「前端双重序列化了」——
+其实**只是缺这个头**。实测同一个 JSON 对象：带头 200，不带头就报这个错。
+
+- `frontend/scripts/check-api-requests.mjs`（跑在 `pnpm test:units` 里）会扫 `real.ts`：
+  凡是 `body: JSON.stringify(...)` 的请求都必须有这个头。`FormData` 的请求**不该**带
+  （浏览器要自己加 multipart boundary），脚本会跳过。
+- 加新写接口时照抄已有的写法，别只写 `body`。
+
 ### `video.stale` 字段
 
 `true` 表示**视频里的画面已经跟不上当前配图**了（你旋转/删除过配图，

@@ -10,7 +10,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "build:mock": "VITE_USE_MOCK=1 vite build",
     "typecheck": "vue-tsc --noEmit",
-    "test:units": "node --experimental-strip-types --no-warnings scripts/check-share-x.mjs",
+    "test:units": "node --experimental-strip-types --no-warnings scripts/check-share-x.mjs && node scripts/check-api-requests.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

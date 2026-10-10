@@ -363,18 +363,11 @@ cd frontend && pnpm test:units
 
 ### 配图理由：`video.scenes[i].why`
 
-模型在**逐段选图的同一次调用**里顺带写一句「这一段为什么配这张图」（`ASSIGN_SYSTEM` 的
-`why`，存库前截到 `ASSIGN_WHY_MAX_CHARS = 40`）。**只存不渲染**，是「图文相符」的复查依据
-（「图像不像文中说的那样」是唯一没法自动判定的错误）。三条规矩（测试 `TestAssignmentNotes`）：
-
-- **只在采纳了它那张图时才收理由**（段号越界、图 id 编造 → 理由一并丢），否则会出现
-  「理由说 f2、画面是 f1」。
-- **缺失项不延续**。选图漏段会沿用上一段的图，但理由不能跟着沿用（那是假信息）。
-  所以 `_assignment_notes` 与被测试钉住的 `_normalize_per_segment` 刻意分成两个函数。
-- **重新合成时一起复用**（同 `point`/`focus`）。
-
-旧数据没有 `why`；补时**图不动**，只让模型解释一遍旧分配后写回（不参与渲染，
-下次 `rebuild_video` 自然带下去）。
+模型在**逐段选图的同一次调用**里顺带写一句「这一段为什么配这张图」，
+**只存不渲染** —— 「图像不像文中说的那样」是唯一没法自动判定的错误，有这一列才能复查。
+三条规矩（测试 `TestAssignmentNotes`）：**只在采纳了那张图时才收理由**；
+**缺失项不延续**（沿用上一段的理由是假信息）；**重新合成时一起复用**。
+细节见 `docs/API.md`。
 
 **补配图（图注解析修好之后用）**：`rebuild_video` 复用旧分配，所以新提取到的图
 不会自动上画。要跑一次「重新选图」：`build_asset_pool`（+ 上次现场生成的主题图）
@@ -453,15 +446,15 @@ cd frontend && pnpm test:units
   只放一帧的话标题一秒就没了，观众来不及读。
 - **没有封面图就不硬贴标题**（`cover_asset is None` 时 headline 一律为空）。
 
-**爆款标题的写法**（`HOOK_SYSTEM` / `HOOK_SYSTEM_EN`）：不超过 14 个字（英文 8 词），
+**爆款标题的写法**（`HOOK_SYSTEM` / `HOOK_SYSTEM_EN`）：不超过 18 个字（英文 8 词），
 四档风格（数字结论 / 悬念提问 / 反差 / 代价）**挑最贴的一档**，必须来自论文真实内容、
-不许编数字，不要学术腔开头。prompt 里写 14 而代码上限是 16，是故意留的余量。
+不许编数字，不要学术腔开头。**提示词写 18、代码上限 `HOOK_MAX_CHARS` 写 20**
+（测试钉着「提示词里的数字 == 代码上限」）；超出 20 不到 `HOOK_TAIL_GRACE`(3) 个字一律
+整句留着 —— 中文词之间没空格，硬砍必然砍在词中间。
 
-**超长标题的截断要在分句处**（`_trim_hook`）。硬砍到第 16 个字实测砍出过
-「4 比特状态量化，反超均匀 **IN**」（把 INT8 砍成 IN）和「4-bit 反超 INT8，显存」（半句）。
-现在的顺序是：① 先看能不能断在标点（且保留 ≥60% 的内容）；② 否则至少别把一个词砍成两半；
-③ 再去掉结尾的虚词。英文同理：词数超了就退回上一个分句
-（「Quantization errors aren't uniform**; only some last**」→「…aren't uniform」）。
+**超长标题的截断要在分句处**（`_trim_hook`）。硬砍实测砍出过半句（「反超均匀 **IN**」——
+把 INT8 砍成 IN）。顺序是：① 窗口里靠后的标点（保留 ≥60% 才用）；② 否则**后面第一个**标点
+（多几个字但读得通）；③ 都没有才硬砍，且不把结尾的英文词砍成两半。英文同理。
 
 **标题是「写一次、以后复用」的数据**：存在 `video.hook`（和 `scenes[i].point` 同一个道理），
 `rebuild_video` 通过 `preset_hook` 传回来 —— 重新合成时不该换一句话。
@@ -480,6 +473,10 @@ cd frontend && pnpm test:units
   分两步是有意的 —— 重新合成要一分钟上下，用户想先把标题改满意再合成一次。
 - 写进去的值过和模型那条**同一套清理**（`normalize_hook`），所以返回值和传入值可能不同，
   **界面要显示返回值**（前端保存后会用返回的 `video.hook` 回填输入框）。
+- **写接口少 `Content-Type: application/json` 就整个不能用**（用户反馈标题改不了）：
+  body 会以 `text/plain` 发出去，FastAPI 报的错里回显整段 JSON 字符串，**看着像双重序列化**。
+  `pnpm test:units` 里新增的脚本会扫源码盯住这条（详见 `docs/API.md`）。
+- **`_HOOK_BREAKS` 里不要放 `/`、`|`**：它们是词中间的分隔符（「Qwen/Kimi 同款」是一个整体）。
 - 实测抓到过一个真 bug：模型（和用户）很爱写 `"封面标题：…"` 这种「引号 + 前缀」组合，
   而当时的顺序是「先去前缀、再去引号」—— 引号挡住了以行首为锚的前缀正则，
   结果「封面标题：4 比特状态量化」整个存了进去。现在先去外层装饰（引号、markdown 星号）
@@ -760,7 +757,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           htmlpage(HTML 画面) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            627 项，改完必须全绿
+backend/tests/            632 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

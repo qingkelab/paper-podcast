@@ -1501,12 +1501,12 @@ onBeforeUnmount(() => {
             </summary>
             <div class="cover-edit__body">
               <label class="cover-edit__field">
-                <span class="cover-edit__label">封面大字（爆款标题）</span>
+                <span class="cover-edit__label">封面大字（爆款标题，建议 18 字内、最长 23）</span>
                 <input
                   v-model="coverHeadlineDraft"
                   class="input"
                   type="text"
-                  maxlength="24"
+                  maxlength="23"
                   placeholder="例如：并发到 70，模型就装不下了"
                   :disabled="savingCover"
                   @input="coverTouched = true"

@@ -2737,7 +2737,10 @@ class TestCoverHeadline:
         )
         system = zh[0]["content"]
         assert "封面标题" in system
-        assert "16" in system and "截断" in system, "要写明超长会被截断"
+        # 提示词里的上限必须和**代码里的**上限一致（`HOOK_MAX_CHARS`）——
+        # 这一条比写死一个数字有用：以后改上限时，只改代码不改提示词就会在这里失败。
+        assert str(HOOK_MAX_CHARS) in system, "提示词里要写明代码真实的上限"
+        assert "截断" in system, "要写明超长会被截断"
         assert "不许编造" in system
         assert "STEPQuant" in zh[1]["content"], "原题要作为材料给进去"
 
@@ -2755,15 +2758,66 @@ class TestCoverHeadline:
         # 多行时取第一行**有内容的**（「标题」这种标签被剥掉后是空的）
         assert normalize_hook("标题\nsaves memory, breaks accuracy") == "saves memory"
 
+    def test_limit_leaves_a_full_twenty_char_headline_intact(self):
+        """上限是 20 个字：正好 20 个字**不能被截**（差一个字就是标题断半句）。
+
+        上限提到 20 的来由：HTML 封面的大字靠 `fitText` 自适应，
+        20 个字在面板里排两行绰绰有余，所以没必要卡在 16。
+        """
+        assert HOOK_MAX_CHARS == 20
+        exactly = "显存直降六成八，Qwen 同款的量化方案"      # 正好 20 个字
+        assert len(exactly) == HOOK_MAX_CHARS
+        assert normalize_hook(exactly) == exactly
+
+    def test_overlong_headline_is_trimmed_not_cut_mid_sentence(self):
+        """超过 20 个字要在分句处收短，而不是硬砍到第 20 个字。"""
+        long = "显存直降六成八！Qwen 和 Kimi 都在用的那套量化方案，居然还能更快"
+        trimmed = normalize_hook(long)
+        assert len(trimmed) <= HOOK_MAX_CHARS, (len(trimmed), trimmed)
+        assert trimmed in long, "截出来的必须是原文的一段，不能凭空造"
+        assert not trimmed.endswith(("，", "、", "的", "和")), f"结尾是个虚词/逗号：{trimmed}"
+
     def test_normalize_is_empty_safe(self):
         assert normalize_hook("") == ""
         assert normalize_hook(None) == ""
         assert normalize_hook("标题：") == ""
 
     def test_long_hook_breaks_at_a_clause_not_mid_word(self):
-        """实测被硬砍出来过「4 比特状态量化，反超均匀 IN」——把 INT8 砍成了 IN。"""
-        assert normalize_hook("4 比特状态量化，反超均匀 INT8 基准") == "4 比特状态量化，反超均匀"
-        assert "IN" != normalize_hook("4 比特状态量化，反超均匀 INT8 基准")[-2:]
+        """实测被硬砍出来过「4 比特状态量化，反超均匀 IN」——把 INT8 砍成了 IN。
+
+        上限提到 20 之后这种「刚好超一点点」的情况会**整句留着**（中文没空格，
+        硬砍必然砍在词中间），所以这里用真正超长的输入来测截断本身。
+        """
+        text = "4 比特状态量化，反超均匀 INT8 基准，显存降七成"
+        result = normalize_hook(text)
+        assert result in text, "截出来的必须是原文的一段"
+        assert len(result) <= HOOK_MAX_CHARS + 6, (len(result), result)
+        # 不许把结尾的英文/数字词砍成两半
+        assert not result.endswith(("IN", "INT", "I")), result
+        assert result == "4 比特状态量化，反超均匀 INT8 基准", "应当断在后一个逗号处"
+
+    def test_slash_is_not_a_break_point(self):
+        """`/` 是**词中间**的分隔符，不能当断句点。
+
+        实测：用户把封面标题写成「显存直降 68.7%！Qwen/Kimi 同款」，
+        结果被砍成「显存直降 68.7%！Qwen」—— 正好丢掉最有信息量的那一半（哪些模型）。
+        """
+        text = "显存直降 68.7%！Qwen/Kimi 同款"
+        assert normalize_hook(text) == text
+        # 超长时也要保住斜杠两边
+        longer = "显存直降 68.7%！Qwen/Kimi 同款，显存直降"
+        assert "Qwen/Kimi" in normalize_hook(longer)
+
+    def test_style_prefix_with_a_pipe_is_stripped(self):
+        """模型会把风格名一起写出来，分隔符不只有冒号（`|` 也实测出现过）。"""
+        assert normalize_hook("数字结论型 | 6.93 倍压缩，精度不掉") == "6.93 倍压缩，精度不掉"
+        assert normalize_hook("悬念提问型｜并发到 70 就装不下了？") == "并发到 70 就装不下了"
+
+    def test_a_few_chars_over_the_limit_is_kept_whole(self):
+        """只超两三个字就整句留着：砍在词中间（「…基准」→「…基」）比略长难看得多。"""
+        text = "4 比特状态量化，反超均匀 INT8 基准"      # 21 字，比上限多 1
+        assert len(text) == HOOK_MAX_CHARS + 1
+        assert normalize_hook(text) == text
 
     def test_long_english_hook_falls_back_to_the_last_clause(self):
         """英文按词数截会截到句子中间（实测「…aren't uniform; only some last」）。"""
@@ -3120,6 +3174,7 @@ class TestCoverTitleCanBeEdited:
             assert response.json()["video"]["hook"] == self.HEADLINE
 
     def test_headline_is_normalized_like_the_model_written_one(self, tmp_path):
+        """用户写的标题走和模型那条**同一套清理**：去引号、去「封面标题：」前缀、超长收短。"""
         with self._client(tmp_path) as client:
             episode_id = self._seed(client)
             client.patch(
@@ -3127,7 +3182,18 @@ class TestCoverTitleCanBeEdited:
                 json={"headline": '"封面标题：4 比特状态量化，反超均匀 INT8 基准"'},
             )
             hook = client.get(f"/api/episodes/{episode_id}").json()["video"]["hook"]
-            assert hook == "4 比特状态量化，反超均匀", hook
+            # 21 个字：上限 20 + 宽限 3 之内，**整句留着**（硬砍会砍在「基准」中间）
+            assert hook == "4 比特状态量化，反超均匀 INT8 基准", hook
+
+            # 真正超长的才会被收短，而且收短之后仍然是一句完整的话
+            client.patch(
+                f"/api/episodes/{episode_id}/cover",
+                json={"headline": "4 比特状态量化，反超均匀 INT8 基准，显存还能再降七成"},
+            )
+            trimmed = client.get(f"/api/episodes/{episode_id}").json()["video"]["hook"]
+            assert len(trimmed) <= 26, trimmed
+            assert trimmed.startswith("4 比特状态量化"), trimmed
+            assert not trimmed.endswith(("，", "、")), trimmed
 
     def test_empty_headline_clears_it(self, tmp_path):
         """清空 = 回到「封面显示论文原题」，而不是留一个空标题。"""

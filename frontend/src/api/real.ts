@@ -282,7 +282,17 @@ export function updateCover(
   if (input.paperTitle !== undefined) body.paper_title = input.paperTitle
   return request<Episode>(
     `/episodes/${encodeURIComponent(id)}/cover${langQuery(input.lang)}`,
-    { method: 'PATCH', body: JSON.stringify(body) },
+    {
+      method: 'PATCH',
+      // ⚠️ 这个头不能少：FastAPI 只在 `application/json` 下才把 body 当对象解析。
+      // 漏了它会以 `text/plain` 发出去，后端报
+      // 「Input should be a valid dictionary or object to extract fields from」，
+      // 而且 error 里回显的 `input` 是**整段 JSON 字符串**——
+      // 看着像前端双重序列化了，实际是**缺这个头**（实测：同一个 JSON 对象，
+      // 带这个头 200、不带就报那个错）。同类请求里 albums/batch 都带了，就这处漏了。
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
   )
 }
 
