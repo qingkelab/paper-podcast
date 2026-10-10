@@ -309,6 +309,7 @@ class TestHtmlPipeline:
 
         from app.services.design import PORTRAIT, SUBTITLE_BG
         from app.services.video import (
+            _render_band_layer,
             _render_card_layer,
             _render_chrome_layer,
             _render_point_layer,
@@ -322,6 +323,9 @@ class TestHtmlPipeline:
             ("card", lambda p, s: _render_card_layer(scene, p, layout=PORTRAIT, session=s)),
             ("point", lambda p, s: _render_point_layer(
                 scene.point, p, layout=PORTRAIT, session=s)),
+            # 字幕带也要比：它是**最窄的一层**（936×242），差一行就错位
+            ("band", lambda p, s: _render_band_layer(
+                "这一句字幕要放得下，还要把 67% 标出来。", p, layout=PORTRAIT, session=s)),
         ]
         for name, render in cases:
             svg_path = render(tmp_path / f"{name}-svg.png", None)

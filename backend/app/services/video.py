@@ -2737,12 +2737,16 @@ def default_asset_id(pool: dict[str, ImageAsset]) -> str:
 # 为什么要换：老路径的排版全是 Python 手算的（折行靠近似字宽表、放不下就试六档字号、
 # 数字高亮的底色靠手工累加每个字的宽度）。这些浏览器都做得更准，而且**代码少一个数量级**。
 #
-# 实测（这台机器，Chrome 154 / 936×1210）：
-# - 整页 125ms/张、图片卡 106ms/张、字幕带 83ms/条（其中截图本身占 42ms）；
-# - 一条 30 段脚本的片子 ≈ 90 张图层页 + 约 500 条字幕带。
-#   **所以字幕带暂时还留在 SVG 那一边**：它是 500 次渲染、却又是版式最简单的一层
-#   （一行字 + 数字底色）。等它按「一场戏所有句子拼成一张长图、ffmpeg 用 crop 取」
-#   批量渲染之后（预计从 40s 压到 2s），再搬过来才有意义。
+# 实测（这台机器，Chrome 154 / 936×1210）：整页 125ms、图片卡 106ms、强调行/聚光灯约 60ms、
+# 字幕带 80ms（其中截图本身占 42ms）。对照 **SVG 路径的字幕带只要 14ms**。
+#
+# 一条真实片子的图层数量（量过库里 7 集，跨语言）：整页/卡片/强调行各 30~90 张、
+# **字幕带只有 26~72 条**（`CAPTION_BEAT_MAX = 2`，绝大多数段不需要拆）。
+# 所以全部搬过来只比原来多 2~3 秒 —— 这个代价换「只剩一个渲染器」是划算的。
+#
+# 反过来说，如果哪天字幕带真的涨到几百条（比如把 `CAPTION_MAX_LINES` 放宽到 3 行、
+# 或切成更碎的句子），代价就变成几十秒，那时再上「一场戏所有句子拼一张长图 +
+# ffmpeg crop 取每一条」（能省掉每条的固定开销，约 2 倍）——**别提前做**。
 RENDER_HTML_LAYERS_ENV = "RENDER_HTML_LAYERS"
 
 
@@ -2833,6 +2837,16 @@ def _render_point_layer(point: str, path: Path, *, layout: Layout, session: Any)
     from .htmlpage import point_row_page
 
     session.render(point_row_page(point, layout), path, work_dir=path.parent)
+    return path
+
+
+def _render_band_layer(beat: str, path: Path, *, layout: Layout, session: Any) -> Path:
+    """字幕带层：单独一层是为了「字幕逐句出现」（每句一条带子按时序叠上去）。"""
+    if session is None:
+        return render_caption_band(beat, path, layout=layout)
+    from .htmlpage import caption_band_page
+
+    session.render(caption_band_page(beat, layout), path, work_dir=path.parent)
     return path
 
 
@@ -2928,9 +2942,7 @@ def _render_scene_layers(
                 if len(beats) > 1:
                     for beat_index, beat in enumerate(beats):
                         band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
-                        # 字幕带暂时走 SVG：它是 500 次渲染里的大头，而版式最简单
-                        # （见上面 RENDER_HTML_LAYERS_ENV 的说明）
-                        render_caption_band(beat, band_path, layout=layout)
+                        _render_band_layer(beat, band_path, layout=layout, session=session)
                         bands.append(CaptionBand(text=beat, image=band_path))
                         result.band_paths.append(band_path)
                     result.beat_count += 1
