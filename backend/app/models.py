@@ -97,6 +97,9 @@ class VideoInfo(BaseModel):
     # **封面上的大字标题**（爆款标题，逐语言各一份）。空串表示没有自定义过 ——
     # 视频里的封面会退回显示论文原题。用户可以在单集页改它（改完要重新合成才生效）。
     hook: str = ""
+    # **视频第一帧的静帧**，给页面上的 `<video poster>` 用。缺省 null（老视频没有）。
+    # 为什么不能用论文首页顶替：那上面**没有烘进标题**，页面上就看不出封面长什么样。
+    poster_url: str | None = None
 
 
 class Illustration(BaseModel):

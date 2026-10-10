@@ -72,7 +72,9 @@
     "bytes": 4801376,
     // 封面上的大字标题（爆款标题，**逐语言各一份**）。空串 = 没自定义过，
     // 封面会退回显示论文原题。可以用 PATCH /cover 改，**改完要重新合成才生效**
-    "hook": "4 比特超 INT8，显存降七成"
+    "hook": "4 比特超 INT8，显存降七成",
+    // **视频第一帧的静帧**，前端当 `<video poster>`。老视频是 null（前端退回用 cover_url）
+    "poster_url": "/api/episodes/3f2a9c1e/video/poster?v=…"
   },
   "audio_url": "/api/episodes/3f2a9c1e/audio",  // 无音频时 null
   "audio_duration_sec": 302.5,
@@ -426,6 +428,16 @@ V2 起每集属于一个用户，并且可以对外分享。三个字段：
   （公开页同理：`GET /api/share/{token}/video?orientation=landscape`）。
   没有这一份时 `404`，`detail` 里明说是「还没有横版视频」。
 - `VideoInfo.orientation` 标出这一份是哪种画幅；老后端不返回，缺失按 `portrait` 处理。
+
+### `GET /api/episodes/{id}/video/poster`
+
+视频**第一帧的静帧**（PNG），给页面上的 `<video poster>` 用。`?lang=` / `?orientation=` 同
+`/video`（竖版和横版各有自己的一张）。
+
+为什么必须单独存一张：**封面标题是画进视频画面的**，而 `<video>` 在播放前显示的是
+`poster`。前端原来拿 `cover_url`（论文首页的原始 PDF 图，上面没有标题）顶替，
+结果「封面标题」在首页和播放器上等于不存在 —— 用户就是这么发现「没有看到」的。
+没有这份图（老视频）返回 404，前端退回用封面。
 
 ### `GET /api/episodes/{id}/video`
 

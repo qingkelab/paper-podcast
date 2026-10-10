@@ -36,6 +36,13 @@ const session = useSessionStore()
 type ShowcaseVersion = {
   language: EpisodeLanguage
   videoUrl: string | null
+  /**
+   * 视频第一帧的静帧（`video.poster_url`）。**这一版专属**，跟着语言切。
+   *
+   * 不能拿论文首页顶替：封面标题是画进视频画面的，而 `<video>` 播放前显示的是 poster ——
+   * 用首页当 poster，页面上就完全没有标题（实测用户打开首页说「没有看到」）。
+   */
+  videoPosterUrl: string | null
   audioUrl: string | null
   /** 视频优先，没有就用音频时长 */
   durationSec: number | null
@@ -50,7 +57,7 @@ type Showcase = {
   venue: string | null
   year: number | null
   /** 封面（论文首页）和论文原图是**跨语言共用**的，不随切换器变 */
-  posterUrl: string | null
+  coverUrl: string | null
   figures: Figure[]
   /** 这一集实际产出了哪些语言，顺序 = 契约里的生成顺序 */
   order: EpisodeLanguage[]
@@ -116,6 +123,7 @@ function showcaseFromShare(view: ShareView): Showcase {
         .slice(0, 4),
       analysis: version?.analysis ?? surface?.analysis ?? null,
       illustration: version?.illustration ?? surface?.illustration ?? null,
+      videoPosterUrl: version?.video?.poster_url ?? surface?.video?.poster_url ?? null,
     }
   })
   return {
@@ -123,7 +131,7 @@ function showcaseFromShare(view: ShareView): Showcase {
     title: view.title,
     venue: view.paper_meta?.venue ?? null,
     year: view.paper_meta?.year ?? null,
-    posterUrl: view.cover_url ?? null,
+    coverUrl: view.cover_url ?? null,
     figures: view.figures ?? [],
     order: list,
     primaryLanguage: primary,
@@ -176,7 +184,7 @@ async function loadShowcase(): Promise<void> {
       title: picked.title,
       venue: picked.paper_meta?.venue ?? null,
       year: picked.paper_meta?.year ?? null,
-      posterUrl: picked.cover_url,
+      coverUrl: picked.cover_url,
       figures: [],
       order: order.length ? order : [primary],
       primaryLanguage: primary,
@@ -223,6 +231,7 @@ async function loadShowcase(): Promise<void> {
         analysis: version?.analysis ?? (language === fullPrimary ? full.analysis : null),
         // 信息图按语言各一份（图上写着字）；老数据只有顶层那一份，退回顶层
         illustration: version?.illustration ?? full.illustration ?? null,
+        videoPosterUrl: version?.video?.poster_url ?? full.video?.poster_url ?? null,
       }
     })
 
@@ -230,7 +239,7 @@ async function loadShowcase(): Promise<void> {
       ...showcase.value,
       venue: full.paper_meta?.venue ?? showcase.value.venue,
       year: full.paper_meta?.year ?? showcase.value.year,
-      posterUrl: full.cover_url ?? showcase.value.posterUrl,
+      coverUrl: full.cover_url ?? showcase.value.coverUrl,
       figures: full.figures ?? [],
       order: order2,
       primaryLanguage: fullPrimary,
@@ -328,6 +337,16 @@ const episodeDuration = computed(() => activeVersion.value?.durationSec ?? null)
 const videoUrl = computed(() => activeVersion.value?.videoUrl ?? null)
 /** 首屏那一段视频（只跟着首屏自己的开关走） */
 const heroVideoUrl = computed(() => heroVersion.value?.videoUrl ?? null)
+
+/**
+ * 视频静帧：**优先用视频自己的第一帧**（`video.poster_url`，上面烘着封面标题），
+ * 老视频没有这份图才退回论文首页 —— 那一页上没标题，但总比一片空白强。
+ */
+function posterFor(version: ShowcaseVersion | null | undefined): string | undefined {
+  return version?.videoPosterUrl ?? showcase.value?.coverUrl ?? undefined
+}
+const videoPoster = computed(() => posterFor(activeVersion.value))
+const heroVideoPoster = computed(() => posterFor(heroVersion.value))
 const heroDuration = computed(() => heroVersion.value?.durationSec ?? null)
 const audioUrl = computed(() => activeVersion.value?.audioUrl ?? null)
 
@@ -516,17 +535,17 @@ onMounted(() => {
               :key="`hero-${heroLanguage ?? 'zh'}`"
               ref="videoRef"
               class="lp-shot__video"
-              :poster="showcase?.posterUrl ?? undefined"
+              :poster="heroVideoPoster"
               :src="heroVideoUrl"
               preload="none"
               playsinline
               controls
             ></video>
             <img
-              v-else-if="showcase?.posterUrl"
+              v-else-if="heroVideoPoster"
               class="lp-shot__video"
-              :src="showcase.posterUrl"
-              alt="论文 PDF 首页渲染出的封面"
+              :src="heroVideoPoster"
+              alt="论文解读视频的封面"
             />
             <div v-else class="lp-shot__placeholder" aria-hidden="true">
               <span class="lp-shot__placeholder-mark">播</span>
@@ -647,16 +666,16 @@ onMounted(() => {
               :key="activeLanguage ?? 'zh'"
               class="lp-show__video"
               :src="videoUrl"
-              :poster="showcase.posterUrl ?? undefined"
+              :poster="videoPoster"
               preload="none"
               playsinline
               controls
             ></video>
             <img
-              v-else-if="showcase.posterUrl"
+              v-else-if="videoPoster"
               class="lp-show__video"
-              :src="showcase.posterUrl"
-              alt="这一期的封面"
+              :src="videoPoster"
+              alt="这一期视频的封面"
             />
             <p class="lp-show__note">竖版 936×1210，画面逐段切换，字幕按主播分色。</p>
           </div>
@@ -721,8 +740,8 @@ onMounted(() => {
               <span class="lp-show__meta">封面 / 论文原图 / 生成信息图</span>
             </div>
             <div class="lp-art">
-              <figure v-if="showcase.posterUrl" class="lp-art__item">
-                <img class="lp-art__img" :src="showcase.posterUrl" alt="论文 PDF 第一页渲染出的封面" />
+              <figure v-if="showcase.coverUrl" class="lp-art__item">
+                <img class="lp-art__img" :src="showcase.coverUrl" alt="论文 PDF 第一页渲染出的封面" />
                 <figcaption class="lp-art__cap">
                   <strong>封面</strong>论文 PDF 第一页整页渲染，也就是视频的画幅来源。
                 </figcaption>

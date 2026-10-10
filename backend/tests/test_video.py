@@ -66,6 +66,7 @@ from app.services.video import (
     _panel_label,
     build_hook_messages,
     build_panel_catalog,
+    capture_poster,
     build_points_messages,
     FigurePanels,
     HOOK_MAX_CHARS,
@@ -3096,3 +3097,110 @@ class TestCoverTitleCanBeEdited:
                     f"/api/episodes/{episode_id}/cover", json={"headline": "x"}
                 )
             assert response.status_code in (401, 404), response.text
+
+
+class TestVideoPosterIsTheFirstFrame:
+    """页面上的 `<video poster>` 必须是**视频自己的第一帧**，不是论文首页。
+
+    踩过的坑（用户直接反馈「http://127.0.0.1:8000/ 没有看到」）：封面标题是**画进
+    视频画面**的，而 `<video>` 在播放前显示 `poster`。原来前端拿 `cover_url`
+    （论文首页的原始 PDF 渲染图，**上面没有标题**）当 poster，于是「封面标题」
+    在首页和播放器上等于不存在 —— 复现方式就是：不点播放，看你看到的是什么。
+    """
+
+    @staticmethod
+    def _png(path: Path) -> Path:
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), False)
+        pix.set_rect(pix.irect, (10, 10, 10))
+        pix.save(str(path))
+        return path
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _client(tmp_path):
+        from fastapi.testclient import TestClient
+
+        from app.config import Settings
+        from app.main import create_app
+
+        settings = Settings(
+            force_mock=True,
+            enable_video=True,
+            data_dir=tmp_path / "data",
+            database_path=tmp_path / "data" / "poster.db",
+        )
+        with TestClient(create_app(settings)) as client:
+            yield client
+
+    def _seed(self, client, *, with_poster: bool) -> str:
+        settings = client.app.state.settings
+        db = client.app.state.db
+        record = db.create_episode(
+            source_type="pdf", source_ref="/tmp/x.pdf", title="T",
+            options={"duration_min": 3, "level": "intro"},
+        )
+        episode_id = record["id"]
+        video_dir = Path(settings.video_dir)
+        video_dir.mkdir(parents=True, exist_ok=True)
+        video = video_dir / f"{episode_id}.mp4"
+        video.write_bytes(b"\x00" * 64)
+        audio = video_dir / f"{episode_id}.mp3"
+        audio.write_bytes(b"\x00" * 64)
+        poster = self._png(video_dir / f"{episode_id}.poster.png") if with_poster else None
+        db.update_episode(
+            episode_id,
+            status="completed",
+            script={"title": "T", "segments": [{"speaker": "A", "text": "第一段"}]},
+            audio_path=str(audio),
+            audio_duration_sec=9.0,
+            video_path=str(video),
+            video={
+                "duration_sec": 9.0, "scene_count": 3, "bytes": 64, "hook": "标题",
+                **({"poster": str(poster)} if poster else {}),
+            },
+        )
+        return episode_id
+
+    def test_poster_url_points_at_the_video_poster(self, tmp_path):
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client, with_poster=True)
+            body = client.get(f"/api/episodes/{episode_id}").json()
+            url = body["video"]["poster_url"]
+            assert url and "/video/poster" in url
+            assert url.startswith(f"/api/episodes/{episode_id}/video/poster")
+            served = client.get(url)
+            assert served.status_code == 200
+            assert served.headers["content-type"] == "image/png"
+
+    def test_poster_url_is_null_for_old_videos(self, tmp_path):
+        """没有静帧的老视频返回 null，前端退回用论文首页（好过一片空白）。"""
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client, with_poster=False)
+            assert client.get(f"/api/episodes/{episode_id}").json()["video"]["poster_url"] is None
+
+    def test_missing_poster_file_is_404(self, tmp_path):
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client, with_poster=False)
+            assert client.get(f"/api/episodes/{episode_id}/video/poster").status_code == 404
+
+    @pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
+    def test_capture_poster_reads_a_real_frame(self, tmp_path):
+        """真编一段视频，抽出来的静帧要和视频同一画幅（不是空白图）。"""
+        import pymupdf
+
+        image = make_png(tmp_path / "src.png", 320, 240)
+        video = tmp_path / "clip.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-y", "-loop", "1", "-i", str(image),
+                "-t", "1.2", "-r", "10", "-pix_fmt", "yuv420p", str(video),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        poster = capture_poster(video, tmp_path / "poster.png", at=0.5)
+        assert poster is not None and poster.exists()
+        pix = pymupdf.Pixmap(str(poster))
+        assert (pix.width, pix.height) == (320, 240)

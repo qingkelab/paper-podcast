@@ -164,6 +164,7 @@ def _version_payload(
             or _video_provenance_unknown(stored_video, record, version),
             # 封面大字标题（逐语言一份，用户可以改，见 PATCH /cover）
             "hook": str(stored_video.get("hook") or ""),
+            "poster_url": _poster_url(episode_id, stored_video, query),
         }
 
     # 横版：与竖版并存的一份（`?orientation=landscape`，1920×1080）
@@ -188,6 +189,8 @@ def _version_payload(
                 "orientation": "landscape",
                 # 两种画幅共用同一句封面标题（它属于这个语言版本，不属于某一份文件）
                 "hook": str((version.get("video") or {}).get("hook") or ""),
+                # 但静帧是**各自一份**（横竖两个画面完全不一样）
+                "poster_url": _poster_url(episode_id, stored_landscape, query, orientation="landscape"),
             }
 
     illustration = None
@@ -1857,11 +1860,52 @@ async def update_cover_title(request: Request, episode_id: str, payload: CoverTi
     return to_episode(refreshed)
 
 
+def _poster_url(
+    episode_id: str, stored: dict[str, Any], query: str, *, orientation: str = "portrait"
+) -> str | None:
+    """视频第一帧静帧的地址（前端当 `<video poster>` 用）。
+
+    没有这份文件时返回 None：前端会退回用论文首页当封面 —— 那是**老视频**的行为，
+    新合成的视频都会带上静帧（见 `video.capture_poster`）。
+    """
+    path = stored.get("poster")
+    if not path or not Path(path).exists():
+        return None
+    separator = "&" if query else "?"
+    extra = "" if orientation == "portrait" else f"orientation={orientation}&"
+    return (
+        f"/api/episodes/{episode_id}/video/poster{query}"
+        f"{separator}{extra}v={_asset_version(path)}"
+    )
+
+
 def _landscape_path(version: dict[str, Any]) -> str | None:
     """横版视频的文件路径。存在 `video_landscape.path` 里（见 pipeline.rebuild_video）。"""
     stored = version.get("video_landscape") or {}
     path = stored.get("path")
     return str(path) if path else None
+
+
+@router.get("/episodes/{episode_id}/video/poster")
+async def get_video_poster(
+    request: Request,
+    episode_id: str,
+    lang: str | None = Query(None),
+    orientation: str = Query("portrait"),
+):
+    """视频第一帧的静帧（PNG）。前端拿它当 `<video poster>`。
+
+    竖版和横版各有自己的一张（两个画面完全不同），所以也吃 `?orientation=`。
+    老视频没有这张图 → 404，前端退回用论文首页当封面。
+    """
+    record = _require_episode(request, episode_id)
+    _, version = _resolve_version(request, record, lang)
+    landscape = (orientation or "portrait").lower() in ("landscape", "horizontal", "16:9")
+    stored = version.get("video_landscape") or {} if landscape else version.get("video") or {}
+    path = stored.get("poster")
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="这一版还没有封面静帧")
+    return FileResponse(Path(path), media_type="image/png")
 
 
 @router.get("/episodes/{episode_id}/video")

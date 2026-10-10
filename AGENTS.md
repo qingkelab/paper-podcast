@@ -468,6 +468,28 @@ cd frontend && pnpm test:units
   片子还短的时候；现在每帧一块 936×1210 的画面都要渲染 + 编码，实测 40~95 秒。
   这类「预计多久」的文案属于**会被改动作废**的东西，改渲染管线时顺手量一次。
 
+### 页面上的视频封面：`poster` 必须是**视频自己的第一帧**
+
+**踩过的坑（用户直接反馈「http://127.0.0.1:8000/ 没有看到」）**：
+封面标题是**画进视频画面**的，而 `<video>` 在没播之前显示的是 `poster` 属性。
+前端原来把 `cover_url`（论文首页的原始 PDF 渲染图）当 poster —— **那一页上没有标题**，
+于是「封面标题」这个东西在首页首屏、成品展示区、单集播放器上全都看不到，
+只有点了播放才出现。用户看到的就是一张裸的论文首页。
+
+**做法**：合成视频时顺手抽一张静帧存下来（`video.capture_poster`，`ffmpeg -ss 1.2 -frames:v 1`，
+失败不影响出片），路径存进 `video.poster`，接口给 `video.poster_url`，
+`GET /api/episodes/{id}/video/poster`（吃 `?lang=` / `?orientation=`）。
+- **抽帧时刻取第 1 段画面的中间**（`min(1.5, max(段时长/2, 0.4))`）：片头有 0.35 秒
+  从白底淡入，取 t=0 会拍到一张白纸。
+- **静帧按「语言 + 画幅」各一份**：横竖两个画面完全不同，中英两版标题也不同。
+- **老数据要补**：`rebuild_video` 不会重抽（它复用编码结果 —— 其实会重编码，
+  但为了不整集重跑，维护脚本直接从已有 MP4 抽帧更快，见「补配图」那节的写法）。
+  补的时候**路径要按语言取**（`holder.video_path`），不要退回顶层 `video_path` ——
+  顶层永远是主语言的，拿它给 en 版抽帧会抽出中文那一版的首帧（第一版脚本就这么错了，
+  英文视频配着中文标题）。
+- 前端的取法：`video.poster_url ?? cover_url`（老视频没有静帧时退回论文首页 —— 没标题，
+  但好过一片空白）。
+
 ### 图内聚光灯：**几何由像素定、语义由模型定**
 
 做法：模型在写「本段要点」的**同一次调用**里再指出「这一段讲的是哪个子图」（一个字母，
@@ -717,7 +739,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            554 项，改完必须全绿
+backend/tests/            558 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

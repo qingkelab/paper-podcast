@@ -453,6 +453,10 @@ class VideoResult:
     # 封面上的大字标题（爆款标题）。和 scenes 里的 point 一样属于
     # 「模型写一次、以后复用」的数据 —— 重新合成时不该换一句。
     hook: str = ""
+    # **视频第一帧的静帧**（PNG）。给前端当 `<video poster>`：不填的话，
+    # 页面上的视频位只能拿论文首页当封面 —— 那是**没烘进标题的原始 PDF 页**，
+    # 观众（和用户）就会以为「封面上没有标题」。（实测踩到：用户打开首页说「没有看到」。）
+    poster_path: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -464,6 +468,7 @@ class VideoResult:
             "assets": self.assets,
             "asset_versions": self.asset_versions,
             "hook": self.hook,
+            "poster": self.poster_path,
         }
 
 
@@ -2806,6 +2811,39 @@ def encode_video(
     )
 
 
+def capture_poster(video_path: Path, poster_path: Path, *, at: float = 1.2) -> Path | None:
+    """把视频某一时刻的画面存成 PNG，用来当 `<video poster>`（封面静帧）。
+
+    **为什么要专门存一张**：视频第一帧上有封面大字标题（那是画进画面的），
+    而页面上的 `<video>` 在没播之前显示的是 `poster`。不填 poster 时前端只能拿
+    论文首页顶替 —— 那是一张**没有标题的原始 PDF 页**，于是「封面标题」这个东西
+    在页面上等于不存在。（用户打开首页说「没有看到」，就是这么来的。）
+
+    抽帧失败不影响出片（它只是张预览图），返回 None。
+    """
+    if not shutil.which("ffmpeg"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-y",
+                "-ss", f"{max(at, 0.0):.2f}",
+                "-i", str(video_path),
+                "-frames:v", "1",
+                str(poster_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("封面静帧抽取失败（不影响视频）：%s", exc)
+        return None
+    if result.returncode != 0 or not poster_path.exists():
+        logger.warning("封面静帧抽取失败（不影响视频）：%s", (result.stderr or "").strip()[:200])
+        return None
+    return poster_path
+
+
 def probe_media_duration(path: Path) -> float | None:
     """用 ffprobe 读容器时长。读不到就返回 None。"""
     if not shutil.which("ffprobe"):
@@ -3322,6 +3360,15 @@ def compose_video(
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
     }
     result.hook = hook
+    result.poster_path = str(
+        capture_poster(
+            output_path,
+            output_path.with_name(output_path.stem + ".poster.png"),
+            # 片头第一帧带 fade_in（从白底淡入 0.35 秒），所以取第 1 段画面**中间**的时刻：
+            # 既躲过淡入，也不会滑到第二段画面里（片头段通常有十几秒，足够）
+            at=min(1.5, max(scenes[0].duration / 2, 0.4)) if scenes else 1.0,
+        )
+    )
 
     for temp_path in [*slide_paths, *band_paths, *point_paths, *card_paths, *focus_paths]:
         try:

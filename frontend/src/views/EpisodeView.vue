@@ -187,6 +187,14 @@ const versionScope = computed(() => (activeVersion.value ? `${activeLanguageLabe
 
 const coverFailed = ref(false)
 const coverLoaded = ref(false)
+/**
+ * 播放器的封面静帧：**优先用视频自己的第一帧**（`video.poster_url`，上面烘着封面标题）。
+ *
+ * 用论文首页顶替的话，播放前看到的是一张**没有标题**的 PDF 页 ——
+ * 用户会以为「标题没加上」（实测就这么被问过一次）。
+ */
+const videoPosterSrc = computed(() => currentVideo.value?.poster_url ?? coverSrc.value ?? null)
+
 const coverSrc = computed(() => {
   if (coverFailed.value) return null
   return episode.value?.cover_url || null
@@ -1521,7 +1529,7 @@ onBeforeUnmount(() => {
                 :key="`${videoKey}-${activeOrientation}`"
                 class="vplayer__media"
                 :src="currentVideo.url"
-                :poster="coverSrc ?? undefined"
+                :poster="videoPosterSrc ?? undefined"
                 controls
                 playsinline
                 preload="metadata"
