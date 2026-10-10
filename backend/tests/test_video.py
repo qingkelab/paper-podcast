@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,11 +60,20 @@ from app.services.video import (
     group_generate_runs,
     heuristic_assignment,
     heuristic_per_segment,
+    _cover_fallback_headline,
     _normalize_points,
     _panel_label,
+    build_hook_messages,
     build_panel_catalog,
     build_points_messages,
     FigurePanels,
+    HOOK_MAX_CHARS,
+    COVER_HEADLINE_MAX_FONT,
+    COVER_HEADLINE_MIN_FONT,
+    build_scenes,
+    cover_headline_layout,
+    image_card_markup,
+    normalize_hook,
     local_point,
     merge_runs_to_cap,
     point_char_limit,
@@ -95,6 +105,10 @@ class FakeTiming:
     speaker: str
     start: float
     end: float
+
+
+def _timing(index: int, start: float, end: float, speaker: str = "A") -> FakeTiming:
+    return FakeTiming(index=index, speaker=speaker, start=start, end=end)
 
 
 def make_png(path: Path, w: int = 400, h: int = 300, color=(30, 60, 100)) -> Path:
@@ -460,7 +474,7 @@ class TestRenderAndEncode:
         scene = Scene(
             start=0, end=3, image=image, kind="figure", speaker="A", text="测试字幕"
         )
-        out = render_slide(scene, tmp_path / "slide.png", title="测试标题")
+        out = render_slide(scene, tmp_path / "slide.png")
         pix = pymupdf.Pixmap(str(out))
         assert (pix.width, pix.height) == (VIDEO_W, VIDEO_H)
 
@@ -874,7 +888,7 @@ class TestSlideTheme:
         scene = Scene(
             start=0, end=3, image=image, kind="figure", speaker="A", text=text
         )
-        out = render_slide(scene, tmp_path / "slide.png", title="测试标题")
+        out = render_slide(scene, tmp_path / "slide.png")
         import pymupdf
 
         return pymupdf.Pixmap(str(out))
@@ -1033,7 +1047,7 @@ class TestBrandEndCard:
             start=0, end=6, image=image, kind="illustration", speaker="A",
             text="关注青稞，每天学习最新论文。下期见。", brand="outro",
         )
-        out = render_endcard(scene, tmp_path / "end.png", title="测试标题")
+        out = render_endcard(scene, tmp_path / "end.png")
         at, W, H = self._pixels(out)
 
         # 四角是品牌深色底
@@ -1071,7 +1085,7 @@ class TestBrandEndCard:
 
         image = make_png(tmp_path / "i.png", 600, 400, color=(220, 220, 220))
         scene = Scene(start=0, end=5, image=image, kind="figure", speaker="A", text="正文内容")
-        out = render_slide(scene, tmp_path / "body.png", title="标题")
+        out = render_slide(scene, tmp_path / "body.png")
         at, W, H = self._pixels(out)
 
         assert at(6, 6) == (255, 255, 255), "正文页应当仍是白底"
@@ -1096,7 +1110,7 @@ class TestBrandEndCard:
 
         image = make_png(tmp_path / "i.png", 600, 400, color=(220, 220, 220))
         scene = Scene(start=0, end=5, image=image, kind="figure", speaker="A", text="正文内容")
-        out = render_slide(scene, tmp_path / "body2.png", title="标题")
+        out = render_slide(scene, tmp_path / "body2.png")
         at, W, H = self._pixels(out)
 
         from app.services.video import (
@@ -1345,7 +1359,7 @@ class TestPointEmphasis:
         """没有要点时不画强调行 —— 不能留一个空色块让人以为坏了。"""
         image = make_png(tmp_path / "img.png", 700, 500)
         scene = Scene(start=0, end=2, image=image, kind="figure", text="第一段。")
-        out = render_slide(scene, tmp_path / "slide.png", title="标题")
+        out = render_slide(scene, tmp_path / "slide.png")
         import pymupdf
 
         pix = pymupdf.Pixmap(str(out))
@@ -1359,7 +1373,7 @@ class TestPointEmphasis:
         scene = Scene(
             start=0, end=2, image=image, kind="figure", text="第一段。", point="成功率 67%"
         )
-        out = render_slide(scene, tmp_path / "slide.png", title="标题")
+        out = render_slide(scene, tmp_path / "slide.png")
         import pymupdf
 
         pix = pymupdf.Pixmap(str(out))
@@ -1841,7 +1855,7 @@ class TestTransitionsAreRendered:
             Scene(start=seconds, end=seconds * 2, image=second, kind="figure", text="第二段。"),
         ]
         chromes = [
-            render_chrome(scene, tmp_path / f"chrome{i}.png", title="测试标题")
+            render_chrome(scene, tmp_path / f"chrome{i}.png")
             for i, scene in enumerate(scenes)
         ]
         cards = [
@@ -1960,7 +1974,7 @@ class TestWaveformStrip:
         scene = Scene(
             start=0, end=2.0, image=image, kind="figure", speaker="A", text="第一段。"
         )
-        chrome = render_chrome(scene, tmp_path / "chrome.png", title="测试")
+        chrome = render_chrome(scene, tmp_path / "chrome.png")
         card = render_image_card(scene, tmp_path / "card.png")
 
         # 前 1 秒大声、后 1 秒安静：声波条上的墨应当明显前多后少
@@ -2077,7 +2091,7 @@ class TestLandscapeLayout:
         scene = Scene(
             start=0, end=2, image=image, kind="figure", text="第一段。", point="成功率 67%"
         )
-        chrome = pymupdf.Pixmap(str(render_chrome(scene, tmp_path / "c.png", title="标题", layout=LANDSCAPE)))
+        chrome = pymupdf.Pixmap(str(render_chrome(scene, tmp_path / "c.png", layout=LANDSCAPE)))
         assert (chrome.width, chrome.height) == (LANDSCAPE.width, LANDSCAPE.height)
         card = pymupdf.Pixmap(str(render_image_card(scene, tmp_path / "card.png", layout=LANDSCAPE)))
         assert (card.width, card.height) == (LANDSCAPE.image_box_w, LANDSCAPE.image_box_h)
@@ -2091,7 +2105,7 @@ class TestLandscapeLayout:
 
         image = make_png(tmp_path / "img.png", 700, 500)
         scene = Scene(start=0, end=2, image=image, kind="figure", text="第一段。")
-        chrome = pymupdf.Pixmap(str(render_chrome(scene, tmp_path / "c.png", title="标题")))
+        chrome = pymupdf.Pixmap(str(render_chrome(scene, tmp_path / "c.png")))
         assert (chrome.width, chrome.height) == (VIDEO_W, VIDEO_H)
 
 
@@ -2106,7 +2120,7 @@ class TestLandscapeEncode:
             Scene(start=2, end=4, image=image, kind="figure", text="第二段。", speaker="B"),
         ]
         chromes = [
-            render_chrome(scene, tmp_path / f"c{i}.png", title="标题", layout=LANDSCAPE)
+            render_chrome(scene, tmp_path / f"c{i}.png", layout=LANDSCAPE)
             for i, scene in enumerate(scenes)
         ]
         cards = [
@@ -2367,7 +2381,7 @@ class TestFocusIsRendered:
             text="第一段。",
             focus=dict(self.FOCUS) if with_focus else None,
         )
-        chrome = render_chrome(scene, tmp_path / "chrome.png", title="测试")
+        chrome = render_chrome(scene, tmp_path / "chrome.png")
         card = render_image_card(scene, tmp_path / "card.png")
         rows: list[Path | None] = [None]
         if with_focus:
@@ -2624,3 +2638,238 @@ class TestPanelLabel:
     def test_empty_body(self):
         assert _panel_label("") == ""
         assert _panel_label("   ") == ""
+
+
+class TestCoverHeadline:
+    """封面上的大字标题（爆款标题）：正文页顶部不再放论文标题，标题的活儿归封面。
+
+    为什么这么改（用户的原话是「顶部的论文标题可以去掉，设计一个爆款标题」）：
+    挂在每帧顶上那行 22px 的论文全名既读不完、又没有信息量；封面则是唯一一次
+    「能不能让人点开」的机会，该放一句抓人的话 + 一行交代出处的原题。
+    """
+
+    def test_prompt_asks_for_a_short_hook_not_the_paper_title(self):
+        zh = build_hook_messages(
+            title="STEPQuant: When and Where Errors Matter",
+            analysis={"innovations": ["int4 反超 int8"], "conclusion": "误差不均匀"},
+            language="zh",
+        )
+        system = zh[0]["content"]
+        assert "封面标题" in system
+        assert "16" in system and "截断" in system, "要写明超长会被截断"
+        assert "不许编造" in system
+        assert "STEPQuant" in zh[1]["content"], "原题要作为材料给进去"
+
+        en = build_hook_messages(title="STEPQuant", analysis={}, language="en")
+        assert "cover headline" in en[0]["content"]
+        assert "Never invent" in en[0]["content"]
+        cjk = sum(1 for ch in en[0]["content"] if "\u4e00" <= ch <= "\u9fff")
+        assert cjk == 0, "英文那版 system 里不能混中文（踩过这个坑）"
+
+    def test_normalize_strips_the_decorations_models_add(self):
+        assert normalize_hook('"6.93 倍压缩，精度不掉"') == "6.93 倍压缩，精度不掉"
+        assert normalize_hook("封面标题：并发到 70，模型就装不下了？") == "并发到 70，模型就装不下了"
+        assert normalize_hook("**反差型：省了显存却更容易崩。**") == "省了显存却更容易崩"
+        assert normalize_hook("（2）省了显存，却更容易崩") == "省了显存，却更容易崩"
+        # 多行时取第一行**有内容的**（「标题」这种标签被剥掉后是空的）
+        assert normalize_hook("标题\nsaves memory, breaks accuracy") == "saves memory"
+
+    def test_normalize_is_empty_safe(self):
+        assert normalize_hook("") == ""
+        assert normalize_hook(None) == ""
+        assert normalize_hook("标题：") == ""
+
+    def test_long_hook_breaks_at_a_clause_not_mid_word(self):
+        """实测被硬砍出来过「4 比特状态量化，反超均匀 IN」——把 INT8 砍成了 IN。"""
+        assert normalize_hook("4 比特状态量化，反超均匀 INT8 基准") == "4 比特状态量化，反超均匀"
+        assert "IN" != normalize_hook("4 比特状态量化，反超均匀 INT8 基准")[-2:]
+
+    def test_long_english_hook_falls_back_to_the_last_clause(self):
+        """英文按词数截会截到句子中间（实测「…aren't uniform; only some last」）。"""
+        hook = normalize_hook(
+            "Quantization errors aren't uniform; only some last long enough to matter",
+            language="en",
+        )
+        assert hook == "Quantization errors aren't uniform"
+
+    def test_hook_within_the_limit_is_untouched(self):
+        assert normalize_hook("奖励拆到条目，推理涨 4 分") == "奖励拆到条目，推理涨 4 分"
+        assert normalize_hook("70 concurrent chats, model full", language="en") == (
+            "70 concurrent chats, model full"
+        )
+
+    def test_fallback_headline_uses_the_paper_title(self):
+        assert _cover_fallback_headline("STEPQuant: Quantization") == "STEPQuant: Quantization"
+        long_title = "A" * 60
+        assert len(_cover_fallback_headline(long_title)) == HOOK_MAX_CHARS * 2
+        assert _cover_fallback_headline("").strip() == ""
+
+    def test_headline_layout_shrinks_to_fit_two_lines(self):
+        scene = Scene(start=0, end=5, image=Path("/tmp/x.png"), kind="cover")
+        for text in ("短标题", "这是一句比较长的封面标题，需要摆成两行才放得下"):
+            scene.headline = text
+            size, lines, height = cover_headline_layout(text, PORTRAIT)
+            assert len(lines) <= 2, (text, lines)
+            assert COVER_HEADLINE_MIN_FONT <= size <= COVER_HEADLINE_MAX_FONT
+            assert height > 0
+
+
+class TestCoverIsDrawnInTheCardLayer:
+    """封面的排版画在**图片卡那一层**：这样它跟着封面一起淡入、一起溶解掉，
+    不用去动滤镜图里任何一处坐标（骨架与图片窗口全程不变）。"""
+
+    def _scene(self, **kwargs):
+        defaults = dict(
+            start=0.0, end=6.0, image=Path("/tmp/none.png"), kind="cover",
+            caption="STEPQuant: When and Where Errors Matter in Deep Quantization",
+        )
+        defaults.update(kwargs)
+        return Scene(**defaults)
+
+    def test_headline_and_image_are_in_the_same_markup(self, tmp_path):
+        import pymupdf
+
+        image = make_png(tmp_path / "cover.png", 400, 520)
+        markup = image_card_markup(self._scene(image=image, headline="并发到 70，模型就装不下了"), PORTRAIT)
+        assert "并发到 70，模型就装不下了" in markup
+        assert "<image" in markup
+        # 标题的 y 必须小于图片的 y（标题在上、图在下）
+        headline_y = float(re.search(r'<text x="20" y="([\d.]+)"', markup).group(1))
+        image_y = float(re.search(r'<image x="[\d.]+" y="([\d.]+)"', markup).group(1))
+        assert headline_y < image_y, markup[:400]
+
+    def test_without_a_headline_the_image_is_centered_in_the_card(self, tmp_path):
+        image = make_png(tmp_path / "cover.png", 400, 520)
+        markup = image_card_markup(self._scene(image=image), PORTRAIT)
+        assert "<text" not in markup, "没有标题时不该画任何字"
+        # 图在卡片里垂直居中（老行为：整页铺满图片区）
+        img_y = float(re.search(r'<image x="[\d.]+" y="([\d.]+)"', markup).group(1))
+        img_h = float(re.search(r'<image x="[\d.]+" y="[\d.]+" width="[\d.]+" height="([\d.]+)"', markup).group(1))
+        assert abs((img_y + img_h / 2) - PORTRAIT.image_box_h / 2) < 1.5
+
+    def test_rendered_cover_has_ink_where_the_body_has_none(self, tmp_path):
+        """正文页顶部那块**必须干净**（标题条去掉了），封面同一块要有标题的墨。"""
+        import pymupdf
+
+        cover = make_png(tmp_path / "cover.png", 400, 520)
+        body = make_png(tmp_path / "fig.png", 800, 400)
+
+        cover_out = render_slide(
+            self._scene(image=cover, headline="并发到 70，模型就装不下了"),
+            tmp_path / "cover-slide.png",
+            include_subtitle=False, include_point=False,
+        )
+        body_out = render_slide(
+            Scene(start=0, end=5, image=body, kind="figure", text="正文",
+                  caption="Figure 1: caption", point="要点"),
+            tmp_path / "body-slide.png",
+        )
+
+        def band_ink(path) -> int:
+            pix = pymupdf.Pixmap(str(path))
+            w, n, s = pix.width, pix.n, pix.samples
+            ink = 0
+            # 标题带：y 90~180，x 40~700（躲开右上角的 logo 底块）
+            for y in range(90, 180, 2):
+                for x in range(40, 700, 2):
+                    i = (y * w + x) * n
+                    if (s[i] + s[i + 1] + s[i + 2]) // 3 < 190:
+                        ink += 1
+            return ink
+
+        assert band_ink(cover_out) > 200, "封面上没有标题的墨"
+        assert band_ink(body_out) == 0, "正文页顶部还留着东西（标题条没去干净）"
+
+
+class TestBuildScenesCover:
+    """封面帧要拿到 headline，正文帧一个都不该有。"""
+
+    def test_only_the_cover_scene_carries_the_headline(self, tmp_path):
+        cover = make_png(tmp_path / "cover.png")
+        fig = make_png(tmp_path / "fig2.png")
+        assets = {
+            "cover": ImageAsset("cover", cover, "cover", "论文首页"),
+            "f1": ImageAsset("f1", fig, "figure", "Figure 1: x"),
+        }
+        timings = [_timing(0, 1.0, 4.0), _timing(1, 4.0, 7.0)]
+        scenes = build_scenes(
+            segments=[{"text": "第一段"}, {"text": "第二段"}],
+            timings=timings,
+            audio_duration=7.0,
+            assets=assets,
+            image_for_segment=["f1", "f1"],
+            fallback_id="f1",
+            headline="并发到 70，模型就装不下了",
+            cover_caption="STEPQuant: When and Where Errors Matter",
+        )
+        assert scenes[0].kind == "cover"
+        assert scenes[0].headline == "并发到 70，模型就装不下了"
+        assert scenes[0].caption == "STEPQuant: When and Where Errors Matter"
+        assert all(scene.headline == "" for scene in scenes[1:]), "正文页不该有封面标题"
+
+    def test_no_headline_keeps_the_old_cover_caption(self, tmp_path):
+        cover = make_png(tmp_path / "cover.png")
+        assets = {"cover": ImageAsset("cover", cover, "cover", "论文首页")}
+        scenes = build_scenes(
+            segments=[{"text": "第一段"}],
+            timings=[_timing(0, 1.0, 4.0)],
+            audio_duration=4.0,
+            assets=assets,
+            image_for_segment=["cover"],
+            fallback_id="cover",
+        )
+        assert scenes[0].headline == ""
+        assert scenes[0].caption == "论文首页"
+
+
+class TestFirstFrameIsTheCover:
+    """产品要求：观众第一眼看到的必须是**论文首页**，而且上面有大字标题。
+
+    社区话术把片头音乐换掉之后，第一句人声就从 0 秒开始，原来那个独立的封面帧
+    （靠片头音乐撑出来的）就不存在了 —— 于是这条规则从「有音乐时才有封面」
+    变成「第一帧一律是封面」，否则爆款标题根本没地方出现。
+    """
+
+    def _scenes(self, tmp_path, *, first_image: str, headline: str = "并发到 70，模型就装不下了"):
+        cover = make_png(tmp_path / "cover.png", 400, 520)
+        fig = make_png(tmp_path / "fig9.png", 800, 400)
+        assets = {
+            "cover": ImageAsset("cover", cover, "cover", "论文首页"),
+            "f1": ImageAsset("f1", fig, "figure", "Figure 1: x"),
+        }
+        return build_scenes(
+            segments=[{"text": "第一段", "brand": "intro"}, {"text": "第二段", "brand": "intro"}, {"text": "第三段"}],
+            timings=[_timing(0, 0.0, 3.0), _timing(1, 3.0, 6.0), _timing(2, 6.0, 9.0)],
+            audio_duration=9.0,
+            assets=assets,
+            image_for_segment=["cover" if first_image == "cover" else "f1", "cover", "f1"],
+            fallback_id="f1",
+            headline=headline,
+            cover_caption="STEPQuant: When and Where Errors Matter",
+        )
+
+    def test_first_frame_is_switched_back_to_the_cover(self, tmp_path):
+        scenes = self._scenes(tmp_path, first_image="f1")
+        assert scenes[0].kind == "cover", "第一帧必须是论文首页，模型配错了也要换回来"
+        assert scenes[0].headline == "并发到 70，模型就装不下了"
+        assert scenes[0].caption == "STEPQuant: When and Where Errors Matter"
+
+    def test_headline_covers_the_whole_intro_run(self, tmp_path):
+        scenes = self._scenes(tmp_path, first_image="cover")
+        # 片头两段都停在封面上 → 两帧都带标题（只放一帧的话一秒就没了，来不及读）
+        assert scenes[0].headline and scenes[1].headline
+        assert scenes[2].headline == "", "讲到正文了就不该再有封面标题"
+
+    def test_no_cover_asset_means_no_headline_anywhere(self, tmp_path):
+        fig = make_png(tmp_path / "only.png", 800, 400)
+        assets = {"f1": ImageAsset("f1", fig, "figure", "Figure 1: x")}
+        scenes = build_scenes(
+            segments=[{"text": "第一段"}],
+            timings=[_timing(0, 0.0, 3.0)],
+            audio_duration=3.0,
+            assets=assets,
+            image_for_segment=["f1"],
+            fallback_id="f1",
+            headline="有标题但没有封面图",
+        )
+        assert scenes[0].headline == "", "没有封面图就别硬贴标题"

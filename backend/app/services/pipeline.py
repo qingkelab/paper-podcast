@@ -387,6 +387,8 @@ class Pipeline:
             analysis=version.get("analysis") or {},
             preset_scenes=stored.get("scenes") or None,
             preset_assets=stored.get("assets") or None,
+            # 封面标题同样是「写一次、以后复用」的数据，重合成时不该换一句
+            preset_hook=str(stored.get("hook") or ""),
             language=lang,
             orientation="landscape" if landscape else "portrait",
         )

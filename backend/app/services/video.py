@@ -209,6 +209,19 @@ FONT_STACK = "PingFang SC, Hiragino Sans GB, Microsoft YaHei, Noto Sans CJK SC, 
 # 白底更接近读论文的观感，也更适合投屏和打印截图。
 BG_COLOR = "#ffffff"
 TITLE_COLOR = "#1a2233"
+
+# ---- 封面帧（片头那一帧）的排版 ----
+# 为什么单独做一套：正文页的图片区是「一页纸占满」，而封面要有**大字标题**。
+# 封面的大字标题 + 论文首页的图都画在图片卡那一层里（见 render_image_card）。
+COVER_PAD = 20                  # 卡内左右/上下的留白（卡本身贴在 x=20，所以画面上是 40，与字幕对齐）
+COVER_HEADLINE_MAX_FONT = 54    # 竖版最大字号；横版自动降（见 cover_headline_layout）
+COVER_HEADLINE_MIN_FONT = 30    # 再小就截断，别缩成小字报
+COVER_HEADLINE_LEADING = 1.22   # 行距倍数
+COVER_HEADLINE_BASELINE = 0.92  # 首行基线在行盒里的位置
+COVER_ACCENT_W = 76             # 标题下面那根品牌绿短杠
+COVER_ACCENT_H = 7
+COVER_ACCENT_GAP = 14
+COVER_TITLE_COLOR = "#121a2b"
 CAPTION_COLOR = "#6b7a8f"
 FRAME_STROKE = "#d8dfe8"
 SUBTITLE_BG = "#f4f7fa"
@@ -331,6 +344,9 @@ class Scene:
     point: str = ""
     # 图内聚光灯：这一段在讲图里的哪一块（相对 0~1 比例 + 短标签）。None = 不框
     focus: dict[str, Any] | None = None
+    # 封面上的大字标题（**只有片头那一帧用**）。正文页顶部不再放论文标题 ——
+    # 一行小字挂在每帧顶上既不抓人、又占掉画面，标题的活儿交给封面。
+    headline: str = ""
     # "outro" 表示这是片尾品牌段 —— 视频层会把它渲染成品牌卡片而不是普通配图页
     brand: str = ""
 
@@ -399,6 +415,9 @@ class VideoResult:
     # 合成时各素材的版本号（mtime-size），用来判断视频是否已经过时：
     # 用户手动旋转了配图、或重新提取过，视频里还是旧画面
     asset_versions: dict[str, str] = field(default_factory=dict)
+    # 封面上的大字标题（爆款标题）。和 scenes 里的 point 一样属于
+    # 「模型写一次、以后复用」的数据 —— 重新合成时不该换一句。
+    hook: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -409,6 +428,7 @@ class VideoResult:
             "scenes": self.scenes,
             "assets": self.assets,
             "asset_versions": self.asset_versions,
+            "hook": self.hook,
         }
 
 
@@ -469,6 +489,191 @@ def build_assign_messages(
         {"role": "system", "content": ASSIGN_SYSTEM},
         {"role": "user", "content": user},
     ]
+
+
+# 封面标题（爆款标题）的长度上限。
+# 为什么不照抄论文原题：原题（「STEPQuant: When and Where Errors Matter in Deep
+# Quantization」）在封面大字上既长又没有钩子，观众扫一眼就走了。封面要的是
+# 「**跟我有关 / 有意思**」的一句话，原题放在它下面那行小字里（见 build_scenes 的
+# cover_caption）—— 两行各司其职：一行抓人，一行交代出处。
+HOOK_MAX_CHARS = 16
+# 断在标点处至少要保留多少比例的内容，否则宁可不按标点断
+HOOK_BREAK_KEEP = 0.6
+HOOK_MAX_WORDS_EN = 9
+
+HOOK_SYSTEM = """你在给一个「论文解读视频」写**封面标题**。
+
+观众在信息流里刷到这段视频，画面一闪而过，只有封面上的这一行字能让人停下来。
+你要写的不是论文的名字，而是**让人想点开的那一句话**。
+
+规则：
+- **不超过 14 个字**（写到 16 个字就已经是上限，超了会被我们截断 —— 与其被截，
+  不如一开始就把话说短）。封面上的字号很大，长一点就挤成两行小字。
+- 必须来自这篇论文**真实的内容**：它解决了什么、发现了什么、结果有多反常。
+  **不许编造**数字或结论，论文里没有的别写。
+- 四档风格，**挑最贴这篇论文的那一档**，不要四档混着写：
+  1. **数字结论型**：「6.93 倍压缩，精度不掉」
+  2. **悬念提问型**：「并发到 70，模型就装不下了？」
+  3. **反差型**：「省了显存，却更容易崩」
+  4. **代价型**：「精度换速度，这笔账划不划算」
+- 可以口语、可以带问号，但**不要**标题党到失真（观众点进来发现不是那么回事就划走了）。
+- **不要**出现「论文」「本文」「研究」「一种」这类学术腔开头，也不要引号。
+- 语言与脚本一致（中文脚本写中文，英文脚本写英文），结尾不加标点。
+- 只输出这一行字本身，不要解释、不要 JSON、不要换行。"""
+
+HOOK_SYSTEM_EN = """You write the **cover headline** for a paper-explainer video.
+
+A viewer scrolls past this video in a feed. The only thing that can stop the scroll is the
+one line on the cover. Write that line — not the paper's title, but the sentence that makes
+someone want to watch.
+
+Rules:
+- **At most 8 words** (9 is the hard ceiling — anything longer gets trimmed, and a trimmed
+  headline reads like a cut-off sentence). The cover uses a very large font; longer wraps.
+- It must come from the paper's **actual content**: what problem it solves, what it found,
+  how surprising the result is. **Never invent** numbers or claims that are not in the paper.
+- Pick **one** of these four styles — whichever fits this paper best, do not mix them:
+  1. **number/result**: "6.9x compression, same accuracy"
+  2. **question/hook**: "70 concurrent chats and the model is full?"
+  3. **contrast**: "saves memory, breaks accuracy"
+  4. **trade-off**: "what speed actually costs"
+- Stay honest: a headline that oversells loses the viewer in the first ten seconds.
+- No academic throat-clearing ("This paper", "We study", "A novel"), no quotation marks,
+  no trailing punctuation. Output the line only — no explanation, no JSON, no line breaks."""
+
+
+def build_hook_messages(
+    *,
+    title: str = "",
+    analysis: dict[str, Any] | None = None,
+    language: str = "zh",
+) -> list[dict[str, str]]:
+    """要一句封面标题。
+
+    只发解读稿里最有信息量的几栏（创新点 / 核心结论 / 结果），不把整份解读塞进去：
+    封面标题是个「一句话」的活，材料给多了模型反而写成综述。
+    """
+    system = HOOK_SYSTEM if language == "zh" else HOOK_SYSTEM_EN
+    data = analysis or {}
+
+    def joined(key: str, *, limit: int) -> str:
+        value = data.get(key)
+        if isinstance(value, list):
+            return "；".join(str(item) for item in value[:3])[:limit]
+        return str(value or "")[:limit]
+
+    if language == "zh":
+        user = f"""【论文原题】{title or "（未提供）"}
+
+【解读稿摘要】
+- 创新点：{joined("innovations", limit=160) or "（未提供）"}
+- 方法：{joined("method", limit=160) or "（未提供）"}
+- 实验与结果：{joined("experiments", limit=200) or "（未提供）"}
+- 核心结论：{joined("conclusion", limit=160) or "（未提供）"}
+
+请写一句不超过 14 个字的封面标题，只输出这一行字。"""
+    else:
+        user = f"""[PAPER TITLE] {title or "(not provided)"}
+
+[ANALYSIS SUMMARY]
+- Contributions: {joined("innovations", limit=160) or "(not provided)"}
+- Method: {joined("method", limit=160) or "(not provided)"}
+- Results: {joined("experiments", limit=200) or "(not provided)"}
+- Conclusion: {joined("conclusion", limit=160) or "(not provided)"}
+
+Write the cover headline in at most 8 words. Output that one line only."""
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def normalize_hook(raw: Any, *, language: str = "zh") -> str:
+    """整理模型给的封面标题：去掉引号/书名号/序号/换行，按语言卡长度。
+
+    模型经常把标题包在引号里、前面还写个「封面标题：」，这些都直接剥掉 ——
+    封面上的大字出现引号非常出戏。
+    """
+    def clean(line: str) -> str:
+        # 先去 markdown 强调符：`**反差型：…**` 里的 `**` 会挡住下面那些前缀规则
+        line = line.strip().strip("*_`").strip()
+        line = re.sub(
+            r"^[\s\-•*\d.、)）:：]*(封面标题|标题|headline|title)\s*[:：]?",
+            "",
+            line.strip(),
+            flags=re.IGNORECASE,
+        )
+        # 模型爱把风格名一起写出来（「反差型：省了显存却更容易崩」）——那是给它自己看的，
+        # 顶到封面上很出戏。只认「XX型：」这一种形态，真实标题里极少这么开头。
+        line = re.sub(r"^[\u4e00-\u9fffA-Za-z]{2,5}型\s*[:：]\s*", "", line)
+        line = re.sub(r"^[（(]\s*[1-4]\s*[)）]\s*", "", line)
+        line = line.strip().strip('"\'“”「」《》【】`').replace("**", "").strip()
+        line = re.sub(r"\s+", " ", line).rstrip("。．.,，;；!！?？~～")
+        return line.strip()
+
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # 多行时逐行清理，取**第一行有内容的**（标题在头一行；「标题」这种标签被剥掉后会是空）
+    for line in text.splitlines():
+        candidate = clean(line)
+        if len(candidate) >= 4:
+            text = candidate
+            break
+    else:
+        text = clean(text)
+    if not text:
+        return ""
+    return _trim_hook(text, language=language)
+
+
+# 封面标题超长时，从哪里断开。
+# 硬砍到第 16 个字是不行的 —— 实测砍出来过「4 比特状态量化，反超均匀 IN」（把 INT8 砍成 IN）、
+# 「4-bit 反超 INT8，显存」（半句）。封面上的大字出现半句比短一句难看得多，
+# 所以优先在**标点/分句处**断开，其次至少不要把一个词砍成两半。
+_HOOK_BREAKS = "，。、；：！？；,.;:!?/|"
+
+
+def _trim_hook(text: str, *, language: str) -> str:
+    """超长时在**分句处**断开，而不是数着字数硬砍。"""
+    if language != "zh":
+        words = text.split()
+        if len(words) <= HOOK_MAX_WORDS_EN:
+            return text
+        head = words[:HOOK_MAX_WORDS_EN]
+        # 英文按词截会截到句子中间（实测「…aren't uniform; only some last」）。
+        # 词数够多时宁可退回上一个分句，读起来是完整的一句。
+        for index in range(len(head) - 1, 2, -1):
+            if head[index - 1].endswith((",", ";", ":", "—")):
+                return " ".join(head[:index]).rstrip(",;:— ")
+        return _strip_trailing_stopwords(" ".join(head), language=language, floor=HOOK_MAX_WORDS_EN // 2)
+
+    if len(text) <= HOOK_MAX_CHARS:
+        return text
+    window = text[:HOOK_MAX_CHARS]
+    cut = max(window.rfind(ch, HOOK_MAX_CHARS // 2) for ch in _HOOK_BREAKS)
+    # 只在「断在标点处仍然保留了大部分内容」时才用标点断句：
+    # 否则会砍成「4 比特状态量化」这种只剩前半句的标题（实测出现过）。
+    if cut >= HOOK_MAX_CHARS * HOOK_BREAK_KEEP:
+        return window[:cut].strip()
+    # 没有合适的标点：至少别把结尾那个词砍成两半（「反超均匀 IN」→「反超均匀」）
+    trimmed = re.sub(r"[A-Za-z0-9.%+\-]+$", "", window).strip()
+    return _strip_trailing_stopwords(trimmed or window, language=language, floor=HOOK_MAX_CHARS // 2)
+
+
+def _cover_fallback_headline(title: str) -> str:
+    """没有模型输出时的封面大字：用论文原题（会截断）。
+
+    只在这一种情况下用：说话模型不可用（Mock / 调用失败）。封面上什么都不放
+    比放个原题更糟 —— 观众总得知道这是哪篇论文。
+    """
+    text = " ".join((title or "").split())
+    if not text:
+        return ""
+    limit = HOOK_MAX_CHARS * 2  # 封面允许两行，所以比爆款标题宽一倍
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip("，。、,.;") + "…"
+    return text
 
 
 POINTS_SYSTEM = """你在给一个「论文解读视频」做**画面强调**。
@@ -870,6 +1075,8 @@ def build_scenes(
     fallback_id: str,
     points: list[str] | None = None,
     focuses: list[dict[str, Any] | None] | None = None,
+    headline: str = "",
+    cover_caption: str = "",
 ) -> list[Scene]:
     """把脚本、时间戳和逐段配图拼成画面时间轴。
 
@@ -880,6 +1087,9 @@ def build_scenes(
     「从某段开始一直用到下一张图」，这样才能保证画面跟着话题走。
 
     `points[i]` 是第 i 段的「要点强调行」文案（可为空串 → 这一段不显示强调行）。
+
+    `headline` 是封面上的大字标题（爆款标题），`cover_caption` 是它下面那行小字
+    （论文原题）—— 两者都只作用在片头那一帧。
     """
     if not segments or not timings:
         raise VideoError("缺少脚本或时间戳，无法建立视频时间轴")
@@ -900,9 +1110,15 @@ def build_scenes(
     scenes: list[Scene] = []
 
     # ---- 片头：封面 ----
+    #
+    # 只有「有片头音乐」时才会有这一段独立的封面帧（`head_end > 0.3`）。
+    # 社区话术把片头音乐换掉之后，第一句人声就从 0 秒开始了 —— 于是这一段不存在，
+    # 视频的**第一帧**变成了第一段脚本的画面。所以封面另有两条保底规则（见函数末尾）：
+    # 「第一帧必须是论文首页」和「首页那几帧放大字标题」。
     head_end = ordered[0].start
     cover = assets.get("cover")
-    head_asset = cover if (cover and cover.exists) else asset_for(0)
+    cover_asset = cover if (cover and cover.exists) else None
+    head_asset = cover_asset or asset_for(0)
     if head_end > 0.3:
         scenes.append(
             Scene(
@@ -932,6 +1148,27 @@ def build_scenes(
                 brand=str(segment.get("brand") or ""),
             )
         )
+
+    # ---- 封面帧：第一帧必须是论文首页，而且要有大字标题 ----
+    #
+    # **第一帧必须是论文首页**（PDF 第一页）是产品要求：观众第一眼要看到这是哪篇论文，
+    # 而不是某张配图。模型给第一段配了别的图时，这里也要把它换回封面。
+    if cover_asset and scenes and scenes[0].kind != "cover":
+        scenes[0].image = cover_asset.path
+        scenes[0].kind = "cover"
+        scenes[0].caption = cover_asset.caption
+    # 首页那**连续几帧**（片头话术通常讲两三段，都还停在封面上）一起放大字标题：
+    # 只放第一帧的话，标题会在一秒后消失，观众来不及读。
+    leading = 0
+    for scene in scenes:
+        if scene.kind != "cover" or scene.brand == "outro":
+            break
+        leading += 1
+    for scene in scenes[:leading]:
+        if headline:
+            scene.headline = headline
+            # 有大字标题时，下面那行小字换成**论文原题**（观众得知道这是哪篇）
+            scene.caption = cover_caption or scene.caption
 
     # ---- 片尾：信息图 + 结束卡 ----
     tail_start = ordered[-1].end
@@ -1125,7 +1362,6 @@ def render_slide(
     scene: Scene,
     output_path: Path,
     *,
-    title: str = "",
     include_subtitle: bool = True,
     include_point: bool = True,
     layout: Layout = PORTRAIT,
@@ -1143,7 +1379,6 @@ def render_slide(
     return _render_slide_layers(
         scene,
         output_path,
-        title=title,
         include_subtitle=include_subtitle,
         include_point=include_point,
         include_image=True,
@@ -1155,12 +1390,11 @@ def render_chrome(
     scene: Scene,
     output_path: Path,
     *,
-    title: str = "",
     include_subtitle: bool = True,
     include_point: bool = True,
     layout: Layout = PORTRAIT,
 ) -> Path:
-    """只渲染**骨架**：白底 + 标题 + logo + 图注 + 强调行 + 字幕带（图片区留白）。
+    """只渲染**骨架**：白底 + logo + 图注 + 强调行 + 字幕带（图片区留白）。
 
     为什么要拆出骨架：转场要的是「图片在变、版面不动」。实测那条 40 秒的论文宣传片
     就是这种观感 —— 白底、每 9~10 秒换一次画面、换的时候整页快速淡过去。
@@ -1169,12 +1403,84 @@ def render_chrome(
     return _render_slide_layers(
         scene,
         output_path,
-        title=title,
         include_subtitle=include_subtitle,
         include_point=include_point,
         include_image=False,
         layout=layout,
     )
+
+
+def cover_headline_layout(
+    headline: str, layout: Layout, *, max_lines: int = 2
+) -> tuple[float, list[str], float]:
+    """封面大字标题怎么排：返回 `(字号, 行, 文字块高度)`。
+
+    字号从 `COVER_HEADLINE_MAX_FONT` 往下试，直到能塞进 `max_lines` 行 ——
+    「爆款标题」是我们让模型写的，长一两个字很正常，缩字号比截断句子体面。
+    再小到 `COVER_HEADLINE_MIN_FONT` 还放不下就截断（加省略号）。
+    """
+    text = " ".join((headline or "").split())
+    width = layout.image_box_w - COVER_PAD * 2
+    if not text:
+        return 0.0, [], 0.0
+    # `_wrap` 的单位宽度就是字号（一个全角字 ≈ 1 个字号宽），所以像素宽 ÷ 字号 = 单位数
+    for size in range(COVER_HEADLINE_MAX_FONT, COVER_HEADLINE_MIN_FONT - 1, -2):
+        lines = _wrap(text, width / size)[: max_lines + 1]
+        if len(lines) <= max_lines:
+            return float(size), lines, len(lines) * size * COVER_HEADLINE_LEADING
+    size = float(COVER_HEADLINE_MIN_FONT)
+    lines = _wrap(text, width / size)[:max_lines]
+    if lines:
+        lines[-1] = lines[-1].rstrip("，。、,.;") + "…"
+    return size, lines, len(lines) * size * COVER_HEADLINE_LEADING
+
+
+def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
+    """图片卡那一层的 SVG 内容，**坐标以图片区左上角为原点**。
+
+    为什么要单独抽出来：卡片这一层现在有两个消费者 ——
+    分层的编码路径（`render_image_card`，图片单独一层、参与转场）和
+    「一页到底」的合成路径（`render_slide` 把它整段贴进骨架里）。
+    两处如果各画一份，封面的大字标题就只会在其中一条路径上出现，
+    而这种不一致平时看不出来（谁也不会同时跑两条路径对比）。
+    """
+    size, lines, block_h = cover_headline_layout(scene.headline, layout)
+    pad = COVER_PAD
+    if lines:
+        # 标题占多高，图就从哪儿开始（下面留 pad 的空隙）
+        img_top_in_card = pad + block_h + COVER_ACCENT_GAP + COVER_ACCENT_H + pad
+        img_box_h = max(int(layout.image_box_h - img_top_in_card), 40)
+    else:
+        img_top_in_card = 0
+        img_box_h = layout.image_box_h
+
+    data_uri, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, img_box_h)
+    img_x = (layout.image_box_w - img_w) / 2
+    img_y = img_top_in_card + (img_box_h - img_h) / 2
+
+    parts: list[str] = []
+    if lines:
+        y = pad + size * COVER_HEADLINE_BASELINE
+        for line in lines:
+            parts.append(
+                f'<text x="{pad}" y="{y:.1f}" font-family="{FONT_STACK}" font-size="{size:.0f}" '
+                f'font-weight="700" fill="{COVER_TITLE_COLOR}">{html.escape(line)}</text>'
+            )
+            y += size * COVER_HEADLINE_LEADING
+        # 品牌绿短杠：给标题一个收尾，也让封面跟社区配色挂上钩
+        bar_y = pad + block_h + COVER_ACCENT_GAP
+        parts.append(
+            f'<rect x="{pad}" y="{bar_y:.1f}" width="{COVER_ACCENT_W}" height="{COVER_ACCENT_H}" '
+            f'rx="{COVER_ACCENT_H / 2:.1f}" fill="{BRAND_GREEN}"/>'
+        )
+    parts.append(
+        f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
+        f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
+    )
+    parts.append(
+        f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" href="{data_uri}"/>'
+    )
+    return "\n".join(parts)
 
 
 def render_image_card(
@@ -1185,18 +1491,16 @@ def render_image_card(
     画幅是图片区（`layout.image_box_w × layout.image_box_h`），叠在骨架的 `(20, layout.image_top)`。
     边框跟着图片走（它是贴着图片量的 2px 内缩），所以它属于这一层 ——
     转场时「带框的图」整体淡入淡出，而不是框留在原地、图在里面换。
-    """
-    data_uri, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, layout.image_box_h)
-    img_x = (layout.width - img_w) / 2 - layout.image_box_left
-    img_y = (layout.image_box_h - img_h) / 2
 
-    parts: list[str] = [
+    **封面帧（`scene.headline` 非空）走另一套排版**：上面是爆款标题（大字 + 品牌绿短杠），
+    下面才是论文首页的图。放在这一层而不是骨架层，是因为这一层已经被转场当成
+    「会变的那一块」在用了 —— 标题跟着封面一起淡入、一起溶解掉，不需要动滤镜图里
+    任何一处坐标（骨架与图片窗口全程不变）。
+    """
+    parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.image_box_w}" height="{layout.image_box_h}" '
         f'viewBox="0 0 {layout.image_box_w} {layout.image_box_h}">',
-        f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
-        f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>',
-        f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" '
-        f'href="{data_uri}"/>',
+        image_card_markup(scene, layout),
         "</svg>",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1210,21 +1514,12 @@ def _render_slide_layers(
     scene: Scene,
     output_path: Path,
     *,
-    title: str,
     include_subtitle: bool,
     include_point: bool,
     include_image: bool,
     layout: Layout = PORTRAIT,
 ) -> Path:
     """骨架与整页共用的渲染实现（`include_image` 决定图片层要不要画进来）。"""
-    img_x = img_y = 0.0
-    img_w = img_h = 0.0
-    data_uri = ""
-    if include_image:
-        data_uri, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, layout.image_box_h)
-        img_x = (layout.width - img_w) / 2
-        img_y = layout.image_top + (layout.image_box_h - img_h) / 2
-
     font_size, lines = _fit_subtitle(scene.text)
 
     parts: list[str] = [
@@ -1233,12 +1528,10 @@ def _render_slide_layers(
         f'<rect width="{layout.width}" height="{layout.height}" fill="{BG_COLOR}"/>',
     ]
 
-    # 顶部标题条
-    if title:
-        parts.append(
-            f'<text x="40" y="{layout.title_baseline}" font-family="{FONT_STACK}" font-size="22" '
-            f'fill="{TITLE_COLOR}">{html.escape(title[:40])}</text>'
-        )
+    # ⚠️ 这里**没有**顶部标题条：论文标题不再挂在每一帧顶上。
+    # 挂在顶上的那行小字有两个问题：一是 22px 的论文全名在一屏里根本读不完，
+    # 二是「每帧都有的东西」等于没有信息量。标题现在只出现在封面（见 render_image_card），
+    # 而且换成了抓人的爆款标题 + 下面一行的论文原题。
 
     # 右上角社区 logo 水印。
     # logo 是浅色字标，白底上直接放会看不见，所以垫一块深色圆角底。
@@ -1257,15 +1550,13 @@ def _render_slide_layers(
             f'width="{lw}" height="{lh}" href="{uri}"/>'
         )
 
-    # 配图（浅灰细边框，白底上用来界定图片边界）；骨架模式下这块留白，由图片卡叠上来
+    # 配图（浅灰细边框，白底上用来界定图片边界）；骨架模式下这块留白，由图片卡叠上来。
+    # 用的是和分层路径**同一段** markup（`image_card_markup`），所以封面的大字标题
+    # 在一页到底的用法里也在 —— 两条路径不会画成两个样子。
     if include_image:
         parts.append(
-            f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
-            f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
-        )
-        parts.append(
-            f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" '
-            f'href="{data_uri}"/>'
+            f'<g transform="translate({layout.image_box_left}, {layout.image_top})">'
+            f"{image_card_markup(scene, layout)}</g>"
         )
 
     # 图注
@@ -1674,7 +1965,7 @@ def render_caption_band(
 
 
 def render_endcard(
-    scene: Scene, output_path: Path, *, title: str = "", layout: Layout = PORTRAIT
+    scene: Scene, output_path: Path, *, layout: Layout = PORTRAIT
 ) -> Path:
     """片尾品牌卡：深色底 + 社区 logo + 关注引导。
 
@@ -1700,12 +1991,8 @@ def render_endcard(
         f'<rect width="{layout.width}" height="{layout.height}" fill="{BRAND_DARK}"/>',
     ]
 
-    # 左上角小标题，保持和正文页一致的定位
-    if title:
-        parts.append(
-            f'<text x="40" y="{layout.title_baseline}" font-family="{FONT_STACK}" font-size="22" '
-            f'fill="{BRAND_GREEN}" opacity="0.85">{html.escape(title[:40])}</text>'
-        )
+    # 片尾也不放论文标题：这张卡是品牌卡，画面上的主角是关注引导，
+    # 左上角再挂一行论文全名只会跟引导语抢注意力（正文页的标题条也一并去掉了）。
 
     if logo:
         uri, lw, lh = logo
@@ -2474,6 +2761,7 @@ def compose_video(
     max_topic_images: int = 4,
     preset_scenes: list[dict[str, Any]] | None = None,
     preset_assets: dict[str, str] | None = None,
+    preset_hook: str = "",
     allow_point_llm: bool | None = None,
     language: str = "zh",
     orientation: str = "portrait",
@@ -2483,6 +2771,9 @@ def compose_video(
     preset_scenes / preset_assets 用于**重新合成**：上一次已经把「哪一段用哪张图」
     算好了并存了下来，重做时直接复用，不再问模型 —— 既省钱省时间，
     也保证重做前后画面选择一致（否则再问一次结果可能就不一样了）。
+
+    `preset_hook` 是上次写的封面标题，`allow_point_llm` 同时管「要点文案」和
+    「封面标题」这两件**可以单独补一次**的模型输出（见下面强调行那一段）。
     """
     pool = build_asset_pool(
         cover_path=cover_path, figures=figures, illustration_png=illustration_png
@@ -2738,6 +3029,30 @@ def compose_video(
         fallback_used,
     )
 
+    # ---- 封面标题（爆款标题）----
+    #
+    # 只出现在片头那一帧上。三级来源：
+    # 1. **上次写的**（`video.hook`）—— 重新合成时必须复用（跟强调行同一个道理）；
+    # 2. **让模型写一次**（`HOOK_SYSTEM`，挑风格、不许编数字）；
+    # 3. **论文原题兜底** —— 没有标题的封面很怪，原题至少交代了这是什么。
+    hook = normalize_hook(preset_hook, language=language)
+    if not hook and allow_point_llm and llm is not None and not getattr(llm, "mock", True):
+        try:
+            raw = llm._chat(
+                build_hook_messages(title=title, analysis=analysis, language=language),
+                max_tokens=80,
+                temperature=0.8,
+                json_mode=False,  # 要的就是一行纯文本，塞进 JSON 反而更容易被引号包起来
+            )
+            hook = normalize_hook(raw, language=language)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("封面标题生成失败，改用论文原题：%s", exc)
+    cover_headline = hook or _cover_fallback_headline(title)
+    if hook:
+        logger.info("封面标题：%s", hook)
+    elif cover_headline:
+        logger.info("封面标题：没有模型输出，用论文原题兜底（%s…）", cover_headline[:16])
+
     scenes = build_scenes(
         segments=segments,
         timings=timings,
@@ -2747,6 +3062,8 @@ def compose_video(
         fallback_id=default_id,
         points=points,
         focuses=focuses,
+        headline=cover_headline,
+        cover_caption=title,
     )
 
     layout = layout_for(orientation)
@@ -2773,7 +3090,7 @@ def compose_video(
             # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
             # 品牌卡上的字是大号引导语，不参与「字幕逐句出现」——那会把它切碎。
             # 它整页都是牌子，没有「图片层」，转场用 to_card（上一整页淡出）代替。
-            render_endcard(scene, slide_path, title=title, layout=layout)
+            render_endcard(scene, slide_path, layout=layout)
             endcard_count += 1
         else:
             # 正文：**骨架 + 图片卡** 两层。骨架（标题/图注/强调行/字幕带）全程不动，
@@ -2781,7 +3098,6 @@ def compose_video(
             render_chrome(
                 scene,
                 slide_path,
-                title=title,
                 include_subtitle=len(beats) <= 1,
                 include_point=False,
                 layout=layout,
@@ -2868,6 +3184,7 @@ def compose_video(
     result.asset_versions = {
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
     }
+    result.hook = hook
 
     for temp_path in [*slide_paths, *band_paths, *point_paths, *card_paths, *focus_paths]:
         try:
