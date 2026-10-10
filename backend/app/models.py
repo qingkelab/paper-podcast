@@ -100,6 +100,14 @@ class VideoInfo(BaseModel):
     # **视频第一帧的静帧**，给页面上的 `<video poster>` 用。缺省 null（老视频没有）。
     # 为什么不能用论文首页顶替：那上面**没有烘进标题**，页面上就看不出封面长什么样。
     poster_url: str | None = None
+    # **封面标题改过、但还没重新合成**：视频里烘的还是旧标题。
+    # 为什么单独一个字段而不是复用 `stale`：`stale` 说的是配图（旋转/删除过论文原图），
+    # 提示文案和「该不该慌」都不是一回事。用户改的是一行字，要的是「重新合成一下就生效」。
+    title_pending: bool = False
+    # **这一份画面是哪条渲染路径画的**：`html`（Chrome 无头，默认）或 `svg`（resvg 保底）。
+    # 两条路径同时在（没装 Chrome 就自动降级），所以「同一篇论文两台机器出的画面
+    # 不一样」只能靠它分辨。老视频没有这个记录，返回 null。
+    renderer: str | None = None
 
 
 class Illustration(BaseModel):

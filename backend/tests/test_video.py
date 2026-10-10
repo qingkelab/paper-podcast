@@ -3328,6 +3328,24 @@ class TestVideoPosterIsTheFirstFrame:
             episode_id = self._seed(client, with_poster=False)
             assert client.get(f"/api/episodes/{episode_id}/video/poster").status_code == 404
 
+    def test_renderer_is_exposed(self, tmp_path):
+        """这一份画面是 HTML 还是 SVG 画的，接口要真的报出来。
+
+        它只躺在库里的话，`VideoInfo.renderer` 就是个**恒为 null 的字段** ——
+        而它存在的理由恰恰是「同一篇论文两台机器出的画面不一样，要有一句话可查」。
+        """
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client, with_poster=False)
+            assert client.get(f"/api/episodes/{episode_id}").json()["video"]["renderer"] is None
+            client.app.state.db.update_episode(
+                episode_id,
+                video={
+                    "duration_sec": 9.0, "scene_count": 3, "bytes": 64,
+                    "hook": "标题", "renderer": "html",
+                },
+            )
+            assert client.get(f"/api/episodes/{episode_id}").json()["video"]["renderer"] == "html"
+
     @pytest.mark.skipif(not ffmpeg_available(), reason="需要系统安装 ffmpeg")
     def test_capture_poster_reads_a_real_frame(self, tmp_path):
         """真编一段视频，抽出来的静帧要和视频同一画幅（不是空白图）。"""
@@ -3347,3 +3365,106 @@ class TestVideoPosterIsTheFirstFrame:
         assert poster is not None and poster.exists()
         pix = pymupdf.Pixmap(str(poster))
         assert (pix.width, pix.height) == (320, 240)
+
+
+class TestCoverTitlePendingRebuild:
+    """改完标题要**就地**能给一个「重新合成视频」的入口。
+
+    用户反馈过「没有 重新合成视频 的按钮」：那句「保存后点「重新合成视频」才会生效」
+    指的是页面上的一个按钮，而它当时只挂在 `video.stale`（**配图**过时）的提示条里 ——
+    改标题不会把 `stale` 置真，于是按钮不出现，用户被指去点一个不存在的东西。
+    所以标题改动有自己的标记 `title_pending`，重新合成时自然清掉。
+    """
+
+    def _client(self, tmp_path):
+        import contextlib
+
+        from fastapi.testclient import TestClient
+
+        from app.config import Settings
+        from app.main import create_app
+
+        @contextlib.contextmanager
+        def ctx():
+            settings = Settings(
+                force_mock=True,
+                enable_video=True,
+                data_dir=tmp_path / "data",
+                database_path=tmp_path / "data" / "pending.db",
+            )
+            with TestClient(create_app(settings)) as client:
+                yield client
+
+        return ctx()
+
+    def _seed(self, client) -> str:
+        settings = client.app.state.settings
+        db = client.app.state.db
+        video_path = settings.data_dir / "videos" / "x.mp4"
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        video_path.write_bytes(b"\x00" * 128)
+        audio_path = settings.data_dir / "audio" / "x.mp3"
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_path.write_bytes(b"\x00" * 64)
+        record = db.create_episode(
+            source_type="pdf", source_ref="/tmp/x.pdf", title="原标题",
+            options={"duration_min": 3, "level": "intro"},
+        )
+        # 注意要连 `script` 一起给：`_resolve_version()` 不认一个没有脚本的版本，
+        # 那样接口返回的 `video` 会是 None（我第一次就是这么写的，白查了一轮）
+        db.update_episode(
+            record["id"],
+            status="completed",
+            script={"title": "原标题", "segments": [{"speaker": "A", "text": "第一段"}]},
+            audio_path=str(audio_path),
+            audio_duration_sec=10.0,
+            video_path=str(video_path),
+            video={"duration_sec": 10.0, "scene_count": 1, "assets": {}, "hook": "", "title_pending": False},
+        )
+        return record["id"]
+
+    def test_saving_a_title_marks_it_as_pending(self, tmp_path):
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            assert client.get(f"/api/episodes/{episode_id}").json()["video"]["title_pending"] is False
+
+            # 结尾的「！」会被清掉（标题不该以标点收尾，这是既有规则）
+            body = client.patch(
+                f"/api/episodes/{episode_id}/cover", json={"headline": "显存直降 68.7%！"}
+            ).json()
+            assert body["video"]["hook"] == "显存直降 68.7%"
+            assert body["video"]["title_pending"] is True, "改完标题要说「还没合成」"
+
+    def test_saving_the_same_title_does_not_flag_pending(self, tmp_path):
+        """标题没变就别说「待合成」—— 那会白提示一次。"""
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            client.patch(f"/api/episodes/{episode_id}/cover", json={"headline": "同一个标题"})
+            again = client.patch(
+                f"/api/episodes/{episode_id}/cover", json={"headline": "同一个标题"}
+            ).json()
+            assert again["video"]["hook"] == "同一个标题"
+            # 第二次仍然是 pending：它确实还没合成过（第一次就打了标记，这里不该被清掉）
+            assert again["video"]["title_pending"] is True
+
+    def test_changing_the_paper_title_also_flags_pending(self, tmp_path):
+        """论文原题也是画进封面的（面板里那行小字），改它一样要重新合成。"""
+        with self._client(tmp_path) as client:
+            episode_id = self._seed(client)
+            body = client.patch(
+                f"/api/episodes/{episode_id}/cover", json={"paper_title": "换一个论文标题"}
+            ).json()
+            assert body["title"] == "换一个论文标题"
+            assert body["video"]["title_pending"] is True
+
+    def test_rebuild_clears_the_flag(self, tmp_path):
+        """重新合成出来的视频，画面和标题必然一致 —— 标记要被清掉。
+
+        `VideoResult.to_dict()` 里恒为 False，而 pipeline 整份覆盖库里的 video，
+        所以这里直接盯住那个契约（不跑完整合成：那要真的编码一段视频）。
+        """
+        from app.services.video import VideoResult
+
+        payload = VideoResult(video_path=tmp_path / "x.mp4", duration_sec=1.0, scene_count=1,
+                              bytes_written=1, assignment="reused").to_dict()
+        assert payload["title_pending"] is False

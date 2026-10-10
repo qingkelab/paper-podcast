@@ -107,8 +107,10 @@ with render_session(work_dir) as session:      # HTML 可用 → ChromeSession�
   要求 `html` 但机器上没有 Chrome 时**自动降级**（并记一条日志）。
   「这条机器没装 Chrome」不该变成「出不了片」。
 - `RENDER_HTML_LAYERS=0` 可以单独关掉图层走 HTML（不必回滚代码）。
-- 出片用的哪条路径存进 `video.renderer`（`html`/`svg`）——
+- 出片用的哪条路径存进 `video.renderer`（`html`/`svg`），**并且通过接口报出来** ——
   否则「同一篇论文两台机器出的画面不一样」光看 MP4 是查不出来的。
+  （它一度只写库、不出口：既不在 `VideoInfo` 里，也没进 `_version_payload` 的
+  白名单 —— 排查时给不出来的字段，和没有这个字段是一样的。）
 - **测试默认走 SVG**（`tests/conftest.py` 里 autouse 设 `RENDER_BACKEND=svg`）：
   既快又确定。真正关心 HTML 的测试自己开（`tests/test_htmlpage.py`）。
 

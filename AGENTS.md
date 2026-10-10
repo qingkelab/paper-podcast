@@ -471,6 +471,9 @@ cd frontend && pnpm test:units
 
 - **只写数据、不重新合成**：封面是烘焙进 MP4 的画面，改完要再调 `POST /video/rebuild`。
   分两步是有意的 —— 重新合成要一分钟上下，用户想先把标题改满意再合成一次。
+  但**入口必须就地给**：那句「点「重新合成视频」后生效」曾指向一个**不存在的按钮**
+  （它只挂在 `stale` 提示条里，而改标题不置 `stale`）。现在标题改动有自己的标记
+  `video.title_pending`，封面编辑器就地出按钮，重新合成时清掉。
 - 写进去的值过和模型那条**同一套清理**（`normalize_hook`），所以返回值和传入值可能不同，
   **界面要显示返回值**（前端保存后会用返回的 `video.hook` 回填输入框）。
 - **写接口少 `Content-Type: application/json` 就整个不能用**（用户反馈标题改不了）：
@@ -757,7 +760,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           htmlpage(HTML 画面) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            632 项，改完必须全绿
+backend/tests/            637 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

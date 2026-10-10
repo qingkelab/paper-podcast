@@ -503,7 +503,8 @@ async function saveCoverTitle(): Promise<void> {
     episode.value = updated
     // 显示**后端收短之后**的那一份：它可能和你敲的不完全一样（超长会断在分句处）
     resetCoverDraft()
-    showToast('ok', '封面标题已保存，点「重新合成视频」后生效')
+    // 按钮就在下面这一行里（`title_pending` 会把它显示出来），所以说「点下面的」
+    showToast('ok', '封面标题已保存 —— 点下面的「重新合成视频」后生效')
   } catch (cause) {
     if (id.value !== targetId) return
     showToast('error', errorMessage(cause, '保存封面标题失败'))
@@ -1533,9 +1534,28 @@ onBeforeUnmount(() => {
                   <span v-if="savingCover" class="spinner" aria-hidden="true" />
                   {{ savingCover ? '保存中…' : '保存' }}
                 </button>
-                <span class="section__hint">
-                  保存后点「重新合成视频」才会生效 —— 标题是画进画面里的。
-                  超长会按分句自动收短（中文 16 字 / 英文 9 个词）。
+                <!--
+                  只改数据、不自动重新合成（重新合成要一分钟上下）。所以保存之后
+                  **就地**给一个「重新合成视频」按钮 —— 标题是画进画面里的，
+                  不合成一次，页面上、首页、分享页看到的都还是旧标题。
+                -->
+                <button
+                  v-if="currentVideo?.title_pending"
+                  type="button"
+                  class="btn btn--sm"
+                  :disabled="rebuildingVideo"
+                  @click="rebuildVideoNow"
+                >
+                  <span v-if="rebuildingVideo" class="spinner" aria-hidden="true" />
+                  {{ rebuildingVideo ? '重新合成中…' : '重新合成视频' }}
+                </button>
+                <span v-if="currentVideo?.title_pending" class="section__hint" role="status">
+                  标题已存，视频里还是旧标题 —— 点「重新合成视频」{{ rebuildEtaText }}后生效
+                  <template v-if="rebuildingVideo">（已等 {{ rebuildElapsed }} 秒，请先别关闭页面）</template>
+                </span>
+                <span v-else class="section__hint">
+                  标题是画进画面里的，改完要重新合成才看得到。
+                  建议 18 字以内（最长 23），超长会按分句自动收短。
                 </span>
               </div>
             </div>

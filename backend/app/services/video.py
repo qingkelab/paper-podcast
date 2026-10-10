@@ -155,6 +155,10 @@ class VideoResult:
     # 页面上的视频位只能拿论文首页当封面 —— 那是**没烘进标题的原始 PDF 页**，
     # 观众（和用户）就会以为「封面上没有标题」。（实测踩到：用户打开首页说「没有看到」。）
     poster_path: str = ""
+    # 封面标题改过、但还没重新合成时为 true（由 PATCH /cover 打上）。
+    # 这里恒为 false：**刚合成出来的视频，画面和标题必然是一致的** ——
+    # `to_dict()` 整份覆盖库里的 video，所以重新合成本身就是把标记清掉。
+    title_pending: bool = False
     # 这一份画面是**哪条渲染路径**画出来的：`html`（Chrome 无头）或 `svg`（resvg）。
     # 存下来是为了「同一篇论文，两台机器出的画面不一样」这类问题有一句话可查 ——
     # 两条路径都在，出片时用了哪条光看 MP4 是看不出来的。
@@ -172,6 +176,7 @@ class VideoResult:
             "hook": self.hook,
             "poster": self.poster_path,
             "renderer": self.renderer,
+            "title_pending": self.title_pending,
         }
 
 

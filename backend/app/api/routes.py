@@ -165,6 +165,13 @@ def _version_payload(
             # 封面大字标题（逐语言一份，用户可以改，见 PATCH /cover）
             "hook": str(stored_video.get("hook") or ""),
             "poster_url": _poster_url(episode_id, stored_video, query),
+            # 标题改了但还没重新合成（视频里烘的还是旧标题）
+            "title_pending": bool(stored_video.get("title_pending")),
+            # 这份画面是 **HTML（Chrome 无头）** 还是 **SVG（resvg）** 画的。
+            # 两条路径同时在（没装 Chrome 就自动降级），所以「同一篇论文两台机器
+            # 出的画面不一样」得靠它才分得清 —— 只躺在库里的话这条线索等于查不到：
+            # `VideoInfo.renderer` 一直是个恒为 null 的字段。
+            "renderer": str(stored_video.get("renderer") or "") or None,
         }
 
     # 横版：与竖版并存的一份（`?orientation=landscape`，1920×1080）
@@ -189,8 +196,13 @@ def _version_payload(
                 "orientation": "landscape",
                 # 两种画幅共用同一句封面标题（它属于这个语言版本，不属于某一份文件）
                 "hook": str((version.get("video") or {}).get("hook") or ""),
+                # 同理：改标题对横竖两版都还没生效
+                "title_pending": bool((version.get("video") or {}).get("title_pending")),
                 # 但静帧是**各自一份**（横竖两个画面完全不一样）
                 "poster_url": _poster_url(episode_id, stored_landscape, query, orientation="landscape"),
+                # 横版和竖版可能落在不同的渲染路径上（比如竖版渲染完 Chrome 挂了、
+                # 横版退回 SVG），所以这个字段是**各报各的**，不是共用
+                "renderer": str(stored_landscape.get("renderer") or "") or None,
             }
 
     illustration = None
@@ -1829,22 +1841,42 @@ async def update_cover_title(request: Request, episode_id: str, payload: CoverTi
     """
     record = _require_episode(request, episode_id)
     version = _resolve_version(request, record, lang=None)[1]
+    # 语言取这一版自己的语言：中文标题按字数收、英文按词数收
+    language = str(version.get("language") or record.get("language") or "zh")
+    stored_video = dict(version.get("video") or {})
 
     fields: dict[str, Any] = {}
+    # 改标题 = 视频里那行字**暂时对不上了**。打上这个标记，前端才会就地给出
+    # 「重新合成视频」的按钮 —— 否则用户看到的是一句「点重新合成后生效」，
+    # 而那个按钮平时根本不显示（它只挂在「配图过时」的提示条里）。
+    # 重新合成时 `result.to_dict()` 会整份覆盖 video，标记自然被清掉。
+    pending = False
     if payload.paper_title is not None and payload.paper_title.strip():
-        fields["title"] = payload.paper_title.strip()[:200]
+        # 论文原题也画在封面上（玻璃面板里那行小字），所以改它同样要重新合成
+        new_title = payload.paper_title.strip()[:200]
+        pending = pending or new_title != str(record.get("title") or "")
+        fields["title"] = new_title
 
     if payload.headline is not None:
-        # 语言取这一版自己的语言：中文标题按 16 字收、英文按词数收
-        language = str(version.get("language") or record.get("language") or "zh")
         headline = normalize_hook(payload.headline, language=language)
-        stored_video = dict(version.get("video") or {})
+        pending = pending or headline != str(stored_video.get("hook") or "")
         stored_video["hook"] = headline
+
+    # 只有当**真的改动了什么**（pending）或者改了标题字段时才写回 video：
+    # 空 PATCH 不该在视频记录上留下痕迹
+    if pending or payload.headline is not None:
+        if pending:
+            stored_video["title_pending"] = True
         versions = dict(record.get("versions") or {})
         if versions:
             primary = _primary_language(record)
             entry = dict(versions.get(language) or {})
-            entry["video"] = {**(entry.get("video") or {}), "hook": headline}
+            entry_video = dict(entry.get("video") or {})
+            if payload.headline is not None:
+                entry_video["hook"] = stored_video["hook"]
+            if pending:
+                entry_video["title_pending"] = True
+            entry["video"] = entry_video
             versions[language] = entry
             fields["versions"] = versions
             # 顶层字段镜像主语言那一版（老前端和分享页读的是它）
