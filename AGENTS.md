@@ -120,6 +120,24 @@ cd frontend && pnpm test:units
   所有真正的图（实测 Attention 那篇只有 3 张位图，但单页有 600~1000 个矢量绘图）。
   必须「按图注定位 + 图形包围盒渲染区域」。
 - **图注在图下方，表注在表上方**。方向搞反会截到一片空白。
+- **图注的排版有好几种流派，少认一种的代价是「整集视频里没有一张论文原图」**。
+  实测踩过两次，两篇论文各不相同：
+  | 写法 | 例 | 后果 |
+  |---|---|---|
+  | `Figure 1:` / `Fig. 1.` / `Table 2：` | 大多数论文 | 正常 |
+  | **`Figure 1 \| Overview.`**（竖线，ACL/ICLR 模板） | WOVEN | 112 页论文**一条都认不出** → 提取到 0 张图 |
+  | **`Figure 2 Overview of HLA.`**（根本没有分隔符） | HLA | 整篇只提取到 1 张图 |
+  两篇的成片都只能用封面 / 信息图 / 现场生成的示意图，看起来就是「怎么连原文的图都没用」。
+  现在 `_CAPTION_SEP` 把 `|`、`｜` 也算分隔符；**没有分隔符**的那种走
+  `_caption_candidates` 的第二遍：只在**文本块开头**认，且编号后第一个词不能是
+  shows/illustrates/presents 这类**引用动词**（正文里的交叉引用「Figure 3 shows …」
+  也常落在行首，靠这两条才分得开）。
+- **提取到 0 张图不会报错，只会静默降级**。所以「这一集画面里有没有论文原图」
+  要当成一个可检查的指标：按 `video.scenes[i].image` 分组统计一下就知道
+  （`f1`/`t3` 这类 id 是论文原图，`cover`/`illustration`/`topicN` 不是）。
+  修完图注解析之后重跑是两步：**重抽配图 → 重新问一次逐段选图** →
+  `rebuild_video`。`rebuild_video` 自己会复用旧分配（TestPresetReuse 钉着），
+  所以「重新选图」必须单独跑一次（脚本见下面「补配图」）。
 - **有些论文的图里文字全是竖排的**（典型是注意力可视化的词对齐网格）。
   实测 Attention 那篇 Figure 3/4/5 是 108 行文字全部方向 (0,-1)、没有一行横排。
   代码会把这类图转正（`_text_direction` + `_rotate_pixmap`），判定很保守
@@ -337,6 +355,13 @@ cd frontend && pnpm test:units
 - **强调行文案属于「可以单独补一次」的数据**：`video.scenes[i].point`。旧视频里没有它，
   所以有 `allow_point_llm` 这个显式开关 + 一个维护脚本（见下面「补强调行」）。
   重新合成时**默认仍然不问模型**（`TestPresetReuse` 钉着这条规则）。
+
+**补配图（图注解析修好之后用）**：`rebuild_video` 复用旧分配，所以新提取到的图
+不会自动上画。要跑一次「重新选图」：`build_asset_pool`（+ 上次现场生成的主题图）
+→ `build_assign_messages` → `_normalize_per_segment` → 把新 `image` 写回
+`video.scenes[i]` → 再 `rebuild_video`。选到 `generate` 的段落**沿用上次那张**，
+别现场重画（省一次模型调用 + 几十秒）。音频/脚本/要点/封面标题全都不动。
+做过一次：3 集，用到论文原图的段落 0/29、0/51、2/27 → 17/29、19/51、10/27。
 
 **补强调行 / 补子图聚光灯（旧视频用）**：写一个脚本逐集调用 `build_points_messages`
 （带上 `panel_options`）→ `_chat_json` → `normalize_point_items`，把 `point` 和
@@ -671,7 +696,7 @@ backend/app/services/     ingest(预处理) prompts(Prompt) llm(DeepSeek/方舟)
                           video(视频合成) pipeline(编排) branding(社区话术)
 backend/app/auth.py       账号与会话（scrypt 口令 / 会话 cookie / 归属判定）
 backend/app/worker.py     asyncio 队列，串行消费 + 分类重试
-backend/tests/            541 项，改完必须全绿
+backend/tests/            547 项，改完必须全绿
 frontend/src/api/         index(适配器) real(真实) mock(浏览器端模拟)
 frontend/src/views/        LandingView(首页) CreateView(表单) Library/Episode/Task/Settings
 frontend/src/utils/language.ts  语言标签、清洗、按单集记住上次看的语言

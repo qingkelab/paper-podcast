@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from app.services.figures import (
+    _CAPTION,
     MAX_FIGURES,
     extract_figures,
     render_first_page,
@@ -33,7 +34,12 @@ SVG_NS = "http://www.w3.org/2000/svg"
 # --------------------------------------------------------------------------
 
 
-def make_pdf(*, drawings: bool = True, caption: str | None = "Figure 1: A test diagram."):
+def make_pdf(
+    *,
+    drawings: bool = True,
+    caption: str | None = "Figure 1: A test diagram.",
+    body: str = "Body text below the caption. " * 4,
+):
     """造一页含矢量图形和图注的 PDF。
 
     drawings=False 时只放文字——用来模拟「纯文字排版的表格」，
@@ -56,7 +62,7 @@ def make_pdf(*, drawings: bool = True, caption: str | None = "Figure 1: A test d
         page.insert_text((80, 460), caption, fontsize=10)
 
     # 图注下方再放点正文，确保「图注上方」这个方向是真的按位置区分的
-    page.insert_text((80, 500), "Body text below the caption. " * 4, fontsize=10)
+    page.insert_text((80, 500), body, fontsize=10)
 
     data = doc.tobytes()
     doc.close()
@@ -627,3 +633,71 @@ class TestIllustrationIsWhite:
         svg = fallback_svg(self.ANALYSIS, self.META)
         assert ILLUSTRATION_PALETTE["bg"] in svg
         assert ILLUSTRATION_PALETTE["card_border"] in svg
+
+
+class TestCaptionStyles:
+    """图注的排版有几种流派，少认一种的代价是**整集的视频里没有论文原图**。
+
+    实测两篇论文各踩一次：
+    - `Figure 1 | Overview.`（ACL/ICLR 模板，竖线分隔）→ 112 页的论文**一条都认不出**；
+    - `Figure 2 Overview of HLA.`（**没有分隔符**）→ 整篇只提取到 1 张图。
+    两篇的成片都只能用封面 / 信息图 / 现场生成的示意图，用户看到的就是
+    「怎么连原文里的图都没用上」。
+    """
+
+    def test_pipe_separator_is_a_caption(self, tmp_path):
+        figures = extract_figures(
+            make_pdf(caption="Figure 1 | Overview of the whole pipeline."), tmp_path, "pipe"
+        )
+        assert len(figures) == 1
+        assert "Overview of the whole pipeline" in figures[0].caption
+
+    def test_full_width_pipe_is_in_the_separator_set(self):
+        """全角竖线（中文排版里常见）也要算分隔符。
+
+        这里直接测正则：合成 PDF 用的内置字体渲染不出全角竖线
+        （会落成一个点），那样的 fixture 测不出东西。
+        """
+        assert _CAPTION.match("Figure 1 ｜ 全流程概览")
+        assert _CAPTION.match("Figure 1 | Overview")
+        assert _CAPTION.match("Fig. 1: Overview")
+        assert _CAPTION.match("Table 2. Results")
+
+    def test_caption_without_a_separator_at_block_start(self, tmp_path):
+        """`Figure 2 Overview of HLA.` —— 标签后面直接是正文，没有冒号。"""
+        figures = extract_figures(
+            make_pdf(caption="Figure 1 Motivating observations for selective retrieval."),
+            tmp_path,
+            "nosep",
+        )
+        assert len(figures) == 1
+        assert "Motivating observations" in figures[0].caption
+
+    def test_in_text_reference_is_not_a_caption(self, tmp_path):
+        """正文段落开头写「Figure 3 shows …」时**不能**把它当图注。
+
+        真实图注是它自己一段；交叉引用落在段落中间或段首，
+        靠「段落开头 + 引用动词黑名单」区分。
+        """
+        figures = extract_figures(
+            make_pdf(caption="Figure 1: A test diagram.", body="Figure 3 shows that the method works. " * 3),
+            tmp_path,
+            "ref",
+        )
+        assert len(figures) == 1, "正文里的交叉引用被当成图注了"
+        assert figures[0].label == "Figure 1"
+
+    def test_table_without_a_separator_above_the_table(self, tmp_path):
+        """表注在**表上方**：没有分隔符时同样要认出来（`Table 1 From-scratch …`）。"""
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((80, 140), "Table 1 From-scratch 1.3B results on RULER.", fontsize=10)
+        page.draw_rect(pymupdf.Rect(80, 160, 515, 430), color=(0, 0, 0), width=1.5)
+        page.draw_rect(pymupdf.Rect(120, 200, 300, 300), fill=(0.8, 0.85, 0.95))
+        figure = extract_figures(doc.tobytes(), tmp_path, "tblnosep")
+        doc.close()
+        assert len(figure) == 1
+        assert figure[0].kind == "table"
+        assert "From-scratch" in figure[0].caption

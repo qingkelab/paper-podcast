@@ -27,10 +27,26 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# `Figure 1:` / `Fig. 1.` / `Table 2：`  —— 冒号可能是半角或全角
-_CAPTION = re.compile(r"^\s*(Figure|Fig\.?|Table)\s+(\d+)\s*[:.．：]", re.IGNORECASE | re.MULTILINE)
+# 图注分隔符：`Figure 1:` / `Fig. 1.` / `Table 2：` / `Figure 3 |`
+#
+# ⚠️ 竖线 `|` 是**必须**的一项：ACL/ICLR 那一版模板用 `Figure 1 | Overview.`，
+# 实测某篇 112 页的论文整篇 **0 条**能认出来（加 `|` 之后 137 条），
+# 后果是那一集的视频里一张论文原图都没有，全在用封面/信息图/现场生成的示意图。
+_CAPTION_SEP = r"[:.．：|｜]"
+_CAPTION = re.compile(rf"^\s*(Figure|Fig\.?|Table)\s+(\d+)\s*{_CAPTION_SEP}", re.IGNORECASE | re.MULTILINE)
 # 同一个块里出现第二条图注时用来断开（不带 ^ 锚，因为要数「第几条」）
-_CAPTION_ANYWHERE = re.compile(r"(?:Figure|Fig\.?|Table)\s+\d+\s*[:.．：]", re.IGNORECASE)
+_CAPTION_ANYWHERE = re.compile(rf"(?:Figure|Fig\.?|Table)\s+\d+\s*{_CAPTION_SEP}", re.IGNORECASE)
+# 「没有分隔符」的图注：`Figure 1 Motivating observations for …`（也有一批论文这么排）。
+# 只在**段落开头**认它（见 _caption_candidates），因为正文里的交叉引用
+# 「Figure 3 shows that …」也常常落在行首，靠段落开头 + 动词黑名单才分得开。
+_CAPTION_NO_SEP = re.compile(r"^\s*(Figure|Fig\.?|Table)\s+(\d{1,2})\s+(?=\S)", re.IGNORECASE)
+# 紧跟编号的第一个词如果是这些动词，那它是在**引用**某张图，不是图注本身
+_REFERENCE_VERBS = frozenset(
+    """shows show illustrated illustrates illustrate depicts depict presents present
+    reports report gives give compares compare summarizes summarize plots plot provides
+    provide details detail lists list displays display uses use confirms confirm
+    demonstrates demonstrate visualizes visualize summarises summarise""".split()
+)
 # 图内部单独成词的子图标注：`(a)`、`(b)`…（`(i)`/`(iv)` 这种罗马数字不算，容易被当成列表项）
 _PANEL_MARK_WORD = re.compile(r"^\(([a-hj-z])\)$")
 
@@ -410,6 +426,70 @@ def _panel_marks(page, region) -> list[dict]:
     return sorted(found.values(), key=lambda mark: (round(mark["y"], 1), mark["x"]))
 
 
+def _caption_candidates(page) -> list[tuple[str, "pymupdf.Rect"]]:
+    """把这一页所有的「图注标签 + 它的位置」找出来。
+
+    两个来源，缺一不可（都是实测踩出来的）：
+
+    1. **带分隔符的行首匹配**（`Figure 1:` / `Fig. 1.` / `Figure 3 |`）。
+       用行首而不是任意位置，是为了避开正文里的交叉引用。
+    2. **段落开头、没有分隔符**（`Figure 2 Overview of HLA. …`）。
+       这种排版（不少 ACL 论文）在来源 1 里一条都认不出来 —— 实测某篇论文
+       整篇只有 1 张图被提取到，视频里几乎看不到论文原图。
+       判据收紧到「出现在**文本块开头**」+「编号后面第一个词不是 shows/illustrates
+       这类引用动词」：真正的图注是它自己一段，而交叉引用都在正文段落中间。
+
+    返回的标签保持原文写法（`Fig. 1` / `Figure 1` 都留着），去重交给
+    `_canonical_key`。
+    """
+    found: list[tuple[str, "pymupdf.Rect"]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(raw_label: str, kind_raw: str, number: str) -> None:
+        key = (kind_raw.lower().rstrip("."), number)
+        if key in seen:
+            return
+        try:
+            hits = page.search_for(raw_label)
+        except Exception:  # noqa: BLE001
+            return
+        if not hits:
+            return
+        seen.add(key)
+        found.append((raw_label, hits[0]))
+
+    try:
+        page_text = page.get_text()
+    except Exception:  # noqa: BLE001
+        page_text = ""
+    for match in _CAPTION.finditer(page_text):
+        add(match.group(0).strip().rstrip(":.．：|｜").strip(), match.group(1), match.group(2))
+
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:  # noqa: BLE001
+        blocks = []
+    for block in blocks:
+        if len(block) >= 7 and block[6] != 0:
+            continue  # 图片块
+        text = re.sub(r"\s+", " ", str(block[4])).strip()
+        if not text:
+            continue
+        if _CAPTION.match(text):
+            continue  # 已经在来源 1 里收过了
+        match = _CAPTION_NO_SEP.match(text)
+        if not match:
+            continue
+        first_word = text[match.end() :].split(" ", 1)[0].strip("，,。.、;；:：")
+        if first_word.lower() in _REFERENCE_VERBS:
+            continue  # 「Figure 3 shows …」是引用，不是图注
+        if len(text) - match.end() < 8:
+            continue  # 标签后面几乎没内容，多半是目录/页眉
+        add(match.group(0).strip(), match.group(1), match.group(2))
+
+    return found
+
+
 def _canonical_key(kind: str, number: str) -> tuple[str, str]:
     """图注的规范键，用来去重。
 
@@ -464,10 +544,6 @@ def extract_figures(
     try:
         for page_index in range(doc.page_count):
             page = doc[page_index]
-            try:
-                page_text = page.get_text()
-            except Exception:  # noqa: BLE001
-                continue
 
             graphics = _graphics_bbox(page)
             if graphics is None:
@@ -475,19 +551,10 @@ def extract_figures(
                 # 一段文字截图，没有配图价值
                 continue
 
-            for match in _CAPTION.finditer(page_text):
-                raw_label = match.group(0).strip().rstrip(":.．：").strip()
-                kind_raw = match.group(1)
-                number = match.group(2)
+            for raw_label, caption_rect in _caption_candidates(page):
+                kind_raw = raw_label.split()[0]
+                number = re.sub(r"\D", "", raw_label) or "1"
                 is_table = kind_raw.lower().startswith("tab")
-
-                try:
-                    hits = page.search_for(raw_label)
-                except Exception:  # noqa: BLE001
-                    continue
-                if not hits:
-                    continue
-                caption_rect = hits[0]
 
                 if is_table:
                     # 表注在表上方：往下取
