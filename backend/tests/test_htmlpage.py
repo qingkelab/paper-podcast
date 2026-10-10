@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -724,3 +725,116 @@ class TestFocusMorphReachesTheVideo:
         early, late = border_left(2.05), border_left(2.45)
         assert early is not None and late is not None, (early, late)
         assert early < late - 40, f"成片里聚光灯没移动：{early} → {late}"
+
+
+# 量「浏览器实际怎么断行」的小工具：逐字取 Range 的矩形，按 top 分行。
+# 这是唯一能问出「这一行到底是哪几个字」的办法（innerText 给的是整段，
+# 看不出断行，也看不出标点是不是被甩到了下一行）。
+_BAND_LINES_JS = """(() => {
+  const el = document.querySelector('.band-text');
+  if (!el) return null;
+  // ⚠️ 不能只取 `el.firstChild`：数字会被包成 `<span class="num">`
+  //（「6比特方案…」这种句子第一个子节点就是元素，不是文本节点），
+  // 用 TreeWalker 走**所有**文本节点才稳。
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const out = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    for (let i = 0; i < node.length; i++) {
+      const r = document.createRange(); r.setStart(node, i); r.setEnd(node, i + 1);
+      const rects = r.getClientRects();
+      if (!rects.length) continue;
+      const top = Math.round(rects[0].top);
+      let line = out.find(l => Math.abs(l.top - top) <= 2);
+      if (!line) { line = { top: top, text: '' }; out.push(line); }
+      line.text += node.data[i];
+    }
+  }
+  out.sort((a, b) => a.top - b.top);
+  return JSON.stringify(out.map(l => l.text));
+})()"""
+
+
+@requires_chrome
+class TestLineBreaking:
+    """断行归浏览器之后，**标点不会被甩到下一行独占一行**。
+
+    老路径（`_fit_subtitle` 按近似字宽表折行）在库里的 404 条真实字幕里有 **14 条**
+    （3.5%）把 `。` / `，` 单独排到了下一行 —— 我在成片抽帧里亲眼见过一次：
+    字幕末行只有一个「。」。中文排印规则不允许行首出现收尾标点，浏览器直接照做。
+    """
+
+    ORPHANS = [
+        "是看错了，还是推理歪了，还是压根没理你的要求。",
+        "全部由Gemini-3-Pro在同一套提示和协议下标的，",
+        "也就是说，它在用一个模型的判断去教另一个模型。",
+        "6比特方案已经在SGLang上跑通了，但真要上生产，",
+    ]
+    CLOSERS = "。，、；：！？）」』…"
+
+    def test_no_line_starts_with_a_closing_punctuation(self, session, tmp_path):
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import caption_band_page
+
+        for index, text in enumerate(self.ORPHANS):
+            session.open_page(caption_band_page(text, PORTRAIT), work_dir=tmp_path)
+            raw = session._evaluate(_BAND_LINES_JS)
+            assert raw, f"量不到断行：{text}"
+            lines = json.loads(raw)
+            bad = [
+                line
+                for line in lines[1:]
+                if line.strip() and len(line.strip()) <= 2 and line.strip()[0] in self.CLOSERS
+            ]
+            assert not bad, f"标点被甩到单独一行：{lines}"
+            assert len(lines) <= 2, f"这句话应当两行放下：{lines}"
+
+    def test_the_old_python_wrapping_had_this_defect(self):
+        """把「这条测试为什么存在」钉住：老路径对同一句话**确实**会断出孤行标点。
+
+        如果哪天有人改了 `_fit_subtitle` 让这段断言失败，说明老路径的折行行为变了 ——
+        那时候该重新评估的是这条测试的前提，而不是把它删掉。
+        """
+        from app.services.video import _fit_subtitle
+
+        lines = _fit_subtitle(self.ORPHANS[0], max_lines=3, max_size=38.0)[1]
+        assert lines[-1].strip() == "。", f"老路径的孤行标点行为变了：{lines}"
+
+
+@requires_chrome
+class TestTextNeverOverflowsItsBox:
+    """字号自适应真的跑了（`window.prepare` 接上之后）—— 量的是「没跑出来」的后果。"""
+
+    def test_caption_is_clamped_not_overflowing(self, session, tmp_path):
+        """超长图注只能被行的上限截断（带省略号），**不能溢出到字幕带上**。"""
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import scene_page
+
+        scene = _scene(tmp_path, caption="Figure 1: " + "这段图注特别长，" * 40)
+        session.open_page(scene_page(scene, PORTRAIT), work_dir=tmp_path)
+        raw = session._evaluate(
+            "(() => { const c = document.querySelector('.caption');"
+            " return JSON.stringify({h: c.scrollHeight, box: c.clientHeight,"
+            " lines: getComputedStyle(c).webkitLineClamp,"
+            " overflow: getComputedStyle(c).overflow}); })()"
+        )
+        info = json.loads(raw)
+        assert info["overflow"] == "hidden", "图注必须裁掉多余的行"
+        assert info["lines"] == "2", "图注最多两行"
+        assert info["box"] <= 46 + 1, f"图注的框高固定两行，实际 {info['box']}"
+
+    def test_long_caption_shrinks_instead_of_being_cut_early(self, session, tmp_path):
+        """放不下要**先缩字号**再截 —— 同一片地方能多看到四成字。
+
+        实测库里的真实图注：老路径（18px 硬切两行）中位数能看到 160 字，
+        缩字号之后中位数 227 字（+42%），而且末尾带省略号而不是半句断掉。
+        """
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import scene_page
+
+        scene = _scene(tmp_path, caption="Figure 2: " + "子图说明文字。" * 18)
+        session.open_page(scene_page(scene, PORTRAIT), work_dir=tmp_path)
+        size = session._evaluate(
+            "parseFloat(getComputedStyle(document.querySelector('.caption')).fontSize)"
+        )
+        assert 14 <= size < 18, f"长图注应当把字号压到 18 以下（实际 {size}）"

@@ -29,6 +29,16 @@
   （实测进度条一直停在 0px）。动画要用 WAAPI seek，见 `ChromeSession.render_frames`。
 - **Playwright 装浏览器在这台机器上超时**，别走它。
 
+## 页面与渲染器的约定
+
+- `window.prepare()`：可选的**异步**钩子，在「加载完 + 字体就绪 + 图片解码完」之后、
+  第一次截图之前被 `await`。**字号自适应（量真实字形再定字号）走这里。**
+  它必须真的被调用：曾经文档里写了约定、`_READY_SCRIPT` 里却没调，于是
+  「字号自适应」和「标签别出画」一次都没执行过 —— 页面照样渲得出来、看着也正常，
+  只是所有文字都停在 CSS 的最大字号上（长图注因此被 2 行硬截，而不是缩字号多放几个字）。
+  现在有一条**像素级**测试盯着：`prepare()` 把方块搬到右边，截图上就必须在右边。
+- `window.seek(seconds)`：可选的 JS 动画 seek 钩子（CSS/WAAPI 动画渲染器自己 seek）。
+
 ## 失败要能退回
 
 `backend_name()` 是唯一的口子：Chrome 不在（或 `RENDER_BACKEND=svg`）就返回 `svg`，
@@ -41,6 +51,7 @@ import base64
 import json
 import logging
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -212,7 +223,11 @@ class ChromeSession:
         ]
         logger.debug("启动无头 Chrome：%s", " ".join(args))
         process = subprocess.Popen(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            # 单独一个进程组：Chrome 会 fork 出渲染/GPU 子进程，关的时候要一起收掉
+            start_new_session=True,
         )
         try:
             port = _wait_for_port(profile_dir, process, timeout=timeout)
@@ -256,7 +271,25 @@ class ChromeSession:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-        shutil.rmtree(self.profile_dir, ignore_errors=True)
+        # 只 terminate 主进程是不够的：Chrome 的子进程还活着，会继续往 profile 里写东西，
+        # 于是 rmtree 半路失败 —— 而它是 `ignore_errors=True`，**静默**留下一个临时目录。
+        # 实测过：跑几次测试就攒下一堆 `paper-podcast-chrome-*`。
+        self._kill_process_group()
+        self._remove_profile()
+
+    def _kill_process_group(self) -> None:
+        try:
+            os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # 进程已经没了 / 权限不够，都不该让 close 抛异常
+
+    def _remove_profile(self) -> None:
+        for attempt in range(5):
+            shutil.rmtree(self.profile_dir, ignore_errors=True)
+            if not self.profile_dir.exists():
+                return
+            time.sleep(0.1 * (attempt + 1))
+        logger.warning("Chrome 的临时 profile 没删干净：%s", self.profile_dir)
 
     def __enter__(self) -> "ChromeSession":
         return self
@@ -441,6 +474,8 @@ _READY_SCRIPT = """
   }
   await Promise.all(Array.from(document.images).map(img => img.decode().catch(() => {})));
   if (document.fonts && document.fonts.ready) { await document.fonts.ready; }
+  // 页面约定的收尾钩子：字号自适应在这里做（必须等字体就绪，否则量出来的宽度是错的）
+  if (typeof window.prepare === 'function') { await window.prepare(); }
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   return true;
 })()

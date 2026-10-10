@@ -241,3 +241,48 @@ class TestSessionLifecycle:
         session.close()
         with pytest.raises(HtmlRenderError):
             session._evaluate("1")
+
+
+@requires_chrome
+class TestPrepareHook:
+    """页面约定的 `window.prepare()` **必须真的被调用**。
+
+    这个钩子曾经只是「文档里写了」：`_READY_SCRIPT` 里没调它，于是 HTML 层的
+    「字号自适应」和「标签别出画」一次都没执行过 —— 页面照样渲染得出来、看着也正常，
+    只是所有文字都停在 CSS 的最大字号上（长图注因此被 2 行硬截，而不是缩字号多放几个字）。
+
+    所以这里用**像素**验证，不查字符串、不查标志位：`prepare()` 把方块搬到右边，
+    截图上它就必须在右边。
+    """
+
+    _PAGE = """<!doctype html><meta charset="utf-8">
+<style>
+  html,body{margin:0;background:#fff}
+  #box{position:absolute;top:40px;left:20px;width:60px;height:60px;background:#2f6fb5}
+</style>
+<div id="box"></div>
+<script>
+  window.prepare = async () => {
+    // 模拟「量完真实字形之后改字号/改位置」这一步
+    document.getElementById('box').style.left = '600px';
+  };
+</script>
+"""
+
+    def test_prepare_runs_before_the_screenshot(self, session, tmp_path):
+        page = Page(html=self._PAGE, width=800, height=200)
+        out = session.render(page, tmp_path / "prepared.png", work_dir=tmp_path)
+        at, width, _ = _pixels(out)
+        assert at(630, 70)[2] > 150 and at(630, 70)[0] < 150, "方块没被 prepare() 搬到右边"
+        assert at(50, 70)[0] > 200, "方块还留在原位，说明 prepare() 没跑"
+
+    def test_page_without_prepare_still_renders(self, session, tmp_path):
+        """没写 `prepare()` 的页面（比如字幕带）不能因此渲染失败。"""
+        page = Page(
+            html="<!doctype html><meta charset='utf-8'>"
+            "<style>html,body{margin:0;background:#fff}</style><h1>ok</h1>",
+            width=200,
+            height=100,
+        )
+        out = session.render(page, tmp_path / "no-prepare.png", work_dir=tmp_path)
+        assert out.exists() and out.stat().st_size > 0
