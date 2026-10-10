@@ -40,7 +40,10 @@ from typing import TYPE_CHECKING, Any
 from .design import (
     BG_COLOR,
     BRAND_DARK,
+    BRAND_DARK_PANEL,
+    BRAND_GOLD,
     BRAND_GREEN,
+    BRAND_TEXT,
     CAPTION_COLOR,
     COVER_ACCENT_GAP,
     COVER_ACCENT_H,
@@ -63,6 +66,9 @@ from .design import (
     COVER_SUBTITLE_COLOR,
     COVER_SUBTITLE_FONT,
     COVER_TITLE_COLOR,
+    FOCUS_BORDER,
+    FOCUS_BORDER_W,
+    FOCUS_DIM_ALPHA,
     FONT_STACK,
     FRAME_STROKE,
     POINT_BAR,
@@ -128,10 +134,10 @@ def _data_uri(path: Any, *, max_side: int) -> str:
     return uri
 
 
-def _logo_uri() -> tuple[str, int, int] | None:
+def _logo_uri(width: int = WATERMARK_W) -> tuple[str, int, int] | None:
     from .video import _logo_data_uri
 
-    return _logo_data_uri(WATERMARK_W)
+    return _logo_data_uri(width)
 
 
 def _layout_vars(layout: Layout) -> str:
@@ -345,8 +351,24 @@ function fitText(el) {
     }
   }
 }
+// 把标了 `data-clamp` 的东西拉回容器范围内。
+// 浏览器量的是真实尺寸 —— 老路径那套「(字数+2)*字号*0.62 估宽度」估错就会出画。
+function clampBoxes() {
+  document.querySelectorAll('[data-clamp]').forEach(el => {
+    const host = el.offsetParent || el.parentElement;
+    const hr = host.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    let dx = 0, dy = 0;
+    if (r.left < hr.left + 8) { dx = hr.left + 8 - r.left; }
+    if (r.right + dx > hr.right - 8) { dx = hr.right - 8 - r.right; }
+    if (r.top < hr.top + 6) { dy = hr.top + 6 - r.top; }
+    if (r.bottom + dy > hr.bottom - 6) { dy = hr.bottom - 6 - r.bottom; }
+    if (dx || dy) { el.style.transform = `translate(${dx}px, ${dy}px)`; }
+  });
+}
 window.prepare = async function prepare() {
   document.querySelectorAll('[data-fit-max]').forEach(fitText);
+  clampBoxes();
 };
 """
 
@@ -572,6 +594,148 @@ def caption_band_page(text: str, layout: Layout) -> Page:
     return Page(html=_document(css, _layout_vars(layout), body), width=layout.width, height=band_h)
 
 
+def focus_overlay_page(scene: "Scene", layout: Layout, focus: dict[str, Any]) -> Page:
+    """图内聚光灯那一层（透明底）：图卡大小、与图片卡**同一坐标系**。
+
+    做法上最能说明「HTML 换掉了什么」：老路径要用**四条压暗边**把中间那块「洞」围出来
+    （左上右下各算一次坐标，还得减去边框那圈 pad），框上的药丸标签还要
+    `(len(label) + 2) * size * 0.62` 这样估宽度。
+    这里压暗是一次 `box-shadow` 的扩散、标签宽度由浏览器量 —— 代码短一半，也不会算错。
+
+    聚光灯只框**论文原图**（信息图/段落图是矢量示意图，另有「逐元素长出来」那条路），
+    所以这里的定位逻辑跟图片卡里的图片摆放一致：等比居中。
+    """
+    from .video import _prepare_image
+
+    _, img_w, img_h = _prepare_image(
+        scene.image, layout.image_box_w, layout.image_box_h
+    )
+    img_x = (layout.image_box_w - img_w) / 2
+    img_y = (layout.image_box_h - img_h) / 2
+    fx = img_x + float(focus["x"]) * img_w
+    fy = img_y + float(focus["y"]) * img_h
+    fw = float(focus["w"]) * img_w
+    fh = float(focus["h"]) * img_h
+    # 洞要比框本身大一圈：框线是**压着边界**画的，不大一圈的话框线自己会被压暗
+    pad = 5
+
+    label = str(focus.get("label") or "").strip()
+    chip = (
+        f'<div class="focus-chip" data-clamp>{html_lib.escape(label)}</div>' if label else ""
+    )
+    body = (
+        f'<div class="focus-frame" style="left:{fx:.1f}px; top:{fy:.1f}px; '
+        f'width:{fw:.1f}px; height:{fh:.1f}px; --pad:{pad}px">'
+        '<div class="focus-border"></div>'
+        f"{chip}"
+        "</div>"
+    )
+    return Page(
+        html=_document(
+            BASE_CSS + LAYER_CSS + FOCUS_CSS, _layout_vars(layout), body
+        ),
+        width=layout.image_box_w,
+        height=layout.image_box_h,
+        transparent=True,
+    )
+
+
+FOCUS_CSS = """
+.focus-frame { position: absolute; }
+/* 压暗：一次 box-shadow 的扩散就够（比四条边少一半坐标计算），
+   扩散到画布外由容器的 overflow:hidden 收掉。 */
+.focus-frame::before {
+  content: ''; position: absolute; inset: calc(var(--pad) * -1);
+  border-radius: 8px; box-shadow: 0 0 0 9999px rgba(255,255,255,%.2f);
+}
+.focus-border {
+  position: absolute; inset: 0; border: %dpx solid %s; border-radius: 6px;
+}
+.focus-chip {
+  position: absolute; left: 0; bottom: calc(100%% + 6px);
+  background: %s; color: #ffffff; border-radius: 8px;
+  font-size: 26px; font-weight: 500; line-height: 1.9; padding: 0 13px;
+  white-space: nowrap;
+}
+""" % (FOCUS_DIM_ALPHA, FOCUS_BORDER_W, FOCUS_BORDER, FOCUS_BORDER)
+
+
+def endcard_page(scene: "Scene", layout: Layout) -> Page:
+    """片尾品牌卡：深色底 + 社区 logo + 关注引导。
+
+    **为什么片尾是深色**：logo 是浅色字标，白底上会直接消失；而正文必须是白底
+    （论文配图本身就是白底图表）。所以两种底各归其位 —— 正文白底保证可读，
+    片尾深色保证品牌正确，顺带让「节目结束」有个明确的视觉信号。
+
+    引导语画面和语音都要有（听众往往是听到结尾才决定要不要关注），
+    所以这里的大字和 `branding.BRAND_OUTRO` 说的是同一件事。
+    """
+    from ..branding import BRAND_CTA_SUBTITLE, BRAND_CTA_TITLE
+
+    logo = _logo_uri(460)
+    # ⚠️ 记得取 [0]：`_logo_uri` 返回的是 (uri, 宽, 高)，整个塞进 src 会渲染成
+    # `src="('data:image/png;base64,...', 460, 123)"` —— 浏览器当作坏图，
+    # naturalWidth=0、高度 0，画面上就是「片尾卡上少了个 logo」而**不报任何错**。
+    logo_markup = (
+        f'<img class="endcard-logo" src="{logo[0]}" alt="">'
+        if logo
+        else '<div class="endcard-wordmark">青稞社区</div>'
+    )
+    text = " ".join((scene.text or "").split())
+    subtitle = (
+        f'<div class="subtitle-text endcard-text" '
+        f'{_fit_attrs(max_font=SUBTITLE_MAX_FONT, min_font=SUBTITLE_MIN_FONT, lines=4, height=True)}>'
+        f"{html_lib.escape(text)}</div>"
+        if text
+        else ""
+    )
+    body = (
+        '<div class="endcard-stack">'
+        f"{logo_markup}"
+        '<div class="endcard-divider"></div>'
+        f'<div class="endcard-cta">{html_lib.escape(BRAND_CTA_TITLE)}</div>'
+        f'<div class="endcard-sub">{html_lib.escape(BRAND_CTA_SUBTITLE)}</div>'
+        "</div>"
+        '<div class="subtitle-band endcard-band"></div>'
+        f"{subtitle}"
+    )
+    return Page(
+        html=_document(BASE_CSS + ENDCARD_CSS, _layout_vars(layout), body),
+        width=layout.width,
+        height=layout.height,
+    )
+
+
+ENDCARD_CSS = """
+html, body { background: %(dark)s; }
+/* 品牌区（字幕带以上那一整块）里竖直居中：老路径是写死的 y=392 往下排，
+   居中之后长一点的屏幕比例也不会把内容顶到边上。 */
+.endcard-stack {
+  position: absolute; left: 0; top: 0; width: var(--page-w);
+  height: var(--subtitle-top);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.endcard-logo { width: 460px; height: auto; display: block; }
+.endcard-wordmark { font-size: 56px; font-weight: 600; color: %(text)s; }
+.endcard-divider {
+  width: 220px; height: 2px; background: %(green)s; opacity: 0.85;
+  margin: 60px 0 0;
+}
+.endcard-cta { font-size: 44px; font-weight: 600; color: %(gold)s; margin-top: 56px; }
+.endcard-sub { font-size: 24px; color: %(green)s; margin-top: 22px; }
+/* 字幕区：深色面板 + 浅色字（和其他页的浅底深字相反） */
+.endcard-band { background: %(panel)s; border-top: 2px solid %(green)s; }
+.endcard-text { color: %(text)s; }
+""" % {
+    "dark": BRAND_DARK,
+    "panel": BRAND_DARK_PANEL,
+    "green": BRAND_GREEN,
+    "gold": BRAND_GOLD,
+    "text": BRAND_TEXT,
+    # 深色卡上的字幕带分隔线用品牌绿，透明度 0.5（和上面那条分隔线一样）
+}
+
+
 def _document(css: str, variables: str, body: str) -> str:
     return f"""<!doctype html>
 <html lang="zh-Hans"><head><meta charset="utf-8">
@@ -609,7 +773,11 @@ __all__ = [
     "SUBTITLE_BAND_MAX_FONT",
     "SUBTITLE_MAX_FONT",
     "SUBTITLE_MIN_FONT",
+    "ENDCARD_CSS",
+    "FOCUS_CSS",
     "caption_band_page",
+    "endcard_page",
+    "focus_overlay_page",
     "image_card_page",
     "point_row_page",
     "scene_page",

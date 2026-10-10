@@ -349,3 +349,105 @@ class TestHtmlPipeline:
         result = self._compose(tmp_path, monkeypatch, "html")
         assert result.renderer == "svg"
         assert (tmp_path / "out.mp4").exists()
+
+
+# ---------------------------------------------------------------------------
+# 片尾品牌卡 与 图内聚光灯
+# ---------------------------------------------------------------------------
+
+
+class TestEndcardMarkup:
+    """片尾卡是**品牌卡**：logo 是浅色字标，底必须深；引导语画面和语音都有。"""
+
+    def test_logo_src_is_a_real_data_uri(self, tmp_path):
+        """logo 的 src 必须是**一个** data URI 字符串。
+
+        踩过：`_logo_uri()` 返回的是 `(uri, 宽, 高)` 三元组，整个塞进 f-string 会生成
+        `src="('data:image/png;base64,...', 460, 123)"` —— 浏览器当成坏图，
+        `naturalWidth=0`、高度 0，画面上就是「片尾卡上少了个 logo」，
+        而且**不报任何错**（`alt=""` 连占位都没有）。
+        """
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import endcard_page
+
+        html = endcard_page(_scene(tmp_path), PORTRAIT).html
+        start = html.index('class="endcard-logo" src="') + len('class="endcard-logo" src="')
+        src = html[start : html.index('"', start)]
+        assert src.startswith("data:image/png;base64,"), f"logo 的 src 不是 data URI：{src[:60]}"
+        assert "(" not in src and " " not in src and "," in src
+
+    def test_background_is_brand_dark_not_white(self, tmp_path):
+        """正文白底、片尾深底 —— 反过来的话浅色 logo 直接消失。"""
+        from app.services.design import BRAND_DARK, PORTRAIT
+        from app.services.htmlpage import endcard_page
+
+        html = endcard_page(_scene(tmp_path), PORTRAIT).html
+        assert f"background: {BRAND_DARK}" in html
+
+
+@requires_chrome
+class TestEndcardAndFocusRendering:
+    def test_endcard_logo_is_actually_drawn(self, session, tmp_path):
+        """端到端确认 logo **真的解码出来了**：naturalWidth 必须是 460。"""
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import endcard_page
+
+        session.open_page(endcard_page(_scene(tmp_path), PORTRAIT), work_dir=tmp_path)
+        raw = session._evaluate(
+            "(() => { const i = document.querySelector('.endcard-logo');"
+            " return i ? i.naturalWidth : -1; })()"
+        )
+        assert raw == 460, f"logo 没解码出来（naturalWidth={raw}）"
+
+    def test_endcard_and_focus_layers_match_the_svg_sizes(self, session, tmp_path):
+        """两条路径的画幅必须一致（ffmpeg 叠加用的是固定坐标）。"""
+        import pymupdf
+
+        from app.services.design import PORTRAIT
+        from app.services.video import _render_endcard_layer, _render_focus_layer
+
+        scene = _scene(tmp_path, image=make_png(tmp_path / "f.png", 700, 500))
+        focus = {"x": 0.05, "y": 0.15, "w": 0.3, "h": 0.4, "label": "Recurrent state"}
+        cases = [
+            ("endcard", lambda p, s: _render_endcard_layer(scene, p, layout=PORTRAIT, session=s)),
+            ("focus", lambda p, s: _render_focus_layer(
+                scene, p, focus=focus, layout=PORTRAIT, session=s)),
+        ]
+        for name, render in cases:
+            svg_path = render(tmp_path / f"{name}-svg.png", None)
+            html_path = render(tmp_path / f"{name}-html.png", session)
+            sizes = []
+            for path in (svg_path, html_path):
+                with pymupdf.open(str(path)) as doc:
+                    page = doc.load_page(0)
+                    sizes.append((int(page.rect.width), int(page.rect.height)))
+            assert sizes[0] == sizes[1], f"{name} 两条路径尺寸不一致：{sizes}"
+
+    def test_focus_dims_everything_but_the_highlighted_box(self, session, tmp_path):
+        """聚光灯的判据：框内**没有**被压暗、框外**被**压暗。
+
+        只看「有没有白像素」是查不出来的（白底本来就白）—— 得比 alpha：
+        压暗层是半透明白（alpha≈0.72*255），框内那块是透明。
+        """
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import focus_overlay_page
+
+        import pymupdf
+
+        scene = _scene(tmp_path, image=make_png(tmp_path / "f2.png", 700, 500))
+        page = focus_overlay_page(scene, PORTRAIT, {"x": 0.3, "y": 0.3, "w": 0.3, "h": 0.3})
+        out = session.render(page, tmp_path / "focus.png", work_dir=tmp_path)
+
+        pix = pymupdf.Pixmap(str(out))
+        n, width, height = pix.n, pix.width, pix.height
+        data = pix.samples
+        assert n == 4, "聚光灯层必须有 alpha 通道"
+
+        def alpha(x, y):
+            return data[(y * width + x) * n + 3]
+
+        # 框中心（0.3+0.15 → 卡中间偏左）应当透明，四角应当被压暗
+        inside = alpha(int(width * 0.45), int(height * 0.45))
+        corner = alpha(6, 6)
+        assert inside < 60, f"框内不该被压暗（alpha={inside}）"
+        assert corner > 120, f"框外应当被压暗（alpha={corner}）"

@@ -2836,6 +2836,28 @@ def _render_point_layer(point: str, path: Path, *, layout: Layout, session: Any)
     return path
 
 
+def _render_focus_layer(
+    scene: Scene, path: Path, *, focus: dict[str, Any], layout: Layout, session: Any
+) -> Path:
+    """聚光灯层：图卡画幅、与图片卡同一坐标系，叠在图片卡之上、强调行/字幕之下。"""
+    if session is None:
+        return render_focus_overlay(scene, path, focus=focus, layout=layout)
+    from .htmlpage import focus_overlay_page
+
+    session.render(focus_overlay_page(scene, layout, focus), path, work_dir=path.parent)
+    return path
+
+
+def _render_endcard_layer(scene: Scene, path: Path, *, layout: Layout, session: Any) -> Path:
+    """片尾品牌卡：深色底 + logo + 关注引导（整页一张，没有「图片层」）。"""
+    if session is None:
+        return render_endcard(scene, path, layout=layout)
+    from .htmlpage import endcard_page
+
+    session.render(endcard_page(scene, layout), path, work_dir=path.parent)
+    return path
+
+
 @dataclass
 class RenderedLayers:
     """一次出片渲染出来的所有图层文件（编码阶段要用）。
@@ -2887,7 +2909,7 @@ def _render_scene_layers(
                 # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
                 # 品牌卡上的字是大号引导语，不参与「字幕逐句出现」——那会把它切碎。
                 # 它整页都是牌子，没有「图片层」，转场用 to_card（上一整页淡出）代替。
-                render_endcard(scene, slide_path, layout=layout)
+                _render_endcard_layer(scene, slide_path, layout=layout, session=session)
                 result.endcard_count += 1
             else:
                 # 正文：**骨架 + 图片卡** 两层。骨架（图注/强调行/字幕带）全程不动，
@@ -2929,7 +2951,13 @@ def _render_scene_layers(
                 and scene.kind in ("figure", "table", "cover")
             ):
                 focus_path = work_dir / f"focus-{index:04d}.png"
-                render_focus_overlay(scene, focus_path, focus=scene.focus, layout=layout)
+                _render_focus_layer(
+                    scene,
+                    focus_path,
+                    focus=scene.focus,
+                    layout=layout,
+                    session=session,
+                )
                 result.focus_rows.append(focus_path)
                 result.focus_paths.append(focus_path)
             else:
