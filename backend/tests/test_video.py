@@ -68,8 +68,10 @@ from app.services.video import (
     build_points_messages,
     FigurePanels,
     HOOK_MAX_CHARS,
+    COVER_GLASS_VEIL,
     COVER_HEADLINE_MAX_FONT,
     COVER_HEADLINE_MIN_FONT,
+    cover_title_layout,
     build_scenes,
     cover_headline_layout,
     image_card_markup,
@@ -2726,17 +2728,28 @@ class TestCoverIsDrawnInTheCardLayer:
         defaults.update(kwargs)
         return Scene(**defaults)
 
-    def test_headline_and_image_are_in_the_same_markup(self, tmp_path):
-        import pymupdf
+    def test_cover_is_a_frosted_page_with_the_title_on_top(self, tmp_path):
+        """封面 = 论文首页整幅铺满 + 模糊 + 白纱 + 玻璃面板里的标题。
 
+        为什么模糊：不模糊的话，论文首页自己那行大标题会跟我们的爆款标题抢注意力
+        （两行大字叠在一起，谁也读不清）。
+        """
         image = make_png(tmp_path / "cover.png", 400, 520)
-        markup = image_card_markup(self._scene(image=image, headline="并发到 70，模型就装不下了"), PORTRAIT)
-        assert "并发到 70，模型就装不下了" in markup
-        assert "<image" in markup
-        # 标题的 y 必须小于图片的 y（标题在上、图在下）
-        headline_y = float(re.search(r'<text x="20" y="([\d.]+)"', markup).group(1))
-        image_y = float(re.search(r'<image x="[\d.]+" y="([\d.]+)"', markup).group(1))
-        assert headline_y < image_y, markup[:400]
+        markup = image_card_markup(
+            self._scene(image=image, headline="并发到 70，模型就装不下了", caption="STEPQuant: Quantization"),
+            PORTRAIT,
+        )
+        assert "并发到 70，模型就装不下了" in markup, "标题要压在封面上"
+        assert "STEPQuant: Quantization" in markup, "面板里还要有论文原题"
+        # 底图裁满 + 高斯模糊 + 白纱
+        assert 'slice"' in markup, "首页要裁满整张卡（留白边就露馅了）"
+        assert "xMidYMin" in markup, "对齐到论文首页的**顶部**（标题/摘要那一带），不是正文中间"
+        assert "feGaussianBlur" in markup, "首页要模糊（毛玻璃底）"
+        assert f'opacity="{COVER_GLASS_VEIL}"' in markup
+        # 裁到圆角卡里，否则模糊层会露出直角
+        assert "clipPath" in markup and "coverclip" in markup
+        # 标题是居中的
+        assert 'text-anchor="middle"' in markup
 
     def test_without_a_headline_the_image_is_centered_in_the_card(self, tmp_path):
         image = make_png(tmp_path / "cover.png", 400, 520)
@@ -2873,3 +2886,87 @@ class TestFirstFrameIsTheCover:
             headline="有标题但没有封面图",
         )
         assert scenes[0].headline == "", "没有封面图就别硬贴标题"
+
+
+class TestFrostedGlassIsActuallyBlurred:
+    """毛玻璃不是「写了个 filter」就算：要真的把纸上的字糊掉、但又不糊成一块纯色。
+
+    为什么两头都要管：
+    - 不模糊 → 论文首页自己那行大标题跟我们的爆款标题叠在一起，谁也读不清；
+    - 糊成纯色 → 封面就变成一张浅灰卡，看不出「这是隔着玻璃看的论文」。
+    实测调参时这两个方向都踩过（blur=22 时玻璃面的明暗跨度只剩 15，等于纯色）。
+    """
+
+    def _glass_stats(self, path) -> tuple[float, int, int]:
+        """量图片区里**面板之外**那两带：`(平均亮度, p5~p95 跨度, 相邻像素梯度)`。
+
+        取样位置固定（竖版画幅的图片区，面板在 y 322~567 之外），
+        所以「模糊的封面」和「清晰的对照」可以在同一块区域上直接比。
+        """
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(path))
+        width, n, samples = pix.width, pix.n, pix.samples
+
+        def level(x: int, y: int) -> float:
+            i = (y * width + x) * n
+            return (samples[i] + samples[i + 1] + samples[i + 2]) / 3
+
+        rows = list(range(96, 300, 3)) + list(range(590, 800, 3))
+        vals = sorted(level(x, y) for y in rows for x in range(26, 908, 3))
+        grad = sum(
+            abs(level(x, y) - level(x + 3, y)) for y in rows for x in range(26, 905, 3)
+        ) / (len(rows) * len(range(26, 905, 3)))
+        span = int(vals[int(len(vals) * 0.95)] - vals[int(len(vals) * 0.05)])
+        return sum(vals) / len(vals), span, grad
+
+    def _title_dark(self, path) -> int:
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(path))
+        width, n, samples = pix.width, pix.n, pix.samples
+        return sum(
+            1
+            for y in range(360, 540, 2)
+            for x in range(80, 860, 2)
+            if (samples[(y * width + x) * n] + samples[(y * width + x) * n + 1] + samples[(y * width + x) * n + 2]) / 3
+            < 120
+        )
+
+    def test_cover_glass_is_blurred_but_still_has_texture(self, tmp_path):
+        # 一张有内容的「论文首页」：黑字白纸的条纹，模糊后会变成灰调
+        import pymupdf
+
+        page = tmp_path / "page.png"
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 400, 520), False)
+        pix.set_rect(pix.irect, (255, 255, 255))
+        # **竖条**而不是横条：判据量的是「同一行上相邻像素的差」，
+        # 横条只有上下两条边，横向取样根本量不到（第一版就写成横条，对照组梯度 0.4）
+        # 条要够粗：真实论文首页上「整行标题、图、表格」这类大块内容模糊后还留得下灰度，
+        # 而 4px 的细字模糊后会被平均成纯色（第一版用细条，量到的明暗跨度是 0）
+        for index in range(10):
+            x = 60 + index * 32
+            pix.set_rect(pymupdf.IRect(x, 40, x + 18, 480), (20, 20, 20))
+        pix.save(str(page))
+
+        frosted = render_slide(
+            Scene(start=0, end=5, image=page, kind="cover", text="",
+                  caption="A Paper Title", headline="并发到 70，模型就装不下了"),
+            tmp_path / "frosted.png",
+            include_subtitle=False, include_point=False,
+        )
+        plain = render_slide(
+            Scene(start=0, end=5, image=page, kind="figure", text="", caption=""),
+            tmp_path / "plain.png",
+            include_subtitle=False, include_point=False,
+        )
+
+        mean, span, _ = self._glass_stats(frosted)
+        _, plain_span, _ = self._glass_stats(plain)
+        # 用**明暗跨度**而不是「相邻像素梯度」来判断糊没糊：粗条模糊之后边缘仍然是渐变，
+        # 梯度掉得不多（实测 5.9 → 5.0），而对比度幅度掉得很明显（235 → 88）。
+        assert plain_span > 150, f"对照组应该是清晰的黑白条纹，实际跨度 {plain_span}"
+        assert span < plain_span * 0.6, f"封面没糊住：跨度 {span} vs 清晰时 {plain_span}"
+        assert span > 5, f"玻璃面糊成纯色了（跨度 {span}）—— 看不出是隔着玻璃看论文"
+        assert mean > 160, f"玻璃面太暗（{mean:.0f}），上面的深色字会读不清"
+        assert self._title_dark(frosted) > 200, "标题没画上去"

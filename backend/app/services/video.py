@@ -213,7 +213,7 @@ TITLE_COLOR = "#1a2233"
 # ---- 封面帧（片头那一帧）的排版 ----
 # 为什么单独做一套：正文页的图片区是「一页纸占满」，而封面要有**大字标题**。
 # 封面的大字标题 + 论文首页的图都画在图片卡那一层里（见 render_image_card）。
-COVER_PAD = 20                  # 卡内左右/上下的留白（卡本身贴在 x=20，所以画面上是 40，与字幕对齐）
+COVER_PAD = 20                  # 卡内留白（卡本身贴在 x=20，所以画面上是 40，与字幕对齐）
 COVER_HEADLINE_MAX_FONT = 54    # 竖版最大字号；横版自动降（见 cover_headline_layout）
 COVER_HEADLINE_MIN_FONT = 30    # 再小就截断，别缩成小字报
 COVER_HEADLINE_LEADING = 1.22   # 行距倍数
@@ -222,6 +222,41 @@ COVER_ACCENT_W = 76             # 标题下面那根品牌绿短杠
 COVER_ACCENT_H = 7
 COVER_ACCENT_GAP = 14
 COVER_TITLE_COLOR = "#121a2b"
+
+# ---- 封面的「毛玻璃」：论文首页整幅铺满 + 模糊 + 白色薄纱，标题压在它上面 ----
+#
+# 为什么要模糊：论文首页直接当封面背景时，它自己那行大标题、作者、摘要会跟我们的
+# 爆款标题抢注意力（两行大字叠在一起，谁也读不清）。模糊 + 薄纱把它变成一层
+# 「看得出来是论文、但读不出字」的底，标题就成了画面上唯一的字。
+# 高斯模糊半径（卡片像素，竖版；横版按比例缩）。**这个数就是「毛玻璃的浓度」**：
+# 实测论文首页上的正文小字约 9px 高，半径 ≥11 时整块底会被糊成均匀的浅灰（明暗跨度 14），
+# 那就看不出「这是一篇论文」了；半径 6 时字读不出来、但还留得住灰度结构（跨度 ~25）。
+COVER_GLASS_BLUR = 6.0
+COVER_GLASS_VEIL = 0.30         # 压在上面的薄纱透明度：太低会看到纸上的字，太高就变纯白板
+# 薄纱的**颜色**。用纯白的话整块封面会白得发灰、跟白底画布糊在一起，看不出「玻璃」；
+# 一点冷调（浅蓝灰）能让「玻璃面」和「面板」分层，也更像一块真的毛玻璃。
+COVER_GLASS_TINT = "#cfdcec"
+# 放大倍率：论文首页整页铺进来时，正文区是 9px 的小字，模糊之后几乎全化在白纸里
+# （实测明暗跨度只有 15~18，等于一块纯色卡）。放大之后字变大、模糊留下可见的灰块，
+# 整块底才像「隔着毛玻璃看一张论文」，而不是「一张浅灰色的卡」。
+COVER_GLASS_ZOOM = 1.0
+# 放大围绕哪个纵向位置（0~1）：0.5 = 卡片正中。用 0.42 是想让放大后的视野落在
+# 论文首页的标题/摘要那一带（那儿墨最多、模糊后纹理最明显）。
+COVER_GLASS_ZOOM_CY = 0.42
+# 裁满时对齐论文首页的哪一段：`Min` = 顶部（论文自己的标题/作者/摘要那一带）。
+# 用 `Mid` 会看到正文中间那片密集小字，模糊之后几乎均匀；顶部那块字大、留白也多，
+# 隔着毛玻璃还能看出「这是一篇论文的开头」。
+COVER_GLASS_ANCHOR = "Min"
+# 竖版卡片里「论文首页」的显示倍率（896/935 ≈ 0.958），模糊半径以它为 1.0 的基准
+COVER_GLASS_BLUR_REF_SCALE = 0.958
+COVER_PANEL_MAX_W = 820         # 玻璃面板最大宽度（竖版卡片 896 宽）
+COVER_PANEL_PAD = 44            # 面板内边距
+COVER_PANEL_FILL = 0.82         # 面板本身的那层白（叠在白纱上，比纱更实一点）
+COVER_PANEL_RADIUS = 20
+COVER_SUBTITLE_FONT = 20        # 面板里的论文原题
+COVER_SUBTITLE_COLOR = "#4a5568"
+COVER_HEADLINE_MAX_LINES = 2    # 封面上标题最多两行
+COVER_SUBTITLE_MAX_LINES = 2    # 论文原题最多两行
 CAPTION_COLOR = "#6b7a8f"
 FRAME_STROKE = "#d8dfe8"
 SUBTITLE_BG = "#f4f7fa"
@@ -1281,6 +1316,37 @@ def _prepare_image(path: Path, max_w: int, max_h: int) -> tuple[str, int, int]:
     )
 
 
+def _image_data_uri(path: Path, *, max_side: int = 1400) -> tuple[str, int, int]:
+    """把图缩到 `max_side` 以内再 base64 内嵌，返回 data URI。
+
+    封面要用 `preserveAspectRatio="slice"` 裁满整张卡（比例不受控），
+    所以不能走 `_prepare_image`（那个按 contain 算尺寸）。模糊之后细节本来就没了，
+    缩到 1400 以内既够用又不让 SVG 膨胀。
+
+    返回 `(data URI, 原始宽, 原始高)` —— 宽高要给调用方算**它在卡片里被放大/缩小了多少**，
+    模糊半径得按那个倍率走（见 `image_card_markup`）。
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover
+        raise VideoError("缺少 pymupdf，无法处理配图") from exc
+    try:
+        pix = pymupdf.Pixmap(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise VideoError(f"配图无法读取：{path.name}（{exc}）") from exc
+    scale = min(max_side / max(pix.width, pix.height), 1.0)
+    if scale < 1.0:
+        try:
+            pix = pymupdf.Pixmap(pix, max(int(pix.width * scale), 1), max(int(pix.height * scale), 1))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("封面底图缩放失败，使用原尺寸：%s", exc)
+    return (
+        "data:image/png;base64," + base64.b64encode(pix.tobytes("png")).decode("ascii"),
+        pix.width,
+        pix.height,
+    )
+
+
 def _wrap(text: str, max_units: float) -> list[str]:
     """按全角单位宽度折行（西文按 0.55 计）。"""
     from .illustration import _char_width, _tokenize
@@ -1410,29 +1476,58 @@ def render_chrome(
     )
 
 
-def cover_headline_layout(
-    headline: str, layout: Layout, *, max_lines: int = 2
-) -> tuple[float, list[str], float]:
-    """封面大字标题怎么排：返回 `(字号, 行, 文字块高度)`。
+def cover_panel_width(layout: Layout) -> float:
+    """玻璃面板的宽度：卡片宽减去两侧留白，再压到上限（横版卡片很宽，不能一整条铺满）。"""
+    return min(layout.image_box_w - COVER_PAD * 2, COVER_PANEL_MAX_W)
 
-    字号从 `COVER_HEADLINE_MAX_FONT` 往下试，直到能塞进 `max_lines` 行 ——
+
+def cover_title_layout(
+    headline: str, caption: str, layout: Layout
+) -> tuple[float, list[str], list[str], float, float]:
+    """封面文字怎么排：返回 `(标题字号, 标题行, 原题行, 标题块高, 面板高)`。
+
+    字号从 `COVER_HEADLINE_MAX_FONT` 往下试，直到标题能塞进两行 ——
     「爆款标题」是我们让模型写的，长一两个字很正常，缩字号比截断句子体面。
     再小到 `COVER_HEADLINE_MIN_FONT` 还放不下就截断（加省略号）。
     """
     text = " ".join((headline or "").split())
-    width = layout.image_box_w - COVER_PAD * 2
+    inner = cover_panel_width(layout) - COVER_PANEL_PAD * 2
     if not text:
-        return 0.0, [], 0.0
-    # `_wrap` 的单位宽度就是字号（一个全角字 ≈ 1 个字号宽），所以像素宽 ÷ 字号 = 单位数
-    for size in range(COVER_HEADLINE_MAX_FONT, COVER_HEADLINE_MIN_FONT - 1, -2):
-        lines = _wrap(text, width / size)[: max_lines + 1]
-        if len(lines) <= max_lines:
-            return float(size), lines, len(lines) * size * COVER_HEADLINE_LEADING
+        return 0.0, [], [], 0.0, 0.0
+
     size = float(COVER_HEADLINE_MIN_FONT)
-    lines = _wrap(text, width / size)[:max_lines]
-    if lines:
-        lines[-1] = lines[-1].rstrip("，。、,.;") + "…"
-    return size, lines, len(lines) * size * COVER_HEADLINE_LEADING
+    lines: list[str] = []
+    for candidate in range(COVER_HEADLINE_MAX_FONT, COVER_HEADLINE_MIN_FONT - 1, -2):
+        # `_wrap` 的单位宽度就是字号（一个全角字 ≈ 1 个字号宽），所以像素宽 ÷ 字号 = 单位数
+        wrapped = _wrap(text, inner / candidate)[:COVER_HEADLINE_MAX_LINES + 1]
+        if len(wrapped) <= COVER_HEADLINE_MAX_LINES:
+            size, lines = float(candidate), wrapped
+            break
+    else:
+        size = float(COVER_HEADLINE_MIN_FONT)
+        lines = _wrap(text, inner / size)[:COVER_HEADLINE_MAX_LINES]
+        if lines:
+            lines[-1] = lines[-1].rstrip("，。、,.;") + "…"
+
+    block_h = len(lines) * size * COVER_HEADLINE_LEADING
+    sub_lines = _wrap(caption, inner / COVER_SUBTITLE_FONT)[:COVER_SUBTITLE_MAX_LINES]
+    sub_h = len(sub_lines) * COVER_SUBTITLE_FONT * 1.4
+    panel_h = (
+        COVER_PANEL_PAD * 2
+        + block_h
+        + COVER_ACCENT_GAP
+        + COVER_ACCENT_H
+        + (COVER_ACCENT_GAP + sub_h if sub_lines else 0)
+    )
+    return size, lines, sub_lines, block_h, panel_h
+
+
+def cover_headline_layout(
+    headline: str, layout: Layout, *, max_lines: int = COVER_HEADLINE_MAX_LINES
+) -> tuple[float, list[str], float]:
+    """只要标题那部分（`(字号, 行, 文字块高)`）—— 给测试和别处单独用。"""
+    size, lines, _, block_h, _ = cover_title_layout(headline, "", layout)
+    return size, lines[:max_lines], block_h
 
 
 def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
@@ -1443,43 +1538,83 @@ def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
     「一页到底」的合成路径（`render_slide` 把它整段贴进骨架里）。
     两处如果各画一份，封面的大字标题就只会在其中一条路径上出现，
     而这种不一致平时看不出来（谁也不会同时跑两条路径对比）。
+
+    ## 两种卡
+    - **普通页**：图片 + 贴着它的那圈浅灰细边框（白底上用来界定图片边界）；
+    - **封面页**（`scene.headline` 非空）：论文首页整幅铺满 → 高斯模糊 → 白纱 →
+      一块玻璃面板，面板里是爆款标题（大字）+ 品牌绿短杠 + 论文原题（小字）。
+      模糊的半径按卡片尺寸缩放（横版卡片更大，同一个 stdDeviation 看起来会更清楚）。
     """
-    size, lines, block_h = cover_headline_layout(scene.headline, layout)
-    pad = COVER_PAD
-    if lines:
-        # 标题占多高，图就从哪儿开始（下面留 pad 的空隙）
-        img_top_in_card = pad + block_h + COVER_ACCENT_GAP + COVER_ACCENT_H + pad
-        img_box_h = max(int(layout.image_box_h - img_top_in_card), 40)
-    else:
-        img_top_in_card = 0
-        img_box_h = layout.image_box_h
+    card_w, card_h = layout.image_box_w, layout.image_box_h
+    clip_id = "coverclip"
 
-    data_uri, img_w, img_h = _prepare_image(scene.image, layout.image_box_w, img_box_h)
-    img_x = (layout.image_box_w - img_w) / 2
-    img_y = img_top_in_card + (img_box_h - img_h) / 2
-
-    parts: list[str] = []
-    if lines:
-        y = pad + size * COVER_HEADLINE_BASELINE
-        for line in lines:
-            parts.append(
-                f'<text x="{pad}" y="{y:.1f}" font-family="{FONT_STACK}" font-size="{size:.0f}" '
-                f'font-weight="700" fill="{COVER_TITLE_COLOR}">{html.escape(line)}</text>'
-            )
-            y += size * COVER_HEADLINE_LEADING
-        # 品牌绿短杠：给标题一个收尾，也让封面跟社区配色挂上钩
-        bar_y = pad + block_h + COVER_ACCENT_GAP
-        parts.append(
-            f'<rect x="{pad}" y="{bar_y:.1f}" width="{COVER_ACCENT_W}" height="{COVER_ACCENT_H}" '
-            f'rx="{COVER_ACCENT_H / 2:.1f}" fill="{BRAND_GREEN}"/>'
+    size, lines, sub_lines, block_h, panel_h = cover_title_layout(
+        scene.headline, scene.caption, layout
+    )
+    if not lines:
+        data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
+        img_x = (card_w - img_w) / 2
+        img_y = (card_h - img_h) / 2
+        return "\n".join(
+            [
+                f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
+                f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>',
+                f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" href="{data_uri}"/>',
+            ]
         )
+
+    # 底图用**裁满**（slice）而不是等比放下：模糊层要铺满整张卡，留白边就露馅了
+    data_uri, page_w, page_h = _image_data_uri(scene.image)
+    # 模糊半径要跟着**首页在卡片里被放大了多少**走：竖版是把整页缩到 ~0.96 倍，
+    # 横版卡片又宽又矮，裁满时首页被放大到近 2 倍 —— 同一个半径在横版上会明显更「清楚」。
+    # 实测（同一篇论文）：竖版半径 6 的纹理跨度和横版半径 4.5 对不上，按倍率走才一致。
+    page_scale = max(card_w / page_w, card_h / page_h)
+    blur = COVER_GLASS_BLUR * (page_scale / COVER_GLASS_BLUR_REF_SCALE)
+    panel_w = cover_panel_width(layout)
+    panel_x = (card_w - panel_w) / 2
+    panel_y = max((card_h - panel_h) / 2, COVER_PAD)
+
+    parts: list[str] = [
+        "<defs>",
+        f'<clipPath id="{clip_id}"><rect width="{card_w}" height="{card_h}" rx="8"/></clipPath>',
+        f'<filter id="coverblur" x="-5%" y="-5%" width="110%" height="110%">'
+        f'<feGaussianBlur stdDeviation="{blur:.1f}"/></filter>',
+        "</defs>",
+        f'<g clip-path="url(#{clip_id})">',
+        f'<image x="0" y="0" width="{card_w}" height="{card_h}" preserveAspectRatio="xMidY{COVER_GLASS_ANCHOR} slice" '
+        f'transform="translate({card_w / 2:.1f},{card_h * COVER_GLASS_ZOOM_CY:.1f}) '
+        f'scale({COVER_GLASS_ZOOM}) translate({-card_w / 2:.1f},{-card_h * COVER_GLASS_ZOOM_CY:.1f})" '
+        f'filter="url(#coverblur)" href="{data_uri}"/>',
+        # 白纱：把「纸上的字」压成纹理（读不出字，但看得出是论文）
+        f'<rect width="{card_w}" height="{card_h}" fill="{COVER_GLASS_TINT}" opacity="{COVER_GLASS_VEIL}"/>',
+        # 玻璃面板：比纱再实一点的一层 + 一道亮边，这就是「毛玻璃」的观感
+        f'<rect x="{panel_x:.1f}" y="{panel_y:.1f}" width="{panel_w:.1f}" height="{panel_h:.1f}" '
+        f'rx="{COVER_PANEL_RADIUS}" fill="#ffffff" opacity="{COVER_PANEL_FILL}" '
+        f'stroke="#ffffff" stroke-width="2"/>',
+        "</g>",
+    ]
+
+    center = card_w / 2
+    y = panel_y + COVER_PANEL_PAD + size * COVER_HEADLINE_BASELINE
+    for line in lines:
+        parts.append(
+            f'<text x="{center:.1f}" y="{y:.1f}" text-anchor="middle" font-family="{FONT_STACK}" '
+            f'font-size="{size:.0f}" font-weight="700" fill="{COVER_TITLE_COLOR}">{html.escape(line)}</text>'
+        )
+        y += size * COVER_HEADLINE_LEADING
+    bar_y = panel_y + COVER_PANEL_PAD + block_h + COVER_ACCENT_GAP
     parts.append(
-        f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
-        f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
+        f'<rect x="{center - COVER_ACCENT_W / 2:.1f}" y="{bar_y:.1f}" width="{COVER_ACCENT_W}" '
+        f'height="{COVER_ACCENT_H}" rx="{COVER_ACCENT_H / 2:.1f}" fill="{BRAND_GREEN}"/>'
     )
-    parts.append(
-        f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" href="{data_uri}"/>'
-    )
+    if sub_lines:
+        y = bar_y + COVER_ACCENT_H + COVER_ACCENT_GAP + COVER_SUBTITLE_FONT
+        for line in sub_lines:
+            parts.append(
+                f'<text x="{center:.1f}" y="{y:.1f}" text-anchor="middle" font-family="{FONT_STACK}" '
+                f'font-size="{COVER_SUBTITLE_FONT}" fill="{COVER_SUBTITLE_COLOR}">{html.escape(line)}</text>'
+            )
+            y += COVER_SUBTITLE_FONT * 1.4
     return "\n".join(parts)
 
 
