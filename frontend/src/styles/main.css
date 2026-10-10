@@ -1543,6 +1543,20 @@ pre {
   color: var(--text-dim);
 }
 
+/* 「点这里改」：这个编辑器默认是折起来的，而用户第一个问题就是「在哪改」——
+   摘要上得有一句话说出来 */
+.cover-edit__hint {
+  margin-left: auto;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--accent, #7cb342);
+  white-space: nowrap;
+}
+
+.cover-edit[open] .cover-edit__hint {
+  visibility: hidden;
+}
+
 .cover-edit__body {
   display: grid;
   gap: 12px;

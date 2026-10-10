@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
   IS_MOCK,
@@ -455,6 +455,10 @@ const coverHeadline = computed(() => currentVideo.value?.hook ?? '')
 const coverHeadlineDraft = ref('')
 const coverPaperTitleDraft = ref('')
 const savingCover = ref(false)
+/** 用户在输入框里动过没有：动过就不再被「数据回来了」覆盖掉（详见下面的 watch） */
+const coverTouched = ref(false)
+/** 这份草稿属于哪一集、哪一版（换集/换语言要整体换一份） */
+const coverDraftOwner = ref('')
 /** 有没有改过（没改就不让点保存 —— 一个点了没反应的按钮比没有按钮更糟） */
 const coverDirty = computed(
   () =>
@@ -465,7 +469,25 @@ const coverDirty = computed(
 function resetCoverDraft(): void {
   coverHeadlineDraft.value = coverHeadline.value
   coverPaperTitleDraft.value = episode.value?.title ?? ''
+  coverTouched.value = false
 }
+
+/**
+ * 把草稿对齐到「这一集、这一版」的当前标题。
+ *
+ * ⚠️ 不能只在换集时对齐：页面是**先渲染后拿数据**的，挂载那一刻 `episode` 还是空的 ——
+ * 只对齐一次的话，输入框会一直空着，而「保存」按钮却是可点的（草稿 ≠ 当前值），
+ * 用户一点就把标题清空了。实测踩到过（量到输入框 value 是空、摘要里却显示着标题）。
+ *
+ * 规则：**换集/换语言一定重来；同一集的数据后到，只在不曾动过输入框时才覆盖**。
+ */
+watchEffect(() => {
+  const owner = `${episode.value?.id ?? ''}:${activeLanguage.value ?? ''}`
+  if (coverDraftOwner.value === owner && coverTouched.value) return
+  coverDraftOwner.value = owner
+  coverHeadlineDraft.value = coverHeadline.value
+  coverPaperTitleDraft.value = episode.value?.title ?? ''
+})
 
 async function saveCoverTitle(): Promise<void> {
   if (savingCover.value || !coverDirty.value) return
@@ -1475,6 +1497,7 @@ onBeforeUnmount(() => {
             <summary class="cover-edit__summary">
               封面标题
               <span class="cover-edit__current">{{ coverHeadline || '（未设置，显示论文原题）' }}</span>
+              <span class="cover-edit__hint">点这里改</span>
             </summary>
             <div class="cover-edit__body">
               <label class="cover-edit__field">
@@ -1486,6 +1509,7 @@ onBeforeUnmount(() => {
                   maxlength="24"
                   placeholder="例如：并发到 70，模型就装不下了"
                   :disabled="savingCover"
+                  @input="coverTouched = true"
                 />
               </label>
               <label class="cover-edit__field">
@@ -1496,6 +1520,7 @@ onBeforeUnmount(() => {
                   type="text"
                   maxlength="200"
                   :disabled="savingCover"
+                  @input="coverTouched = true"
                 />
               </label>
               <div class="row cover-edit__actions">
