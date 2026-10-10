@@ -44,10 +44,12 @@ from app.services.video import (
     SUBTITLE_TOP,
     VIDEO_H,
     VIDEO_W,
+    ASSIGN_WHY_MAX_CHARS,
     CaptionBand,
     ImageAsset,
     Scene,
     VideoError,
+    _assignment_notes,
     _fit_subtitle,
     _normalize_per_segment,
     beat_windows,
@@ -321,6 +323,81 @@ class TestAssignPrompt:
             [{"speaker": "A", "text": "x"}], [{"id": "f1", "caption": "y"}]
         )[0]["content"]
         assert "每一段" in system
+
+    def test_prompt_asks_why_each_image_fits(self):
+        """理由要和选图在**同一次调用**里拿到，否则复查图文相符又要多花一次调用。"""
+        system = build_assign_messages(
+            [{"speaker": "A", "text": "x"}], [{"id": "f1", "caption": "y"}]
+        )[0]["content"]
+        assert "why" in system
+        assert "共同点" in system
+
+
+class TestAssignmentNotes:
+    """「为什么配这张图」：只存不渲染，但必须和实际采纳的分配严格对齐。"""
+
+    VALID = {"cover", "f1", "f2", "illustration"}
+
+    def test_keeps_note_per_segment(self):
+        notes = _assignment_notes(
+            [
+                {"segment": 0, "image_id": "cover", "why": "开场交代论文主题"},
+                {"segment": 1, "image_id": "f1", "why": "都在讲误差分布"},
+            ],
+            count=3,
+            valid_ids=self.VALID,
+        )
+        assert notes == ["开场交代论文主题", "都在讲误差分布", ""]
+
+    def test_missing_notes_are_not_carried_forward(self):
+        """不能拿上一段的理由顶替这一段 —— 那是**假**的复查依据，比空着更坏。"""
+        notes = _assignment_notes(
+            [{"segment": 0, "image_id": "f1", "why": "讲误差"}],
+            count=4,
+            valid_ids=self.VALID,
+        )
+        assert notes == ["讲误差", "", "", ""]
+
+    def test_note_for_a_rejected_pick_is_dropped(self):
+        """模型给了理由、但它选的图我们没采纳（编造的 id），理由一并丢掉。"""
+        notes = _assignment_notes(
+            [
+                {"segment": 0, "image_id": "f99", "why": "编造图的理由"},
+                {"segment": 1, "image_id": "f2", "why": "有效"},
+            ],
+            count=2,
+            valid_ids=self.VALID,
+        )
+        assert notes == ["", "有效"]
+
+    def test_generate_pseudo_id_is_accepted(self):
+        """`generate` 是正常的（现场画一张），它的理由要留住。"""
+        notes = _assignment_notes(
+            [{"segment": 0, "image_id": "generate", "why": "这段没有对应原图"}],
+            count=1,
+            valid_ids=self.VALID,
+        )
+        assert notes == ["这段没有对应原图"]
+
+    def test_overlong_note_is_capped(self):
+        notes = _assignment_notes(
+            [{"segment": 0, "image_id": "f1", "why": "啰" * 500}],
+            count=1,
+            valid_ids=self.VALID,
+        )
+        assert len(notes[0]) == ASSIGN_WHY_MAX_CHARS
+
+    def test_whitespace_and_newlines_are_collapsed(self):
+        notes = _assignment_notes(
+            [{"segment": 0, "image_id": "f1", "why": "  都在讲\n  误差  "}],
+            count=1,
+            valid_ids=self.VALID,
+        )
+        assert notes == ["都在讲 误差"]
+
+    @pytest.mark.parametrize("raw", [None, "不是列表", [], [{"bad": 1}]])
+    def test_garbage_yields_empty_notes(self, raw):
+        assert _assignment_notes(raw, count=2, valid_ids=self.VALID) == ["", ""]
 
 
 # --------------------------------------------------------------------------

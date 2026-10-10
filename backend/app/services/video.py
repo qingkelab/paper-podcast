@@ -290,8 +290,19 @@ PROGRESS_BAR_COLOR = "#2f6fb5"
 # 而 6.4MB → 14MB 是「有真实运动」应付的代价。
 VIDEO_CRF = 26
 CAPTION_FADE_SEC = 0.35   # 一句字幕的淡入时长
-CAPTION_BEAT_MAX = 2      # 一段最多拆成几句字幕
+CAPTION_BEAT_MAX = 2      # 一段最多拆成几句字幕（按句子合并时的上限，见 split_caption_beats）
 CAPTION_BEAT_MIN_CHARS = 28   # 短于这个长度就别拆了：每句只剩几个字，闪得更难看
+# **一句字幕最多渲染几行**。多于此就在逗号处再拆一刀（拆成两个连续的字母事件）。
+#
+# 为什么要有这条：`_fit_subtitle` 放不下时会**缩字号**，于是那句 164 字的稿子
+# 会被排成「5 行 @26px」——比「2 行 @30px」难读得多。实测 487 句里有 35 句超过两行
+# （最长 164 字），而按「一分为二」的处方能修掉其中 21 句。
+# 这条规矩来自 Speclip 的字幕 skill（硬约束：最多两行；先拆句，再缩字号）。
+CAPTION_MAX_LINES = 2
+# 行数规则允许拆到的句数上限（防止把一句话拆成七八个碎片）
+CAPTION_BEAT_HARD_MAX = 6
+# 拆出来的碎片短于这个字数就不再拆（几个字一闪而过比三行更难读）
+CAPTION_SPLIT_MIN_CHARS = 10
 CAPTION_BAND_MAX_FONT = 38.0  # 字幕带单独渲染，字可以比整页大（观众主要在读它）
 _SENTENCE_END = "。！？!?；;…"
 
@@ -377,6 +388,10 @@ class Scene:
     caption: str = ""  # 图片说明（图注），显示在图片下方
     # 「本段要点」：一句不超过 14 个字的大字强调（模型写，兜底从原文抠数字）
     point: str = ""
+    # 「这一段为什么配这张图」（模型在逐段选图的**同一次调用**里写的一句话）。
+    # 同一张图被反复用于多段时，「是不是真的在讲同一件事」以前只能靠人重读全稿复查；
+    # 存下理由之后，只看这一列就能判断图文相符 —— 它不参与渲染，是**可复查性**的数据。
+    why: str = ""
     # 图内聚光灯：这一段在讲图里的哪一块（相对 0~1 比例 + 短标签）。None = 不框
     focus: dict[str, Any] | None = None
     # 封面上的大字标题（**只有片头那一帧用**）。正文页顶部不再放论文标题 ——
@@ -476,6 +491,11 @@ class VideoResult:
 # 配图分配
 # --------------------------------------------------------------------------
 
+# 「这一段为什么配这张图」的长度上限。prompt 里写的是 20 个字，这里留一倍余量：
+# 它是**给人看的复查依据**，模型偶尔写长一点不该被拦；但也不能放任它塞一整段进来
+# （那会把 `scenes` 撑大，而 `video.scenes` 是随单集走数据库的）。
+ASSIGN_WHY_MAX_CHARS = 40
+
 ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排。
 
 听众能听到主播的对话，同时看到画面。你的任务是让**每一段话配上意思相符的图**：
@@ -498,10 +518,14 @@ ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排�
 - 能对上论文原图的段落**优先用原图**（原图最准确）；原图对不上才填 `generate`。
 - 相邻段落如果确实在讲同一件事，用同一张图是正常的；话题变了就换图。
 - 图片 id 只能从给出的列表里选，不要编造。
+- 每一项还要写一句 `why`：**这一段和这张图的共同点是什么**。
+  它是给人看的检查依据 —— 复查时只看 `why` 就能判断选得对不对，不必重读全稿。
+  一句话，不超过 20 个字，不要复述图注、不要写「内容相关」这种空话。
 
 只输出 JSON：
-{"assignments": [{"segment": 0, "image_id": "cover"}, {"segment": 1, "image_id": "f1"}, ...]}
-每个脚本段都要有一项，不要遗漏。不要输出任何解释。"""
+{"assignments": [{"segment": 0, "image_id": "cover", "why": "开场点出论文主题"},
+                 {"segment": 1, "image_id": "f1", "why": "都在讲量化误差分布"}, ...]}
+每个脚本段都要有一项，`why` 不要遗漏。除了这个 JSON 不要输出任何解释。"""
 
 
 def build_assign_messages(
@@ -1062,6 +1086,41 @@ def _normalize_per_segment(
     return result
 
 
+def _assignment_notes(
+    raw: Any, *, count: int, valid_ids: set[str]
+) -> list[str]:
+    """把模型给的 `why`（「这一段为什么配这张图」）整理成逐段一列表。
+
+    和 `_normalize_per_segment` 收的是同一份 JSON，但**刻意分成两个函数**：
+    选图的规则被测试钉着（`TestPerSegmentAssignment`），不该为了加一个「顺带存下来的
+    理由」去动它。这里只做整理，**不对缺失项做延续** —— 上一段的理由套到这一段上
+    是**假信息**，比空着更坏（复查时会以为模型真的解释过这一段）。
+
+    认下的条件和选图一致（段号在范围内、image_id 合法），这样理由和实际分配
+    永远对得上；模型给了理由但我们没采纳它那张图时，理由一并丢掉。
+    """
+    if not isinstance(raw, list):
+        return [""] * count
+
+    notes: dict[int, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        image_id = str(item.get("image_id") or "").strip()
+        if image_id != GENERATE_ID and image_id not in valid_ids:
+            continue
+        try:
+            segment = int(item.get("segment"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= segment < count:
+            continue
+        note = " ".join(str(item.get("why") or "").split())
+        if note:
+            notes[segment] = note[:ASSIGN_WHY_MAX_CHARS]
+    return [notes.get(index, "") for index in range(count)]
+
+
 def heuristic_assignment(count: int, figure_count: int) -> list[int]:
     """均匀分布：把图铺到正文段上。模型不可用时的兜底（给的是起始段号）。
 
@@ -1117,6 +1176,7 @@ def build_scenes(
     fallback_id: str,
     points: list[str] | None = None,
     focuses: list[dict[str, Any] | None] | None = None,
+    whys: list[str] | None = None,
     headline: str = "",
     cover_caption: str = "",
 ) -> list[Scene]:
@@ -1129,6 +1189,8 @@ def build_scenes(
     「从某段开始一直用到下一张图」，这样才能保证画面跟着话题走。
 
     `points[i]` 是第 i 段的「要点强调行」文案（可为空串 → 这一段不显示强调行）。
+
+    `whys[i]` 是第 i 段「为什么配这张图」的一句话（只存不渲染，给复查用）。
 
     `headline` 是封面上的大字标题（爆款标题），`cover_caption` 是它下面那行小字
     （论文原题）—— 两者都只作用在片头那一帧。
@@ -1187,6 +1249,7 @@ def build_scenes(
                 caption=asset.caption,
                 point=(points[index] if points and index < len(points) else ""),
                 focus=(focuses[index] if focuses and index < len(focuses) else None),
+                why=(whys[index] if whys and index < len(whys) else ""),
                 brand=str(segment.get("brand") or ""),
             )
         )
@@ -1199,6 +1262,9 @@ def build_scenes(
         scenes[0].image = cover_asset.path
         scenes[0].kind = "cover"
         scenes[0].caption = cover_asset.caption
+        # 模型原本配的是别的图，它写的 `why` 说的是那张图 —— 图被我们换掉了，
+        # 理由就成了假信息，清掉（宁可空着，也不要让人以为模型解释过封面）。
+        scenes[0].why = ""
     # 首页那**连续几帧**（片头话术通常讲两三段，都还停在封面上）一起放大字标题：
     # 只放第一帧的话，标题会在一秒后消失，观众来不及读。
     leading = 0
@@ -2412,6 +2478,10 @@ def split_caption_beats(text: str, *, max_beats: int = CAPTION_BEAT_MAX) -> list
     if len(chunks) <= 1:
         # 没有句末标点：优先在中点附近的逗号处切；连逗号都没有（模型偶尔会写成一长串）
         # 就按中点切一刀 —— 一整段糊上去比切得略生硬更糟。
+        #
+        # ⚠️ 这条路径**也要过一遍行数规则**：英文句号 `.` 不在 `_SENTENCE_END` 里
+        # （加上它会把 "3.5" 这种小数切开），所以英文长句全都走到这里 ——
+        # 实测残留的 15 条三行字幕**全是英文**，就是因为这里直接 return 了。
         mid = len(clean) // 2
         candidates = [i for i, ch in enumerate(clean) if ch in "，,、"]
         if candidates:
@@ -2421,11 +2491,11 @@ def split_caption_beats(text: str, *, max_beats: int = CAPTION_BEAT_MAX) -> list
             cut = min(spaces, key=lambda i: abs(i - mid)) if spaces else mid
         left, right = clean[: cut + 1].strip(), clean[cut + 1 :].strip()
         if not left or not right:
-            return [clean]
-        return [left, right]
+            return _split_beats_by_lines([clean])
+        return _split_beats_by_lines([left, right])
 
     if len(chunks) <= max_beats:
-        return chunks
+        return _split_beats_by_lines(chunks)
 
     # 合并到 max_beats 份：按总字数均分目标，逐句累加到接近目标就断一份
     total = sum(len(chunk) for chunk in chunks)
@@ -2439,7 +2509,57 @@ def split_caption_beats(text: str, *, max_beats: int = CAPTION_BEAT_MAX) -> list
             buffer = ""
     if buffer.strip():
         merged.append(buffer.strip())
-    return merged
+    return _split_beats_by_lines(merged)
+
+
+def _beat_lines(text: str) -> int:
+    """这句字幕实际会渲染成几行（用真正上屏的那套字号/行宽算）。"""
+    return len(_fit_subtitle(text)[1])
+
+
+def _split_at_break(text: str) -> tuple[str, str] | None:
+    """在最靠近中间的逗号处切一刀；没有逗号就退到最近的空格；都不行返回 None。"""
+    mid = len(text) // 2
+    for chars in ("，,、", " "):
+        cuts = [index for index, char in enumerate(text) if char in chars]
+        if not cuts:
+            continue
+        cut = min(cuts, key=lambda index: abs(index - mid))
+        left, right = text[: cut + 1].strip(), text[cut + 1 :].strip()
+        if left and right:
+            return left, right
+    return None
+
+
+def _split_beats_by_lines(
+    beats: list[str],
+    *,
+    max_lines: int = CAPTION_MAX_LINES,
+    hard_max: int = CAPTION_BEAT_HARD_MAX,
+) -> list[str]:
+    """把「会排成三行以上」的那一句继续拆，直到每句 ≤ `max_lines` 行。
+
+    不拆的两种情况：拆出来的碎片太短（几个字一闪而过），或者本来就切不动
+    （没有逗号/空格）。这时宁可留一句三行的，也不要拆成一串碎片。
+    """
+    out = list(beats)
+    while len(out) < hard_max:
+        grown = False
+        pieces: list[str] = []
+        for beat in out:
+            if _beat_lines(beat) <= max_lines:
+                pieces.append(beat)
+                continue
+            pair = _split_at_break(beat)
+            if pair is None or min(len(pair[0]), len(pair[1])) < CAPTION_SPLIT_MIN_CHARS:
+                pieces.append(beat)
+                continue
+            pieces.extend(pair)
+            grown = True
+        out = pieces
+        if not grown or len(out) >= hard_max:
+            break
+    return out
 
 
 def beat_windows(
@@ -2976,28 +3096,30 @@ def compose_video(
 
     # 逐段语义匹配：优先让模型判断「这一段在讲什么、哪张图正好在讲同一件事」
     image_for_segment: list[str] | None = None
+    # 逐段「为什么配这张图」（模型写的，或从上次合成里复用）。只入库、不渲染。
+    assignment_whys: list[str] = [""] * len(segments)
     strategy = "heuristic"
 
     if preset_scenes:
         # 复用上次的选择，只做有效性校验（图可能被删了/文件丢了）
+        stored = {sc.get("index"): sc for sc in preset_scenes if isinstance(sc, dict)}
         picked: list[str] = []
         last_valid = default_id
         for index in range(len(segments)):
-            entry = next(
-                (sc for sc in preset_scenes if sc.get("index") == index), None
-            )
-            candidate = (entry or {}).get("image")
+            candidate = (stored.get(index) or {}).get("image")
             if candidate and candidate in pool and pool[candidate].exists:
                 last_valid = candidate
             picked.append(last_valid)
         image_for_segment = picked
+        # 复用分配时**理由一起复用**：它跟的是「哪一段用什么图」，图没换理由就还成立。
+        # 丢掉的后果是「重新合成一次，复查依据全没了」，而这并不是用户改了什么。
+        assignment_whys = [
+            str((stored.get(index) or {}).get("why") or "")
+            for index in range(len(segments))
+        ]
         strategy = "reused"
         missing = sum(
-            1
-            for index in range(len(segments))
-            if not (
-                next((sc for sc in preset_scenes if sc.get("index") == index), {}) or {}
-            ).get("image") in pool
+            1 for index in range(len(segments)) if (stored.get(index) or {}).get("image") not in pool
         )
         logger.info("重新合成：复用上次的画面分配（%d 段）", len(picked))
         if missing:
@@ -3011,7 +3133,10 @@ def compose_video(
         try:
             data = llm._chat_json(
                 build_assign_messages(segments, assets),
-                max_tokens=max(1500, len(segments) * 60),
+                # 每段一项，现在每项除了 id 还多一句 why（中文 20 字 ≈ 25 token），
+                # 所以预算是 110/段 —— 卡着 60 会让长稿的尾部整段缺项，
+                # 而缺项的表现是「后半程画面回到中性图」，看起来像模型没干活。
+                max_tokens=max(2500, len(segments) * 110),
                 temperature=0.2,
             )
             candidate = _normalize_per_segment(
@@ -3023,10 +3148,28 @@ def compose_video(
             if candidate:
                 image_for_segment = candidate
                 strategy = "model"
+                assignment_whys = _assignment_notes(
+                    data.get("assignments"),
+                    count=len(segments),
+                    valid_ids=set(pool),
+                )
                 distinct = len(set(candidate))
                 logger.info(
                     "逐段配图由模型完成：%d 段用了 %d 张不同的图", len(candidate), distinct
                 )
+                # 抽查几条理由：这是「图文到底符不相符」在日志里唯一看得见的证据
+                # （以前只能靠人重读全稿）。空着的位置不打，所以只报「几段有」。
+                filled = [w for w in assignment_whys if w]
+                if filled:
+                    sample = "；".join(
+                        f"[{i}] {w}" for i, w in enumerate(assignment_whys) if w
+                    )
+                    logger.info(
+                        "配图理由（%d/%d 段有）：%s",
+                        len(filled),
+                        len(segments),
+                        sample[:300],
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning("模型逐段配图失败，退回均匀分布：%s", exc)
 
@@ -3237,6 +3380,7 @@ def compose_video(
         fallback_id=default_id,
         points=points,
         focuses=focuses,
+        whys=assignment_whys,
         headline=cover_headline,
         cover_caption=title,
     )
@@ -3352,6 +3496,9 @@ def compose_video(
             # 强调文案与聚光灯都存下来，重新合成时复用（见上面三级来源的说明）
             "point": points[index] if index < len(points) else "",
             "focus": focuses[index] if index < len(focuses) else None,
+            # 「为什么配这张图」（模型写的）。**只存不渲染**：它是复查图文相符的依据，
+            # 也让「同一张图连讲多段」这种判断有迹可循，不必再重读全稿。
+            "why": assignment_whys[index] if index < len(assignment_whys) else "",
         }
         for index in range(min(len(segments), len(image_for_segment)))
     ]
