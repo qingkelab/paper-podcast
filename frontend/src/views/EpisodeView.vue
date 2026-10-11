@@ -416,7 +416,7 @@ function stopRebuildClock(): void {
   }
 }
 
-async function rebuildVideoNow(): Promise<void> {
+async function rebuildVideoNow(message = '视频已按当前配图重新合成'): Promise<void> {
   if (rebuildingVideo.value) return // 连点保护：上一次还没回来就不发新请求
   const targetId = id.value
   rebuildingVideo.value = true
@@ -431,7 +431,7 @@ async function rebuildVideoNow(): Promise<void> {
     resetVideoState()
     // 就地刷新：返回的 Episode 里 video.stale 已经归位 false，提示条随之消失
     episode.value = updated
-    showToast('ok', '视频已按当前配图重新合成')
+    showToast('ok', message)
   } catch (cause) {
     if (id.value !== targetId) return
     const message = errorMessage(cause, '重新合成视频失败')
@@ -489,8 +489,9 @@ watchEffect(() => {
   coverPaperTitleDraft.value = episode.value?.title ?? ''
 })
 
-async function saveCoverTitle(): Promise<void> {
-  if (savingCover.value || !coverDirty.value) return
+async function saveCoverTitle(options: { silent?: boolean } = {}): Promise<boolean> {
+  if (savingCover.value) return false
+  if (!coverDirty.value) return true
   const targetId = id.value
   savingCover.value = true
   try {
@@ -499,18 +500,39 @@ async function saveCoverTitle(): Promise<void> {
       paperTitle: coverPaperTitleDraft.value,
       lang: activeLanguage.value ?? undefined,
     })
-    if (id.value !== targetId) return
+    if (id.value !== targetId) return false
     episode.value = updated
     // 显示**后端收短之后**的那一份：它可能和你敲的不完全一样（超长会断在分句处）
     resetCoverDraft()
-    // 按钮就在下面这一行里（`title_pending` 会把它显示出来），所以说「点下面的」
-    showToast('ok', '封面标题已保存 —— 点下面的「重新合成视频」后生效')
+    if (!options.silent) {
+      showToast(
+        'ok',
+        updated.video?.title_pending
+          ? '封面标题已保存 —— 点下面的「重新合成视频」后生效'
+          : '封面标题已保存（和原来那句一样，视频不用重做）',
+      )
+    }
+    return true
   } catch (cause) {
-    if (id.value !== targetId) return
+    if (id.value !== targetId) return false
     showToast('error', errorMessage(cause, '保存封面标题失败'))
+    return false
   } finally {
     savingCover.value = false
   }
+}
+
+/**
+ * 封面编辑器里的「重新合成视频」：**先存草稿再合成**。
+ *
+ * 两个动作合成一个按钮是有意的：标题是画进画面的，草稿没保存就合成的话，
+ * 出来的是「旧标题 + 新画面」，用户还得自己再点一次保存 + 再点一次合成。
+ * 保存失败就**不合成** —— 否则白等一分钟，画面里还是旧标题。
+ */
+async function rebuildCoverVideo(): Promise<void> {
+  if (rebuildingVideo.value) return
+  if (coverDirty.value && !(await saveCoverTitle({ silent: true }))) return
+  await rebuildVideoNow('视频已重新合成，封面标题也画进去了')
 }
 
 // --- 音视频互斥：同一页面上两路声音绝不能同时响 -----------------------------
@@ -1428,7 +1450,7 @@ onBeforeUnmount(() => {
                 type="button"
                 class="btn btn--sm btn--primary"
                 :disabled="rebuildingVideo"
-                @click="rebuildVideoNow"
+                @click="rebuildVideoNow()"
               >
                 <span v-if="rebuildingVideo" class="spinner" aria-hidden="true" />
                 {{ rebuildingVideo ? '重新合成中…' : rebuildError ? '重新合成视频（重试）' : '重新合成视频' }}
@@ -1529,33 +1551,53 @@ onBeforeUnmount(() => {
                   type="button"
                   class="btn btn--sm btn--primary"
                   :disabled="savingCover || !coverDirty"
-                  @click="saveCoverTitle"
+                  @click="saveCoverTitle()"
                 >
                   <span v-if="savingCover" class="spinner" aria-hidden="true" />
                   {{ savingCover ? '保存中…' : '保存' }}
                 </button>
                 <!--
-                  只改数据、不自动重新合成（重新合成要一分钟上下）。所以保存之后
-                  **就地**给一个「重新合成视频」按钮 —— 标题是画进画面里的，
-                  不合成一次，页面上、首页、分享页看到的都还是旧标题。
+                  这个按钮**一直在**（不再是「改过标题才出现」）。
+                  第一版挂在 `title_pending` 上，理由是「没改动就别给入口」——
+                  实测被打回来两次（「没有 重新合成视频 的按钮」）：用户点开
+                  「点这里改」，看到的是一个没有合成按钮的面板，只会得出
+                  「这个功能不存在」。而重新合成本身就是一个随时可做的动作
+                  （换配图、想重做一遍画面都算），不该由我们的状态机来决定它露不露面。
+
+                  草稿没保存时按钮变成「保存并重新合成」：标题是画进画面的，
+                  拿旧标题合成一遍等于白等一分钟。
                 -->
                 <button
-                  v-if="currentVideo?.title_pending"
                   type="button"
                   class="btn btn--sm"
-                  :disabled="rebuildingVideo"
-                  @click="rebuildVideoNow"
+                  :disabled="rebuildingVideo || savingCover"
+                  @click="rebuildCoverVideo"
                 >
-                  <span v-if="rebuildingVideo" class="spinner" aria-hidden="true" />
-                  {{ rebuildingVideo ? '重新合成中…' : '重新合成视频' }}
+                  <span v-if="rebuildingVideo || savingCover" class="spinner" aria-hidden="true" />
+                  {{
+                    rebuildingVideo
+                      ? '重新合成中…'
+                      : savingCover
+                        ? '保存中…'
+                        : coverDirty
+                          ? '保存并重新合成'
+                          : '重新合成视频'
+                  }}
                 </button>
-                <span v-if="currentVideo?.title_pending" class="section__hint" role="status">
-                  标题已存，视频里还是旧标题 —— 点「重新合成视频」{{ rebuildEtaText }}后生效
-                  <template v-if="rebuildingVideo">（已等 {{ rebuildElapsed }} 秒，请先别关闭页面）</template>
-                </span>
-                <span v-else class="section__hint">
-                  标题是画进画面里的，改完要重新合成才看得到。
-                  建议 18 字以内（最长 23），超长会按分句自动收短。
+                <span class="section__hint" role="status">
+                  <template v-if="rebuildingVideo">
+                    正在重新渲染画面并编码，{{ rebuildEtaText }}（已等 {{ rebuildElapsed }} 秒），请先别关闭页面
+                  </template>
+                  <template v-else-if="coverDirty">
+                    改动还没保存 —— 点「保存并重新合成」会先存下标题，再把这句标题画进画面
+                  </template>
+                  <template v-else-if="currentVideo?.title_pending">
+                    标题已存，视频里还是旧标题 —— 点「重新合成视频」{{ rebuildEtaText }}后生效
+                  </template>
+                  <template v-else>
+                    标题和视频里画的那句一致（建议 18 字以内、最长 23，超长按分句收短）。
+                    想重做一遍画面也可以点「重新合成视频」（{{ rebuildEtaText }}）。
+                  </template>
                 </span>
               </div>
             </div>
