@@ -1021,9 +1021,11 @@ class TestBilingualVersions:
 
         zh_text = " ".join(s["text"] for s in zh["script"]["segments"])
         en_text = " ".join(s["text"] for s in en["script"]["segments"])
-        # 英文版必须是真英文，而不是把中文版复制一份
-        assert "Today's paper" in en_text or "the paper" in en_text.lower()
-        assert "今天聊的" in zh_text
+        # 英文版必须是真英文，而不是把中文版复制一份。
+        # 判语言纯度用比例、不用钉具体句子：Mock 文案会跟着 prompt 的风格改
+        # （这一轮就改成了「作者视角」的写法），钉死一句话会让每次改文案都红一次。
+        assert "the paper" in en_text.lower() or "our paper" in en_text.lower()
+        assert _cjk_ratio(zh_text) > 0.7, "中文版里混进了英文"
         assert _cjk_ratio(en_text) < 0.1, "英文版里混进了中文"
 
     def test_top_level_mirrors_primary_language(self, bilingual_client):
@@ -1068,7 +1070,9 @@ class TestBilingualVersions:
         en_script = bilingual_client.get(f"{base}/script.txt?lang=en").text
         assert "主播A" in zh_script
         assert "主播A" not in en_script
-        assert "Today's paper" in en_script
+        # 同理：Mock 文案的风格会跟着 prompt 改（这一轮改成了作者视角），
+        # 所以这里判「是英文」而不是钉某一句开场白。
+        assert "Host A" in en_script and "【主播A】" not in en_script
 
         zh_md = bilingual_client.get(f"{base}/analysis.md").text
         en_md = bilingual_client.get(f"{base}/analysis.md?lang=en").text

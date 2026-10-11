@@ -524,7 +524,10 @@ class TestMockScriptLanguage:
         meta, analysis = mock_analysis("attention transformer", language="zh")
         script = mock_script(analysis, meta, duration_min=5, level="intro", language="zh")
         text = " ".join(s["text"] for s in script["segments"])
-        assert "今天聊的" in text
+        # 语言纯度用比例判（钉一句具体文案太脆），再确认它已经是作者视角的新版
+        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        assert cjk / len(text) > 0.7, text[:80]
+        assert "这篇是我们做的" in text
 
 
 class TestSplitLongSegments:
@@ -816,3 +819,66 @@ class TestAnalysisCoversTheWholeReadingOrder:
         english = render_analysis_markdown(episode, "en")
         assert "**Affiliations**：Google Brain" in english
         assert "## Research question" in english and "## Strengths" in english
+
+
+class TestScriptSpeaksAsTheAuthorAndTeaches:
+    """文案生成的两条硬要求（用户原话：「用费曼技巧解释，把自己当成作者」）。
+
+    实测改之前的稿子（三集，库里已有）：「我们」只出现 2 次、「他们」8~9 次、「你们」0 次 ——
+    也就是说主播在**转述**一篇论文，而不是在讲自己做过的事。这两条就是冲这个来的。
+    """
+
+    def test_both_languages_teach_the_feynman_way(self):
+        zh, en = prompts.SCRIPT_SYSTEM, prompts.SCRIPT_SYSTEM_EN
+        assert "费曼技巧" in zh
+        assert "先讲直觉，再上术语" in zh
+        assert "类比不能改变事实" in zh
+        assert "讲不顺 = 这里其实没讲透" in zh
+
+        assert "Feynman" in en
+        assert "Intuition first, jargon second" in en
+        assert "an analogy may not change" in en
+        assert "you have not finished understanding it" in en
+
+    def test_both_languages_speak_as_the_author(self):
+        zh, en = prompts.SCRIPT_SYSTEM, prompts.SCRIPT_SYSTEM_EN
+        assert "把自己当成作者" in zh and "这篇论文的作者本人" in zh
+        assert "像作者本人在复盘自己的工作" in zh
+        assert "speak as the author" in en.lower()
+        assert "the author of this paper" in en
+        assert "your team" in en
+
+    def test_first_person_is_not_a_licence_to_invent(self):
+        """第一人称最容易滑向「编故事」，所以这条禁令我特意写死在两版里。
+
+        允许的第一人称只覆盖「视角」：动机、取舍、为什么排除另一条路都必须来自解读稿。
+        """
+        zh, en = prompts.SCRIPT_SYSTEM, prompts.SCRIPT_SYSTEM_EN
+        assert "不是编造许可证" in zh
+        assert "一律不许编" in zh
+        assert "not a licence to invent" in en
+        assert "Never invent failed" in en
+
+    def test_mock_script_uses_the_same_voice(self):
+        """离线演示（浏览器 Mock / 无密钥）看到的文案要和线上同一个风格。
+
+        否则改完 prompt 打开演示页还是旧腔调，会以为改动没生效 ——
+        这个坑在这个项目里踩过好几次（配色、白底都是这么发现的）。
+        """
+        meta, analysis = mock_analysis("Attention Is All You Need", title_hint="Attention")
+        cases = (
+            ("zh", ("我们", "你们", "打个比方")),
+            ("en", ("our paper", " we ", "relay race")),
+        )
+        for language, markers in cases:
+            script = mock_script(
+                analysis, meta, duration_min=3, level="intro", language=language
+            )
+            text = " " + "".join(item["text"] for item in script["segments"]) + " "
+            for marker in markers:
+                assert marker in text, f"{language} 的 Mock 稿子里没有 {marker!r}：{text[:120]}"
+
+    def test_expert_level_still_lands_terms_in_plain_words(self):
+        """专家档也别把术语扔下不管 —— 费曼那条对所有难度档都成立。"""
+        assert "一句大白话" in prompts.LEVEL_GUIDE["expert"]
+        assert "plain words" in prompts.LEVEL_GUIDE_EN["expert"]
