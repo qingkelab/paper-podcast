@@ -317,3 +317,193 @@ FOCUS_MAX_AREA = 0.85
 SPEAKER_WAVE_COLORS = {"A": "#d3a24a", "B": "#79a9c9"}
 # 伪 id：模型用它表示「这一段没有对应原图，需要现场生成一张」
 GENERATE_ID = "generate"
+
+
+# ---------------------------------------------------------------------------
+# 文字折行：**两套渲染（HTML / SVG）必须共用同一套断行结果**
+# ---------------------------------------------------------------------------
+#
+# 为什么要把折行放到这里、而不是各自写在渲染函数里：
+# 画面有两条渲染路径（HTML 走 Chrome，SVG 走 resvg 兜底），两边都排同一行大字标题。
+# 各排一份的话，同一个标题在两条路径上会断在不同位置 —— 而这种不一致平时看不出来
+# （谁也不会同时跑两条路径对比），只有「同一篇论文两台机器出的画面不一样」时才暴露。
+
+
+def wrap_units(text: str, max_units: float) -> list[str]:
+    """按全角单位宽度折行（西文按 0.55 计）。"""
+    from .illustration import _char_width, _tokenize
+
+    text = " ".join((text or "").split())
+    if not text:
+        return []
+
+    lines: list[str] = []
+    current = ""
+    width = 0.0
+    for token in _tokenize(text):
+        token_width = sum(_char_width(c) for c in token)
+        if current and width + token_width > max_units:
+            lines.append(current.strip())
+            current = ""
+            width = 0.0
+        if not current and token == " ":
+            continue
+        current += token
+        width += token_width
+    if current.strip():
+        lines.append(current.strip())
+    return lines
+
+
+def text_units(text: str) -> float:
+    """这段文字占多少个全角单位（一个汉字 = 1，西文字母/数字 = 0.55）。"""
+    from .illustration import _char_width
+
+    return sum(_char_width(c) for c in text)
+
+
+# 可以在**它后面**断行的标点。断在这里，标点自己留在上一行 ——
+# 中文排版的「避头尾」：句号、逗号、右括号这些不能跑到下一行开头。
+_HOOK_BREAK_AFTER = "，。、；：！？…,.;:!?）】》」』”’)"
+# 换行后**不能**出现在行首的字符（万一按宽度断，也要把它们拉回上一行）
+_HOOK_NO_LINE_START = "，。、；：！？…,.;:!?）】》」』”’)"
+
+
+def _hook_segments(text: str) -> list[str]:
+    """按标点把标题切成「语义段」：标点跟着**前一段**走。"""
+    segments: list[str] = []
+    buffer = ""
+    for char in text:
+        buffer += char
+        if char in _HOOK_BREAK_AFTER:
+            segments.append(buffer)
+            buffer = ""
+    if buffer.strip():
+        segments.append(buffer)
+    return segments
+
+
+def _no_orphan_punctuation(lines: list[str]) -> list[str]:
+    """行首的标点拉回上一行（避头尾）。"""
+    fixed: list[str] = []
+    for line in lines:
+        moved = ""
+        while line and line[0] in _HOOK_NO_LINE_START:
+            moved += line[0]
+            line = line[1:]
+        if moved and fixed:
+            fixed[-1] += moved
+        elif moved:
+            line = moved + line
+        if line.strip() or not fixed:
+            fixed.append(line.strip())
+    return [line for line in fixed if line]
+
+
+def hook_lines(text: str, max_units: float) -> list[str]:
+    """封面大字标题折行：**优先在标点处断**，没有标点才退回按宽度断。
+
+    为什么不能只按宽度折（`wrap_units` 的做法）：那是「塞到塞不下为止」，
+    于是断点经常落在词中间，或者像实测里的这条 ——
+
+        显存直降 68.7%！Qwen/Kimi
+        同款                       ← 第二行只剩一个词，读起来像话被截断了
+
+    宽度上它是合理的（两行都塞满了），但句子的断点明明就在那个「！」上。
+    爆款标题是**一句话**，标点就是它自带的断句：顺着标点断，每行都是一个完整的短语。
+
+    规则：
+    - 尽量把整句放在一行；一行放不下时，退到**最近的一个标点**处断开；
+    - 一个标点都没有的标题（或某个标点之间太长）只能按宽度断 —— 这是明面上的退路，
+      不是静默出错（那条超长的段会走 `wrap_units`，结果照样能画出来）；
+    - 返回**全部**行，不在这里截断：字号与行数由 `cover_title_layout` 决定（它会缩字号
+      直到行数放得下，实在放不下才截断）。
+    """
+    text = " ".join((text or "").split())
+    if not text or max_units <= 0:
+        return []
+
+    lines: list[str] = []
+    current = ""
+    width = 0.0
+
+    for segment in _hook_segments(text):
+        segment_width = text_units(segment)
+        if segment_width > max_units:
+            # 这一段自己就塞不下一行（两个标点之间太长了）：只能按宽度断。
+            # 先把手上的行收掉，再把它的前半截各行独立成行，末尾那截继续和后面拼。
+            if current.strip():
+                lines.append(current.strip())
+            current, width = "", 0.0
+            pieces = wrap_units(segment, max_units)
+            lines.extend(pieces[:-1])
+            current = pieces[-1] if pieces else ""
+            width = text_units(current)
+            continue
+        if current and width + segment_width > max_units:
+            lines.append(current.strip())
+            current, width = "", 0.0
+        current += segment
+        width += segment_width
+
+    if current.strip():
+        lines.append(current.strip())
+    return _no_orphan_punctuation(lines)
+
+
+def cover_panel_width(layout: Layout) -> float:
+    """玻璃面板的宽度：卡片宽减去两侧留白，再压到上限（横版卡片很宽，不能一整条铺满）。"""
+    return min(layout.image_box_w - COVER_PAD * 2, COVER_PANEL_MAX_W)
+
+
+def cover_title_layout(
+    headline: str, caption: str, layout: Layout
+) -> tuple[float, list[str], list[str], float, float]:
+    """封面文字怎么排：返回 `(标题字号, 标题行, 原题行, 标题块高, 面板高)`。
+
+    字号从 `COVER_HEADLINE_MAX_FONT` 往下试，直到标题能塞进两行 ——
+    「爆款标题」是我们让模型写的，长一两个字很正常，缩字号比截断句子体面。
+    再小到 `COVER_HEADLINE_MIN_FONT` 还放不下就截断（加省略号）。
+    """
+    text = " ".join((headline or "").split())
+    inner = cover_panel_width(layout) - COVER_PANEL_PAD * 2
+    if not text:
+        return 0.0, [], [], 0.0, 0.0
+
+    size = float(COVER_HEADLINE_MIN_FONT)
+    lines: list[str] = []
+    for candidate in range(COVER_HEADLINE_MAX_FONT, COVER_HEADLINE_MIN_FONT - 1, -2):
+        # `hook_lines` 的单位宽度就是字号（一个全角字 ≈ 1 个字号宽），所以像素宽 ÷ 字号 = 单位数
+        wrapped = hook_lines(text, inner / candidate)[:COVER_HEADLINE_MAX_LINES + 1]
+        if len(wrapped) <= COVER_HEADLINE_MAX_LINES:
+            size, lines = float(candidate), wrapped
+            break
+    else:
+        size = float(COVER_HEADLINE_MIN_FONT)
+        lines = hook_lines(text, inner / size)[:COVER_HEADLINE_MAX_LINES]
+        if lines:
+            lines[-1] = lines[-1].rstrip("，。、,.;") + "…"
+
+    block_h = len(lines) * size * COVER_HEADLINE_LEADING
+    sub_all = wrap_units(caption, inner / COVER_SUBTITLE_FONT)
+    sub_lines = sub_all[:COVER_SUBTITLE_MAX_LINES]
+    if len(sub_all) > COVER_SUBTITLE_MAX_LINES and sub_lines:
+        # 截断要**看得出来**：默默少掉一行，观众会以为那就是论文的全名。
+        sub_lines[-1] = sub_lines[-1].rstrip("，。、,.;") + "…"
+    sub_h = len(sub_lines) * COVER_SUBTITLE_FONT * 1.4
+    panel_h = (
+        COVER_PANEL_PAD * 2
+        + block_h
+        + COVER_ACCENT_GAP
+        + COVER_ACCENT_H
+        + (COVER_ACCENT_GAP + sub_h if sub_lines else 0)
+    )
+    return size, lines, sub_lines, block_h, panel_h
+
+
+def cover_headline_layout(
+    headline: str, layout: Layout, *, max_lines: int = COVER_HEADLINE_MAX_LINES
+) -> tuple[float, list[str], float]:
+    """只要标题那部分（`(字号, 行, 文字块高)`）—— 给测试和别处单独用。"""
+    size, lines, _, block_h, _ = cover_title_layout(headline, "", layout)
+    return size, lines[:max_lines], block_h

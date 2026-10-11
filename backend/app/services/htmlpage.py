@@ -81,6 +81,7 @@ from .design import (
     WATERMARK_PAD,
     WATERMARK_W,
     Layout,
+    cover_title_layout,
 )
 from .htmlframe import Page
 
@@ -429,9 +430,19 @@ def _image_block(scene: "Scene", layout: Layout) -> str:
     blur = COVER_GLASS_BLUR * (scale / COVER_GLASS_BLUR_REF_SCALE)
     pad = COVER_PAD + 24  # 内层比容器大出去这一圈，让羽化边缘被裁掉
 
+    # **断行由 Python 定，交给浏览器自己折是错的**：CSS 只会按宽度折，
+    # 于是「显存直降 68.7%！Qwen/Kimi 同款」会被断成「…Qwen/Kimi」+「同款」——
+    # 第二行只剩一个词，读起来像话被截断。这里用和 SVG 那一层**同一个**函数
+    # （`cover_title_layout` → `hook_lines`）算出句读位置，用 `<br>` 钉住。
+    # 字号也用它选好的那个（Chrome 的字宽和我们的估算略有出入时，
+    # 下面那套 `data-fit-*` 仍会按真实度量再收一次，不会溢出）。
+    size, lines, sub_lines, _, _ = cover_title_layout(headline, caption, layout)
+    headline_html = "<br>".join(html_lib.escape(line) for line in lines) or html_lib.escape(headline)
+    paper_lines = "<br>".join(html_lib.escape(line) for line in sub_lines) or html_lib.escape(caption)
+
     paper = (
         f'<div class="cover-paper" {_fit_attrs(max_font=COVER_SUBTITLE_FONT, min_font=14, lines=2)}>'
-        f"{html_lib.escape(caption)}</div>"
+        f"{paper_lines}</div>"
         if caption
         else ""
     )
@@ -441,9 +452,9 @@ def _image_block(scene: "Scene", layout: Layout) -> str:
         f'style="filter: blur({blur:.1f}px)"></div>'
         '<div class="cover-veil"></div>'
         '<div class="cover-panel">'
-        f'<div class="cover-headline" '
-        f'{_fit_attrs(max_font=COVER_HEADLINE_MAX_FONT, min_font=COVER_HEADLINE_MIN_FONT, lines=COVER_HEADLINE_MAX_LINES)}>'
-        f"{html_lib.escape(headline)}</div>"
+        f'<div class="cover-headline" style="font-size: {size:.0f}px" '
+        f'{_fit_attrs(max_font=size, min_font=COVER_HEADLINE_MIN_FONT, lines=COVER_HEADLINE_MAX_LINES)}>'
+        f"{headline_html}</div>"
         '<div class="cover-accent"></div>'
         f"{paper}"
         "</div>"

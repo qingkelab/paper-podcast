@@ -76,6 +76,7 @@ from app.services.video import (
     COVER_HEADLINE_MAX_FONT,
     COVER_HEADLINE_MIN_FONT,
     cover_title_layout,
+    hook_lines,
     build_scenes,
     cover_headline_layout,
     image_card_markup,
@@ -2847,6 +2848,93 @@ class TestCoverHeadline:
             assert len(lines) <= 2, (text, lines)
             assert COVER_HEADLINE_MIN_FONT <= size <= COVER_HEADLINE_MAX_FONT
             assert height > 0
+
+
+class TestCoverHeadlineBreaksAtPunctuation:
+    """封面大字要**在标点处断行**，不是「塞满一行算一行」。
+
+    用户的原话是「标题按照标点符号自动换行」。坏例子就是实测的这一条：
+
+        显存直降 68.7%！Qwen/Kimi      ← 按宽度折（旧 `_wrap`）
+        同款                            第二行只剩一个词，读起来像话被截断
+
+    宽度上它没有错（两行都塞满了），可句子的断点明明就在那个「！」上 ——
+    标题是一句话，标点就是它自带的断句。
+    """
+
+    def test_break_falls_on_the_punctuation(self):
+        size, lines, _ = cover_headline_layout("显存直降 68.7%！Qwen/Kimi 同款", PORTRAIT)
+        assert lines == ["显存直降 68.7%！", "Qwen/Kimi 同款"], lines
+        assert size == COVER_HEADLINE_MAX_FONT, "断在标点处之后两行都更短，不该缩字号"
+
+    def test_comma_is_used_the_same_way(self):
+        """逗号同样是断点：断在「，」后面，而不是把它挤成行首。"""
+        lines = hook_lines("这一句先讲问题在哪里，后面那句讲它到底怎么解决", 12.0)
+        assert lines[0].endswith("，"), lines
+        assert all(not line.startswith("，") for line in lines)
+
+    def test_short_title_stays_on_one_line(self):
+        assert cover_headline_layout("短标题", PORTRAIT)[1] == ["短标题"]
+        assert cover_headline_layout("4 比特超 INT8，显存降七成", PORTRAIT)[1] == [
+            "4 比特超 INT8，显存降七成"
+        ], "放得下就别断"
+
+    def test_title_without_punctuation_falls_back_to_width(self):
+        text = "把奖励拆到每个视觉事实再算一遍总分"
+        lines = cover_headline_layout(text, PORTRAIT)[1]
+        assert len(lines) == 2
+        assert "".join(lines) == text, "没有标点时只能按宽度断，但一个字都不能丢"
+
+    def test_closing_punctuation_is_pulled_back_to_the_previous_line(self):
+        """避头尾：句号、逗号这类不能出现在行首（按宽度断时的兜底）。"""
+        from app.services.design import _no_orphan_punctuation
+
+        assert _no_orphan_punctuation(["前一段", "，后一段"]) == ["前一段，", "后一段"]
+        assert _no_orphan_punctuation(["前一段", "！.", "后一段"]) == ["前一段！.", "后一段"]
+
+    def test_long_paragraph_without_punctuation_still_wraps(self):
+        """两个标点之间太长（比如一整句没有断句）也要能画出来，不能只返回半句。"""
+        text = "甲" * 40
+        lines = hook_lines(text, 10.0)
+        assert len(lines) == 4
+        assert "".join(lines) == text
+
+    def test_short_paper_title_truncation_is_visible(self):
+        """论文原题放不下两行时截断，但必须**看得出被截断了**（加省略号）。"""
+        long_caption = (
+            "STEPQuant: When and Where Errors Matter in Delta-Rule Recurrent State "
+            "Quantization for Long-Context Inference Serving with Mixed-Precision "
+            "Bit Allocation and Runtime Adaptation"
+        )
+        _, _, sub_lines, _, _ = cover_title_layout("标题", long_caption, PORTRAIT)
+        assert len(sub_lines) == 2, sub_lines
+        assert sub_lines[-1].endswith("…"), sub_lines
+        _, _, short_lines, _, _ = cover_title_layout("标题", "STEPQuant: Quantization", PORTRAIT)
+        assert short_lines == ["STEPQuant: Quantization"], "放得下就别加省略号"
+
+    def test_svg_and_html_break_in_the_same_place(self, tmp_path):
+        """两条渲染路径（SVG / HTML）必须断在同一个地方。
+
+        这是把它俩放同一个函数（`design.hook_lines`）的唯一理由：各排一份的话，
+        同一个标题在两条路径上断点不同，而这种不一致平时看不出来。
+        """
+        import re
+
+        from app.services.htmlpage import scene_page
+
+        image = make_png(tmp_path / "cover.png", 600, 780)
+        headline = "显存直降 68.7%！Qwen/Kimi 同款"
+        scene = Scene(start=0, end=6, image=image, kind="cover", headline=headline)
+
+        svg = image_card_markup(scene, PORTRAIT)
+        svg_lines = re.findall(r"font-size=\"54\"[^>]*>([^<]+)</text>", svg)
+        assert svg_lines == ["显存直降 68.7%！", "Qwen/Kimi 同款"], svg_lines
+
+        html = scene_page(scene, PORTRAIT).html
+        block = re.search(r'<div class="cover-headline".*?</div>', html, re.S)
+        assert block is not None
+        html_lines = block.group(0).split(">", 1)[1].rsplit("</div>", 1)[0].split("<br>")
+        assert html_lines == svg_lines
 
 
 class TestCoverIsDrawnInTheCardLayer:

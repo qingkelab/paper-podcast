@@ -3,6 +3,8 @@ import type { MockPaperMeta } from '../mockPapers'
 
 /** 通用兜底模板（图神经网络 / 分子性质预测）的英文版解读与双人播客脚本（Mock 双语演示用） */
 export const EN_ANALYSIS: MockAnalysis = {
+  question:
+    'Under one fixed data split and evaluation protocol, how much of the reported gain in molecular property prediction comes from message passing versus pretraining — and how much was an artefact of the evaluation setup?',
   background:
     'Across many application areas, the early default was to compress every sample into a fixed-length feature vector and hand it to a gradient-boosted tree. Those features are counts of local units, so they throw away how the units connect to one another, and they throw away geometry as well. When two samples are structurally similar but differ sharply in the property you care about, a model of this kind usually cannot tell them apart. In 2018, MoleculeNet collected roughly 700,000 samples and published the first public benchmark, but papers disagreed on data splits and hyperparameter budgets. Run the same model under a different protocol and it moves by several points, which makes published conclusions impossible to compare side by side. That gives this work a very concrete question: of the gains reported on those leaderboards, how much came from the model itself, and how much came from the evaluation protocol?',
   innovations: [
@@ -18,6 +20,16 @@ export const EN_ANALYSIS: MockAnalysis = {
     'On ogbg-molhiv, ROC-AUC climbs from the previous best baseline of 0.7558 to 0.826. On the larger ogbg-molpcba, average precision moves from 0.2266 to 0.291, and more than ninety percent of its 128 subtasks improve. On regression, the average MAE over the 12 QM9 targets comes down from 0.045 to 0.031. In the low-label regime, with only 500 training labels, the pretrained model runs 8 to 12 points ahead of random initialization. The ablations are just as informative: dropping the geometry channel costs three points on the tasks that rely on it, and increasing aggregation depth from five layers to eight loses 1.5 points instead of gaining.',
   conclusion:
     'The conclusion lands on two levels. On the method side, the expressive power of layer-wise aggregation is capped by what you can build out of a handful of neighbourhoods; going deeper is less useful than finding a better pretraining signal, and the real gains concentrate on small datasets where labels are scarce. On the evaluation side, a good part of the performance that earlier leaderboards reported came from differences in data splits and hyperparameter budgets rather than from model architecture. Both point at the same thing: the bottleneck in this task has moved from structural design to data and evaluation standards.',
+  concepts: [
+    'Message passing: each atom sends its features to its neighbours, which aggregate what they receive and update themselves; stacking layers lets every atom see several hops of chemical environment.',
+    'Pretraining objective: mask atoms or contrast two views of the same molecule on a large unlabelled set, so the model first learns a general chemical representation before being fine-tuned on a small labelled set.',
+    'Scaffold split: hold out whole molecular scaffolds rather than random molecules. Random splits put near-duplicates on both sides and inflate scores — the most common evaluation trap in this field.',
+  ],
+  strengths: [
+    'Data splits, evaluation protocol and baseline implementations are unified in one codebase, so numbers that used to be incomparable finally sit in one table.',
+    'The scaffold-split control quantifies how much random splitting inflates results, which is arguably more useful to later work than the headline numbers.',
+    'Pretrained weights and training scripts are released and negative results are reported, which is better reproducibility than comparable work.',
+  ],
   limitations: [
     'The expressive ceiling of layer-wise aggregation is bounded by the classical discriminative test it corresponds to, which is not enough for tasks that hinge on geometric detail, and the paper offers no architectural design that breaks through that ceiling.',
     'The 11 million pretraining samples sit inside a single data distribution, so the gains decay sharply once you transfer out of distribution, and the paper never runs a cross-domain validation to measure how bad that decay gets.',

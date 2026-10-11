@@ -31,12 +31,20 @@
   },
   "paper_meta": {                       // 全部字段可为 null
     "title": "...", "authors": ["..."], "abstract": "...",
+    "affiliations": ["Google Brain", "University of Toronto"],  // 作者单位；论文没写就是 []
     "year": 2017, "venue": "NeurIPS", "arxiv_id": "1706.03762",
     "keywords": ["Transformer", "Self-Attention"]
   },
-  "analysis": {                         // 结构化论文解读，见 §4
-    "background": "...", "innovations": ["..."], "method": "...",
-    "experiments": "...", "conclusion": "...", "limitations": ["..."],
+  "analysis": {                         // 结构化论文解读，见 §1「解读字段」
+    // 顺序就是解读的阅读顺序（prompts.ANALYSIS_SYSTEM 里那段固定顺序）
+    "background": "...",                // 开头交代「这是谁的工作」（作者机构）
+    "question": "...",                  // 研究问题（可以判真假的问句）
+    "innovations": ["..."], "method": "...",
+    "experiments": "...",               // 关键数据：数据集/基线/指标数值/消融
+    "conclusion": "...",                // 主要发现与结论
+    "concepts": ["..."],                // 新颖概念的通俗解释（「概念：大白话」）
+    "strengths": ["..."],               // 优点（与 limitations 分开：要的是**优缺点**）
+    "limitations": ["..."],
     "value": "...", "future": ["..."]
   },
   "script": {                           // 双人播客脚本
@@ -145,6 +153,24 @@
 （分别置为 `null` / `[]`），且 `versions` 里也只保留语言与音频信息。
 详情接口才返回完整内容。但 **`cover_url` 在列表里保留**，
 因为列表卡片要显示封面缩略图。
+
+### 解读字段（`analysis` / `paper_meta`）
+
+字段顺序就是**解读的阅读顺序**（同 `backend/app/services/prompts.py::ANALYSIS_SYSTEM`
+里那段固定顺序）：这是谁的工作 → 研究背景与研究问题 → 研究方法 → 关键数据 →
+主要发现与结论 → 新颖概念的通俗解释 → 创新点 → 优点 → 不足 → 应用价值与后续方向。
+
+- **`paper_meta.affiliations`（作者机构）只能来自论文原文**（首页标题区的单位署名）。
+  拉不到就是空数组 —— **机构猜错比不写更糟**：`analysis.background` 会照它讲「这是谁的工作」。
+  解读那一步的 prompt 里写死了这条规矩，脚本那一步只在真的有值时才拿到
+  `【作者机构】`（没有值就不许提机构，也不许拿作者姓名去猜）。
+- `question` / `concepts` / `strengths` 是后加的字段：**老单集库里没有它们**。
+  前端把这三个当可选（缺了就整块不显示），后端也不给老数据补空串 ——
+  补了会分不清「论文没写」和「当时还没这个字段」。
+- `concepts` 是「概念：一句大白话」的列表，给非本领域听众看的；`strengths` 与
+  `limitations` **分开写**：用户要的是优缺点评价，不是一个只挑刺的清单。
+- 下载的解读 `.md` 用的是同一套标题与顺序（`pipeline._DOC_LABELS`），
+  页面和文件里看到的解读必须是同一个东西。
 
 ### 账号、归属与可见性（V2）
 

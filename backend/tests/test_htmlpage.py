@@ -840,6 +840,78 @@ class TestTextNeverOverflowsItsBox:
         assert 14 <= size < 18, f"长图注应当把字号压到 18 以下（实际 {size}）"
 
 
+_COVER_LINES_JS = """(() => {
+  const el = document.querySelector('.cover-headline');
+  if (!el) return null;
+  // 逐字量行盒、再把同一行的字拼回来 —— 这样读到的是**浏览器真正排出来的断行**，
+  // 而不是我们写进 HTML 的那个 `<br>`（万一某行太宽被软折，这里就会多出一行）。
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const rows = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    for (let i = 0; i < node.length; i++) {
+      const r = document.createRange(); r.setStart(node, i); r.setEnd(node, i + 1);
+      const rects = r.getClientRects();
+      if (!rects.length) continue;
+      const top = Math.round(rects[0].top);
+      let row = rows.find(x => Math.abs(x.top - top) <= 2);
+      if (!row) { row = { top: top, right: 0, text: '' }; rows.push(row); }
+      row.text += node.data[i];
+      row.right = Math.max(row.right, Math.round(rects[0].right));
+    }
+  }
+  rows.sort((a, b) => a.top - b.top);
+  const panel = document.querySelector('.cover-panel').getBoundingClientRect();
+  return JSON.stringify({
+    size: parseFloat(getComputedStyle(el).fontSize),
+    lines: rows.map(r => r.text),
+    widestRight: rows.length ? Math.max(...rows.map(r => r.right)) : 0,
+    panelRight: Math.round(panel.right),
+  });
+})()"""
+
+
+@requires_chrome
+class TestCoverHeadlineBreaksAtPunctuation:
+    """封面大字断在哪 —— 量的是**浏览器真正排出来的那几行**。
+
+    断行是 Python 算好、用 `<br>` 钉住的（`design.hook_lines`）。交给 CSS 自己折的话，
+    「显存直降 68.7%！Qwen/Kimi 同款」会断成「…Qwen/Kimi」+「同款」，第二行只剩一个词。
+    这里验证两件事：断点确实落在标点上，而且**没有被浏览器软折**成更多行
+    —— 后者说明我们估算的宽度和 Chrome 的真实度量对得上（估错了就会多出一行）。
+    """
+
+    HEADLINE = "显存直降 68.7%！Qwen/Kimi 同款"
+
+    def _measure(self, session, tmp_path, headline=None):
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import scene_page
+
+        scene = _scene(
+            tmp_path,
+            kind="cover",
+            image=make_png(tmp_path / "page.png", 600, 780, (235, 235, 238)),
+            headline=headline or self.HEADLINE,
+            caption="STEPQuant: When and Where Errors Matter",
+        )
+        session.open_page(scene_page(scene, PORTRAIT), work_dir=tmp_path)
+        return json.loads(session._evaluate(_COVER_LINES_JS))
+
+    def test_chrome_really_renders_the_punctuation_break(self, session, tmp_path):
+        info = self._measure(session, tmp_path)
+        assert info["lines"] == ["显存直降 68.7%！", "Qwen/Kimi 同款"], info
+
+    def test_the_widest_line_stays_inside_the_panel(self, session, tmp_path):
+        info = self._measure(session, tmp_path)
+        assert info["widestRight"] <= info["panelRight"] - 8, (
+            f"有一行顶到面板边缘了：{info['widestRight']} vs {info['panelRight']}"
+        )
+
+    def test_one_line_title_is_not_broken(self, session, tmp_path):
+        info = self._measure(session, tmp_path, headline="4 比特超 INT8，显存降七成")
+        assert info["lines"] == ["4 比特超 INT8，显存降七成"], info
+
+
 _SUBTITLE_LINES_JS = """(() => {
   const el = document.querySelector('.subtitle-text');
   if (!el) return null;

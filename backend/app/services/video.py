@@ -1141,29 +1141,12 @@ def _image_data_uri(path: Path, *, max_side: int = 1400) -> tuple[str, int, int]
 
 
 def _wrap(text: str, max_units: float) -> list[str]:
-    """按全角单位宽度折行（西文按 0.55 计）。"""
-    from .illustration import _char_width, _tokenize
+    """按全角单位宽度折行（西文按 0.55 计）。
 
-    text = " ".join((text or "").split())
-    if not text:
-        return []
-
-    lines: list[str] = []
-    current = ""
-    width = 0.0
-    for token in _tokenize(text):
-        token_width = sum(_char_width(c) for c in token)
-        if current and width + token_width > max_units:
-            lines.append(current.strip())
-            current = ""
-            width = 0.0
-        if not current and token == " ":
-            continue
-        current += token
-        width += token_width
-    if current.strip():
-        lines.append(current.strip())
-    return lines
+    实现在 `design.wrap_units`：折行规则 HTML 与 SVG 两条渲染路径必须共用，
+    所以它跟封面标题的断行规则（`design.hook_lines`）放在一起。这里只留旧名字。
+    """
+    return wrap_units(text, max_units)
 
 
 def _fit_subtitle(
@@ -1267,60 +1250,6 @@ def render_chrome(
         include_image=False,
         layout=layout,
     )
-
-
-def cover_panel_width(layout: Layout) -> float:
-    """玻璃面板的宽度：卡片宽减去两侧留白，再压到上限（横版卡片很宽，不能一整条铺满）。"""
-    return min(layout.image_box_w - COVER_PAD * 2, COVER_PANEL_MAX_W)
-
-
-def cover_title_layout(
-    headline: str, caption: str, layout: Layout
-) -> tuple[float, list[str], list[str], float, float]:
-    """封面文字怎么排：返回 `(标题字号, 标题行, 原题行, 标题块高, 面板高)`。
-
-    字号从 `COVER_HEADLINE_MAX_FONT` 往下试，直到标题能塞进两行 ——
-    「爆款标题」是我们让模型写的，长一两个字很正常，缩字号比截断句子体面。
-    再小到 `COVER_HEADLINE_MIN_FONT` 还放不下就截断（加省略号）。
-    """
-    text = " ".join((headline or "").split())
-    inner = cover_panel_width(layout) - COVER_PANEL_PAD * 2
-    if not text:
-        return 0.0, [], [], 0.0, 0.0
-
-    size = float(COVER_HEADLINE_MIN_FONT)
-    lines: list[str] = []
-    for candidate in range(COVER_HEADLINE_MAX_FONT, COVER_HEADLINE_MIN_FONT - 1, -2):
-        # `_wrap` 的单位宽度就是字号（一个全角字 ≈ 1 个字号宽），所以像素宽 ÷ 字号 = 单位数
-        wrapped = _wrap(text, inner / candidate)[:COVER_HEADLINE_MAX_LINES + 1]
-        if len(wrapped) <= COVER_HEADLINE_MAX_LINES:
-            size, lines = float(candidate), wrapped
-            break
-    else:
-        size = float(COVER_HEADLINE_MIN_FONT)
-        lines = _wrap(text, inner / size)[:COVER_HEADLINE_MAX_LINES]
-        if lines:
-            lines[-1] = lines[-1].rstrip("，。、,.;") + "…"
-
-    block_h = len(lines) * size * COVER_HEADLINE_LEADING
-    sub_lines = _wrap(caption, inner / COVER_SUBTITLE_FONT)[:COVER_SUBTITLE_MAX_LINES]
-    sub_h = len(sub_lines) * COVER_SUBTITLE_FONT * 1.4
-    panel_h = (
-        COVER_PANEL_PAD * 2
-        + block_h
-        + COVER_ACCENT_GAP
-        + COVER_ACCENT_H
-        + (COVER_ACCENT_GAP + sub_h if sub_lines else 0)
-    )
-    return size, lines, sub_lines, block_h, panel_h
-
-
-def cover_headline_layout(
-    headline: str, layout: Layout, *, max_lines: int = COVER_HEADLINE_MAX_LINES
-) -> tuple[float, list[str], float]:
-    """只要标题那部分（`(字号, 行, 文字块高)`）—— 给测试和别处单独用。"""
-    size, lines, _, block_h, _ = cover_title_layout(headline, "", layout)
-    return size, lines[:max_lines], block_h
 
 
 def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:

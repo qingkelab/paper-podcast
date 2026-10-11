@@ -3,6 +3,8 @@ import type { MockPaperMeta } from '../mockPapers'
 
 /** Attention Is All You Need 的英文版解读与双人播客脚本（Mock 双语演示用） */
 export const EN_ANALYSIS: MockAnalysis = {
+  question:
+    'Can attention alone perform sequence transduction — matching or beating the best recurrent and convolutional models on translation quality while also training far more in parallel?',
   background:
     'Before 2017, sequence-to-sequence modeling was owned by RNNs and LSTMs. Those models compute one time step at a time: the hidden state at step t depends on step t-1, so the GPU mostly sits idle, and the information path between any two positions is O(n), which means long-range dependencies get diluted somewhere in the middle. Bahdanau attached attention to an encoder-decoder in 2014 to ease the alignment problem, but it stayed a helper module bolted onto a recurrent network. Convolutional routes like ByteNet can parallelize, yet two distant positions still sit O(log n) layers apart. The paper asks one blunt question: can attention alone perform sequence transduction?',
   innovations: [
@@ -18,6 +20,16 @@ export const EN_ANALYSIS: MockAnalysis = {
     'WMT 2014 English-German and English-French were the main battleground. Base trained 12 hours on eight P100s and big trained 3.5 days. English-German hit 28.4 BLEU, more than 2 BLEU above the best prior ensemble; English-French reached 41.8 BLEU with a single model. Cutting eight heads to one head cost 0.9 BLEU, and cutting head dimension from 64 to 32 cost 0.7 BLEU. On WSJ constituency parsing they reached F1 92.7 against a previous best of 91.7.',
   conclusion:
     'The conclusion is that sequence transduction does not need recurrence. The Transformer set a new state of the art on translation while training more cheaply, and more importantly it shortened the interaction path between any two positions to a constant and organized computation into matrix multiplies that can be laid out across the hardware. That is what finally made it practical to keep scaling the model up. The authors offered attention visualizations as corroborating evidence: different heads really did specialize, some tracking adjacent words, others following verb-object relations or resolving syntactic dependencies.',
+  concepts: [
+    'Self-attention: every position looks at every other position and pulls back a weighted average of their information, so any two positions connect in one step instead of propagating along a chain.',
+    'Multi-head attention: the same attention is run eight times in parallel on 64-dimensional subspaces, each head free to track a different relation (adjacent words, verb-object pairs, coreference), and the results are concatenated back.',
+    'Positional encoding: attention is order-blind on its own, so the index of each token has to be injected separately or word order becomes invisible to the model.',
+  ],
+  strengths: [
+    'Complexity analysis, a like-for-like equal-compute comparison and component-by-component ablations are reported together, so the gain is attributable to the architecture rather than to extra parameters or data.',
+    'The ablations are quantitative: eight heads down to one costs 0.9 BLEU, head dimension 64 down to 32 costs 0.7 BLEU — none of the design choices is decorative.',
+    'The setup is reproducible (data, 8x P100 training time, optimizer and warmup schedule are all specified), so later work can compare on the same footing.',
+  ],
   limitations: [
     'Self-attention is quadratic in sequence length: encoding 2,000 tokens already means four million relevance scores, so memory and compute both get expensive on long documents and long audio.',
     'Sinusoidal position encodings extrapolate poorly, so performance drops once the input is clearly longer than the training length, and the paper never systematically tested very long inputs.',

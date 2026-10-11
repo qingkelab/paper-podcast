@@ -821,15 +821,20 @@ def _markdown_section(heading: str, body: Any) -> list[str]:
 _DOC_LABELS = {
     "zh": {
         "authors": "作者",
+        "affiliations": "作者机构",
         "published": "发表",
         "keywords": "关键词",
         "abstract": "摘要",
+        # 顺序 = 解读的阅读顺序（同 prompts.ANALYSIS_SYSTEM 里那段固定顺序）
         "sections": (
             ("研究背景", "background"),
+            ("研究问题", "question"),
             ("核心创新点", "innovations"),
             ("研究方法", "method"),
-            ("实验结果", "experiments"),
-            ("核心结论", "conclusion"),
+            ("关键数据", "experiments"),
+            ("主要发现与结论", "conclusion"),
+            ("关键概念（通俗解释）", "concepts"),
+            ("优点", "strengths"),
             ("存在不足", "limitations"),
             ("行业应用价值", "value"),
             ("未来研究方向", "future"),
@@ -840,15 +845,19 @@ _DOC_LABELS = {
     },
     "en": {
         "authors": "Authors",
+        "affiliations": "Affiliations",
         "published": "Published",
         "keywords": "Keywords",
         "abstract": "Abstract",
         "sections": (
             ("Background", "background"),
+            ("Research question", "question"),
             ("Key contributions", "innovations"),
             ("Method", "method"),
-            ("Experiments", "experiments"),
-            ("Conclusion", "conclusion"),
+            ("Key numbers", "experiments"),
+            ("Findings and conclusion", "conclusion"),
+            ("Key concepts, in plain language", "concepts"),
+            ("Strengths", "strengths"),
             ("Limitations", "limitations"),
             ("Why it matters", "value"),
             ("Open questions", "future"),
@@ -871,6 +880,8 @@ def render_analysis_markdown(episode: dict[str, Any], language: str = "zh") -> s
     facts: list[str] = []
     if meta.get("authors"):
         facts.append(f"**{labels['authors']}**：{', '.join(meta['authors'])}")
+    if meta.get("affiliations"):
+        facts.append(f"**{labels['affiliations']}**：{', '.join(meta['affiliations'])}")
     if meta.get("venue") or meta.get("year"):
         facts.append(
             f"**{labels['published']}**：{meta.get('venue') or ''} {meta.get('year') or ''}".strip()

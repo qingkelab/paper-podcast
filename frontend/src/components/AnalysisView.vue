@@ -26,13 +26,23 @@ interface ListCard {
 
 type Card = TextCard | ListCard
 
+/**
+ * 卡片的顺序就是**解读的阅读顺序**（同 `prompts.ANALYSIS_SYSTEM` 里那段固定顺序）：
+ * 这是谁的工作 → 背景与问题 → 方法 → 关键数据 → 结论 → 概念解释 → 创新 → 优缺点 → 价值与方向。
+ *
+ * 新增的 `question` / `concepts` / `strengths` 是可选字段：老单集没有它们，
+ * 下面按空值过滤，缺了就不显示这张卡（不显示和「论文未涉及」是两回事）。
+ */
 const CARDS: Array<{ key: keyof Analysis; title: string; kind: 'text' | 'list'; wide: boolean }> = [
   { key: 'background', title: '研究背景', kind: 'text', wide: true },
-  { key: 'innovations', title: '创新点', kind: 'list', wide: false },
+  { key: 'question', title: '研究问题', kind: 'text', wide: false },
+  { key: 'innovations', title: '创新点', kind: 'list', wide: true },
   { key: 'method', title: '研究方法', kind: 'text', wide: true },
-  { key: 'experiments', title: '实验结果', kind: 'text', wide: false },
-  { key: 'conclusion', title: '核心结论', kind: 'text', wide: false },
-  { key: 'limitations', title: '存在不足', kind: 'list', wide: true },
+  { key: 'experiments', title: '关键数据', kind: 'text', wide: false },
+  { key: 'conclusion', title: '主要发现与结论', kind: 'text', wide: false },
+  { key: 'concepts', title: '关键概念（通俗解释）', kind: 'list', wide: true },
+  { key: 'strengths', title: '优点', kind: 'list', wide: false },
+  { key: 'limitations', title: '存在不足', kind: 'list', wide: false },
   { key: 'value', title: '行业价值', kind: 'text', wide: false },
   { key: 'future', title: '未来方向', kind: 'list', wide: false },
 ]

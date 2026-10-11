@@ -3,6 +3,8 @@ import type { MockPaperMeta } from '../mockPapers'
 
 /** Deep Residual Learning（ResNet）的英文版解读与双人播客脚本（Mock 双语演示用） */
 export const EN_ANALYSIS: MockAnalysis = {
+  question:
+    'Does widening or deepening a network have to help? Concretely: why does a deeper plain network have higher training error than a shallower one even though the extra layers could learn to do nothing, and can a small structural change remove that degradation?',
   background:
     'Before ResNet, progress in image classification came almost entirely from stacking networks deeper: AlexNet had 8 layers, VGG had 19. But the authors noticed something odd. Take a VGG-style architecture from 20 layers to 56 layers and both training error and test error get worse. That is not overfitting, because the deeper network also does worse on the training set. And it is not simply vanishing gradients either, since BatchNorm plus sensible initialization already lets networks with tens of layers converge. The paper calls this degradation: the extra layers cannot be trained into an identity mapping, so adding depth actively hurts optimization. On ImageNet, a plain 34-layer network has a top-1 error more than 2 points higher than a plain 18-layer one.',
   innovations: [
@@ -18,6 +20,16 @@ export const EN_ANALYSIS: MockAnalysis = {
     'On ImageNet, ResNet-34 reaches 3.76% top-5 error, while ResNet-152 reaches 4.49% as a single model and 3.57% as an ensemble, winning the ILSVRC 2015 classification track. On CIFAR-10, residuals let a 110-layer network hit 6.43% error, while the 1202-layer version overfits and climbs back to 7.93%. For detection, swapping the Faster R-CNN backbone to ResNet-101 takes COCO mAP from 21.2 to 27.2. Training uses SGD with momentum 0.9 and an initial learning rate of 0.1.',
   conclusion:
     'The core conclusion is that depth is not the root of the problem; whether identity mapping can be learned is. Residual connections turn the extra layers into an optional fine-tune: train them well and they contribute new features, train them badly and they collapse back into an identity path, so the network is at worst no worse than its shallower counterpart. The change is small enough to be a single addition, yet it makes networks above 100 layers stably trainable for the first time, at lower compute than the shallow large models of the same era.',
+  concepts: [
+    'Degradation: adding depth makes training error worse, and it is neither overfitting nor vanishing gradients — the extra layers fail even at learning to do nothing.',
+    'Residual learning: instead of asking a few layers to fit the target mapping, ask them for the change on top of the input, then add the input back; doing nothing just means driving that change to zero.',
+    'Identity shortcut: the parameter-free path that carries the input straight to the output. It costs nothing and is what keeps hundred-layer stacks trainable.',
+  ],
+  strengths: [
+    'The problem is defined sharply: degradation is separated from overfitting and vanishing gradients with controlled experiments before any solution is proposed.',
+    'The fix is minimal and general — one addition, no extra parameters, no change to the convolution — and it ships with a controlled comparison of bottleneck blocks and shortcut variants.',
+    'The evidence chain is complete: 20/56/110-layer comparisons on CIFAR-10, 3.57% top-5 error for a 152-layer single model on ImageNet, and measured gradient magnitudes.',
+  ],
   limitations: [
     'The explanation of degradation stays at the level of intuition. The paper never gives a theoretical account of why deep networks struggle to fit identity mappings; the more formal discussion was added by later work.',
     'Residual connections do not solve every deep-network problem. On CIFAR-10 the 1202-layer network actually gets worse, rising to 7.93% error, which shows that extreme depth still overfits on small datasets.',

@@ -30,6 +30,8 @@ const metaItems = computed(() => {
   if (!value) return []
   const items: Array<{ label: string; value: string }> = []
   if (value.authors?.length) items.push({ label: '作者', value: value.authors.join('、') })
+  // 作者单位（论文首页的署名机构）。论文没写就没有这一行 —— 不猜、也不留空占位。
+  if (value.affiliations?.length) items.push({ label: '作者机构', value: value.affiliations.join('、') })
   if (value.year) items.push({ label: '年份', value: String(value.year) })
   if (value.venue) items.push({ label: '会议 / 期刊', value: value.venue })
   if (value.arxiv_id) items.push({ label: 'arXiv', value: value.arxiv_id })

@@ -36,6 +36,9 @@ class EpisodeOptions(BaseModel):
 class PaperMeta(BaseModel):
     title: str | None = None
     authors: list[str] = Field(default_factory=list)
+    # **作者单位**（首页标题区的署名）。只在论文原文写了的时候才有值 ——
+    # 拉不到就是空数组：机构猜错比不写更糟，解读里会照它讲「这是谁的工作」。
+    affiliations: list[str] = Field(default_factory=list)
     abstract: str | None = None
     year: int | None = None
     venue: str | None = None
@@ -44,11 +47,23 @@ class PaperMeta(BaseModel):
 
 
 class Analysis(BaseModel):
+    """结构化解读。字段顺序就是解读的阅读顺序（见 prompts.ANALYSIS_SYSTEM）。
+
+    `question` / `concepts` / `strengths` 是后加的三个字段：老单集库里没有它们，
+    所以前端把它们当**可选**渲染（缺了就整块不显示），后端也不会给老数据补空串。
+    """
+
     background: str = ""
+    # 研究问题（可以判真假的问句）—— 用户要的「研究目的和问题」单独成一段
+    question: str = ""
     innovations: list[str] = Field(default_factory=list)
     method: str = ""
     experiments: str = ""
     conclusion: str = ""
+    # 新颖概念的通俗解释（「概念：大白话」）
+    concepts: list[str] = Field(default_factory=list)
+    # 优点。和 limitations 分开写：用户要的是**优缺点**评价，不是一个「不足」列表
+    strengths: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     value: str = ""
     future: list[str] = Field(default_factory=list)

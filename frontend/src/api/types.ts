@@ -32,6 +32,11 @@ export interface EpisodeOptions {
 export interface PaperMeta {
   title: string | null
   authors: string[] | null
+  /**
+   * 作者单位（论文首页的署名机构）。**取不到就是空数组** ——
+   * 机构猜错比不写更糟：解读里会照它讲「这是谁的工作」。
+   */
+  affiliations?: string[] | null
   abstract: string | null
   year: number | null
   venue: string | null
@@ -42,10 +47,21 @@ export interface PaperMeta {
 /** 结构化论文解读 */
 export interface Analysis {
   background: string | null
+  /**
+   * 研究问题（可以判真假的问句）。
+   *
+   * 为什么是可选的：老单集库里存的解读没有这个字段，界面缺了就整块不显示，
+   * 不必给历史数据补空串（补了反而分不清「论文没写」和「当时没这个字段」）。
+   */
+  question?: string | null
   innovations: string[] | null
   method: string | null
   experiments: string | null
   conclusion: string | null
+  /** 新颖概念的通俗解释（「概念：大白话」） */
+  concepts?: string[] | null
+  /** 优点。与 limitations 分开：解读要的是**优缺点**，不只是挑刺 */
+  strengths?: string[] | null
   limitations: string[] | null
   value: string | null
   future: string[] | null

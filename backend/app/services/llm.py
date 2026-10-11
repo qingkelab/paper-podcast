@@ -499,6 +499,9 @@ def _normalize_meta(value: Any) -> dict[str, Any]:
     return {
         "title": _as_str(data.get("title")) or None,
         "authors": _as_list(data.get("authors")),
+        # 作者机构（首页单位署名）。**取不到就是空数组**，绝不从别处补 ——
+        # 猜错的机构比不写更糟（解读里会照它讲「这是谁的工作」）。
+        "affiliations": _as_list(data.get("affiliations")),
         "abstract": _as_str(data.get("abstract")) or None,
         "year": year,
         "venue": _as_str(data.get("venue")) or None,
@@ -511,10 +514,13 @@ def _normalize_analysis(value: Any) -> dict[str, Any]:
     data = value if isinstance(value, dict) else {}
     return {
         "background": _as_str(data.get("background")),
+        "question": _as_str(data.get("question")),
         "innovations": _as_list(data.get("innovations")),
         "method": _as_str(data.get("method")),
         "experiments": _as_str(data.get("experiments")),
         "conclusion": _as_str(data.get("conclusion")),
+        "concepts": _as_list(data.get("concepts")),
+        "strengths": _as_list(data.get("strengths")),
         "limitations": _as_list(data.get("limitations")),
         "value": _as_str(data.get("value")),
         "future": _as_list(data.get("future")),
@@ -691,6 +697,7 @@ _MOCK_META_POOL = [
     {
         "title": "Attention Is All You Need",
         "authors": ["Ashish Vaswani", "Noam Shazeer", "Niki Parmar"],
+        "affiliations": ["Google Brain", "Google Research", "University of Toronto"],
         "year": 2017,
         "venue": "NeurIPS",
         "arxiv_id": "1706.03762",
@@ -701,6 +708,7 @@ _MOCK_META_POOL = [
     {
         "title": "Deep Residual Learning for Image Recognition",
         "authors": ["Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun"],
+        "affiliations": ["Microsoft Research Asia"],
         "year": 2016,
         "venue": "CVPR",
         "arxiv_id": "1512.03385",
@@ -711,6 +719,7 @@ _MOCK_META_POOL = [
     {
         "title": "LoRA: Low-Rank Adaptation of Large Language Models",
         "authors": ["Edward J. Hu", "Yelong Shen", "Phillip Wallis"],
+        "affiliations": ["Microsoft", "Microsoft Azure AI"],
         "year": 2022,
         "venue": "ICLR",
         "arxiv_id": "2106.09685",
@@ -749,6 +758,10 @@ def _mock_analysis_en(topic: str) -> dict[str, Any]:
             "to scale. The paper asks a blunt question: can a more general mechanism do better "
             "at the same or lower compute cost?"
         ),
+        "question": (
+            "The paper asks whether attention alone, without any sequential recurrence, can match or "
+            "beat the best sequence models at equal or lower compute."
+        ),
         "innovations": [
             "It replaces the sequential structure with a single attention mechanism, cutting the "
             "path length between any two positions from linear to constant and making training "
@@ -779,6 +792,22 @@ def _mock_analysis_en(topic: str) -> dict[str, Any]:
             "alone is enough for strong results, and it has a structural advantage in parallelism "
             "and scalability."
         ),
+        "concepts": [
+            "Self-attention: every position looks at every other position and pulls back a weighted "
+            "average of their information, so any two positions connect in one step instead of "
+            "propagating through a chain.",
+            "Multi-head: the same attention is run several times in parallel, each head tracking a "
+            "different kind of relation, and the results are concatenated.",
+            "Positional encoding: attention itself is order-blind, so the index of each token has to "
+            "be injected separately or word order becomes invisible.",
+        ],
+        "strengths": [
+            "Complexity analysis, a like-for-like compute-budget comparison and ablations are reported "
+            "together, so the gain is attributable to the architecture rather than to scale.",
+            "Each component (multi-head, positional encoding) is ablated, showing none of them is decorative.",
+            "The setup is reproducible: data, compute and metrics are specified, so later work can compare "
+            "on the same footing.",
+        ],
         "limitations": [
             "Self-attention cost grows quadratically with sequence length, which becomes prohibitive "
             "for long documents.",
@@ -812,6 +841,10 @@ def mock_analysis(
             "导致训练难以并行、规模难以扩大。论文要回答的是：能否用一种更通用的机制，"
             "在同等甚至更少的计算量下取得更好的效果。"
         ),
+        "question": (
+            "论文要回答的是：在不依赖串行结构的前提下，只用注意力机制能否在同等或更低的计算量下，"
+            "取得不低于此前最优序列模型的翻译质量。"
+        ),
         "innovations": [
             "用统一的注意力机制替换了原有的串行结构，使计算路径长度从线性降到常数级，训练可完全并行。",
             "通过多头机制让模型在不同表示子空间并行建模，相比单头注意力在同等参数下效果更稳定。",
@@ -833,6 +866,19 @@ def mock_analysis(
             "论文证明了序列建模不必依赖串行结构，注意力机制本身足以支撑强性能，"
             "并且这种结构在并行度和可扩展性上具有结构性优势。"
         ),
+        "concepts": [
+            "自注意力：让序列里每个位置都去看一遍其他所有位置，然后按「有多相关」加权把信息取回来，"
+            "所以任意两处的联系都只需要一步，不必像循环网络那样一步步传递。",
+            "多头：把同一套注意力并排做几份，每份关注不同的关系（比如语法搭配、指代、位置远近），"
+            "最后拼起来，比只做一份更稳。",
+            "位置编码：注意力本身分不出先后顺序，得额外把「第几个词」注入进去，"
+            "否则「狗咬人」和「人咬狗」在模型眼里是一样的。",
+        ],
+        "strengths": [
+            "把复杂度分析、公平计算预算下的对比和消融放在一起做，收益能归因到结构本身，而不是参数量堆叠。",
+            "消融实验逐个拆掉部件（多头、位置编码），说明每个设计都不是装饰。",
+            "结论可复现：训练配置、数据规模和指标都给了，后来的工作能在同一套设置上继续比。",
+        ],
         "limitations": [
             "自注意力的计算与内存开销随序列长度呈平方增长，长文档场景下代价迅速变得不可接受。",
             "论文的主要验证集中在机器翻译，向其他模态的泛化能力在当时尚未充分验证。",

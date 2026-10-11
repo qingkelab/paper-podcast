@@ -387,10 +387,13 @@ function metaFor(paper: MockPaper, title: string): PaperMeta {
 function cloneAnalysis(analysis: MockPaper['analysis']): Analysis {
   return {
     background: analysis.background,
+    question: analysis.question,
     innovations: [...analysis.innovations],
     method: analysis.method,
     experiments: analysis.experiments,
     conclusion: analysis.conclusion,
+    concepts: analysis.concepts ? [...analysis.concepts] : undefined,
+    strengths: analysis.strengths ? [...analysis.strengths] : undefined,
     limitations: [...analysis.limitations],
     value: analysis.value,
     future: [...analysis.future],
@@ -1864,6 +1867,7 @@ function buildAnalysisMarkdown(
 
   lines.push(`# ${meta?.title ?? episode.title}`, '')
   if (meta?.authors?.length) lines.push(`**作者**：${meta.authors.join(', ')}`)
+  if (meta?.affiliations?.length) lines.push(`**作者机构**：${meta.affiliations.join(', ')}`)
   if (meta?.year) lines.push(`**发表**：${meta.venue ?? meta.year}`)
   if (meta?.arxiv_id) {
     lines.push(`**arXiv**：[${meta.arxiv_id}](https://arxiv.org/abs/${meta.arxiv_id})`)
@@ -1887,10 +1891,13 @@ function buildAnalysisMarkdown(
 
   section('摘要', meta?.abstract)
   section('研究背景', analysis.background)
+  section('研究问题', analysis.question)
   listSection('核心创新点', analysis.innovations)
   section('研究方法', analysis.method)
-  section('实验结果', analysis.experiments)
-  section('核心结论', analysis.conclusion)
+  section('关键数据', analysis.experiments)
+  section('主要发现与结论', analysis.conclusion)
+  listSection('关键概念（通俗解释）', analysis.concepts)
+  listSection('优点', analysis.strengths)
   listSection('存在不足', analysis.limitations)
   section('行业应用价值', analysis.value)
   listSection('未来研究方向', analysis.future)

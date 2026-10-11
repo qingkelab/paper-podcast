@@ -700,3 +700,119 @@ class TestAnalysisPromptLanguage:
         # 论文没写某个字段时的兜底文案也要跟着语言走
         assert "论文未涉及" in prompts.analysis_system("zh")
         assert "Not covered in the paper." in prompts.analysis_system("en")
+
+
+class TestAnalysisCoversTheWholeReadingOrder:
+    """解读要按「谁的工作 → 背景与问题 → 方法 → 关键数据 → 结论 → 概念解释 → 创新 → 优缺点 → 方向」走。
+
+    用户给的结构里有两件事原来的解读**没有**：研究问题（单独成句）和
+    「新颖概念的通俗解释」；还有一件事做了一半：只写了「不足」，
+    没有正面写过「优点」。所以新增了 `question` / `concepts` / `strengths`。
+    """
+
+    def _prompt_shape(self, language: str = "zh") -> tuple[set[str], set[str]]:
+        import json
+        import re
+
+        system = prompts.analysis_system(language)
+        match = re.search(r"\{.*\}", system, re.S)
+        assert match, "prompt 里找不到 JSON 结构说明"
+        block = json.loads(match.group(0))
+        return set(block["paper_meta"]), set(block["analysis"])
+
+    def test_prompt_model_and_normalizer_agree_on_the_fields(self):
+        """prompt 要的字段 == 落库的模型 == 归一化函数 == Mock 给的字段。
+
+        这三处最容易漂移：prompt 里加了一个字段、模型里没有 → 模型白写一段；
+        模型里有、prompt 里没要 → 界面上永远空着。两边都不报错，
+        所以只能拿一条测试钉住。
+        """
+        from app.models import Analysis, PaperMeta
+
+        model_fields = set(Analysis.model_fields)
+        meta_fields = set(PaperMeta.model_fields)
+        for language in ("zh", "en"):
+            prompt_meta, prompt_analysis = self._prompt_shape(language)
+            assert prompt_analysis == model_fields, f"{language} 的 analysis 字段对不上"
+            assert prompt_meta == meta_fields, f"{language} 的 paper_meta 字段对不上"
+
+        meta, mock = mock_analysis("Attention Is All You Need", title_hint="Attention")
+        assert set(mock) == model_fields, f"Mock 落下的解读字段：{model_fields ^ set(mock)}"
+        assert set(meta) == meta_fields, f"Mock 落下的元信息字段：{meta_fields ^ set(meta)}"
+
+    def test_new_fields_survive_normalisation(self):
+        from app.services.llm import _normalize_analysis, _normalize_meta
+
+        analysis = _normalize_analysis(
+            {
+                "background": "背景",
+                "question": "它到底能不能成立？",
+                "concepts": ["自注意力：每个位置都看一遍其他位置"],
+                "strengths": ["对照组做得很干净"],
+            }
+        )
+        assert analysis["question"] == "它到底能不能成立？"
+        assert analysis["concepts"] == ["自注意力：每个位置都看一遍其他位置"]
+        assert analysis["strengths"] == ["对照组做得很干净"]
+
+        # 老数据（模型没给）→ 空值，不是 None、也不是报错
+        empty = _normalize_analysis({})
+        assert empty["question"] == "" and empty["concepts"] == [] and empty["strengths"] == []
+
+        meta = _normalize_meta({"title": "T", "affiliations": ["Google Brain"]})
+        assert meta["affiliations"] == ["Google Brain"]
+        assert _normalize_meta({})["affiliations"] == []
+
+    def test_affiliations_must_come_from_the_paper(self):
+        """作者机构只能来自原文 —— 猜错的机构比不写更糟（解读会照它讲「这是谁的工作」）。"""
+        zh = prompts.analysis_system("zh")
+        en = prompts.analysis_system("en")
+        assert "作者机构只能来自论文原文" in zh
+        assert "论文未标注机构" in zh
+        assert "Affiliations come from the paper only" in en
+
+    def test_affiliations_reach_the_podcast_brief(self):
+        """机构要**传到脚本那一步**，否则播客里永远不会点出这是谁的工作。"""
+        messages = prompts.build_script_messages(
+            {"background": "背景", "innovations": ["a"]},
+            {"title": "T", "affiliations": ["Google Brain", "University of Toronto"]},
+            duration_min=3,
+            level="intro",
+            language="zh",
+        )
+        body = messages[-1]["content"]
+        assert "【作者机构】Google Brain、University of Toronto" in body
+        # 没有机构时不许出现这一行（模型手里没有的事实，宁可不说）
+        bare = prompts.build_script_messages(
+            {"background": "背景", "innovations": ["a"]},
+            {"title": "T"},
+            duration_min=3,
+            level="intro",
+            language="zh",
+        )[-1]["content"]
+        assert "【作者机构】" not in bare
+
+    def test_markdown_export_keeps_the_same_sections(self):
+        """下载的解读 .md 要用同一套标题与顺序，否则「解读」在页面上和文件里是两个东西。"""
+        from app.services.pipeline import render_analysis_markdown
+
+        episode = {
+            "title": "T",
+            "paper_meta": {"authors": ["A"], "affiliations": ["Google Brain"]},
+            "analysis": {
+                "background": "背景",
+                "question": "问题？",
+                "concepts": ["概念：大白话"],
+                "strengths": ["优点一"],
+                "limitations": ["不足一"],
+            },
+            "script": {},
+        }
+        text = render_analysis_markdown(episode, "zh")
+        for heading in ("**作者机构**：Google Brain", "## 研究问题", "## 关键概念（通俗解释）", "## 优点"):
+            assert heading in text, text
+        assert text.index("## 研究背景") < text.index("## 研究问题") < text.index("## 关键概念（通俗解释）")
+
+        english = render_analysis_markdown(episode, "en")
+        assert "**Affiliations**：Google Brain" in english
+        assert "## Research question" in english and "## Strengths" in english

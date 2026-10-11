@@ -3,6 +3,8 @@ import type { MockPaperMeta } from '../mockPapers'
 
 /** LoRA: Low-Rank Adaptation 的英文版解读与双人播客脚本（Mock 双语演示用） */
 export const EN_ANALYSIS: MockAnalysis = {
+  question:
+    'Does adapting a large model really require updating every weight? If the fine-tuning update itself lives in a low-rank subspace, can a pair of small matrices — with the pretrained weights frozen — match full fine-tuning?',
   background:
     'Back in 2021, if you wanted to move a pretrained model like BERT or GPT onto a downstream task, the default move was still full fine-tuning: update every weight for every task and keep a separate copy of the model for each one. GPT-3 has 175 billion parameters, and a single fp16 copy of those weights is 350 gigabytes. The other camp trained only a handful of parameters instead. Adapters insert a small bottleneck module into every layer; prefix tuning prepends learnable vectors to the input. Both cut trainable parameters dramatically, but both also change the architecture, and adapters pile inference cost on top, roughly a 21 percent latency increase. So the question became: can we leave the architecture alone, add nothing to inference, and still push trainable parameters down to the one-in-ten-thousand range?',
   innovations: [
@@ -18,6 +20,16 @@ export const EN_ANALYSIS: MockAnalysis = {
     'The paper validates at three scales. GPT-2 Medium has 355 million parameters; on E2E natural language generation, full fine-tuning scores 68.2 BLEU while LoRA at r equals 4 reaches 70.4 with only 0.35 million trainable parameters, about one thousandth of the full model. On GLUE, RoBERTa and DeBERTa match or slightly beat full fine-tuning. On GPT-3 175B, trainable parameters drop to 4.7 million and checkpoints shrink from 350GB to 35MB. On latency, adapters run at about 1.21 times the baseline, while LoRA merged back into the weights matches the baseline exactly.',
   conclusion:
     'The conclusion is that fine-tuning a large model does not have to mean updating every weight. Task adaptation simply needs far less freedom than the total parameter count suggests. Constrain the update to a low-rank space and you can match full fine-tuning quality while cutting trainable parameters, optimizer state and storage by orders of magnitude, all without adding inference latency. The paper moves the bar for fine-tuning large models from needing a cluster on par with the pretraining run down to possibly getting by on one card with a reasonable amount of memory.',
+  concepts: [
+    'Low-rank update: the change to a weight matrix is factored into two thin matrices, cutting parameters from width x height down to width x r plus r x height, with r typically 1 to 64.',
+    'Frozen backbone: the pretrained weights never move and only the small pair is trained, so there is no catastrophic forgetting and almost no extra memory.',
+    'Merging back: at inference B x A is added into the original weight, so the architecture and latency are unchanged — the reason it travels better to production than adapter-style methods.',
+  ],
+  strengths: [
+    'The hypothesis is measured, not asserted: a singular-value analysis of GPT-3 weight updates shows the effective rank is genuinely low.',
+    'The comparison is clean — adapter and prefix-tuning baselines at equal trainable-parameter counts, with variance across random seeds reported.',
+    'The engineering payoff is immediately usable: checkpoints drop from 350GB to 35MB, trainable parameters by roughly four orders of magnitude, and switching tasks means swapping one small file.',
+  ],
   limitations: [
     'The boundaries of the low-rank assumption are unclear. Experiments mostly cover generation and classification tasks close to the pretraining distribution, and the gains are limited when the domain shifts far or the task demands genuinely new knowledge.',
     'There is no universal recipe for the three hyperparameters: rank, scaling factor and which layer to adapt. The ablations only give directional guidance, so real projects still have to try each setting one by one.',

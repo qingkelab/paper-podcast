@@ -116,6 +116,14 @@ with render_session(work_dir) as session:      # HTML 可用 → ChromeSession�
 
 ## 页面与渲染器的约定
 
+- **文字折行由 Python 定，不让浏览器/CSS 自己折**。封面大字标题的断点用
+  `design.hook_lines` 算好（优先断在标点上），HTML 用 `<br>` 钉住、SVG 直接按行画 ——
+  两条路径**共用同一个函数**，所以同一个标题在两条路径上断在同一处。
+  交给 CSS 的话它只会按宽度折：「显存直降 68.7%！Qwen/Kimi 同款」会断成
+  「…Qwen/Kimi」+「同款」，末行只剩一个词，读起来像话被截断。
+  字号也一起算好传过去（`cover_title_layout`），`data-fit-*` 只作为 Chrome 度量
+  和我们的估算不一致时的兜底。
+
 - 页面必须**自包含**（图片走 data URI）—— 这样一份 HTML 丢到哪都能渲染出同样的画面，
   截图失败的现场也能直接丢进浏览器看。
 - `window.prepare()`（可选、异步）：在「加载完 + 字体就绪 + 图片解码完」之后、
