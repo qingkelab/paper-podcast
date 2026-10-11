@@ -3556,3 +3556,519 @@ class TestCoverTitlePendingRebuild:
         payload = VideoResult(video_path=tmp_path / "x.mp4", duration_sec=1.0, scene_count=1,
                               bytes_written=1, assignment="reused").to_dict()
         assert payload["title_pending"] is False
+
+
+# --------------------------------------------------------------------------
+# 逐句配图：配图粒度从「段」降到「句」（设计见 docs/BEAT_MOTION.md）
+# --------------------------------------------------------------------------
+#
+# 单位是**句**，所以「这一句能不能有自己的画面」全在 `build_scene_beats` 里决定：
+# 三条守卫各自单独钉住。切句用 `split_caption_beats`（与编码侧同一个函数，
+# 两边句数必须一致，这里顺带把这条耦合也钉住）。
+
+from app.services.video import (  # noqa: E402 - 本轮新增的名字补在这里，不动上面的 import 块
+    BEAT_IMAGE_MIN_SEC,
+    Beat,
+    _beat_notes_by_segment,
+    _normalize_per_beat,
+    build_scene_beats,
+    collapse_generate_within_segments,
+    heuristic_per_beat,
+)
+
+
+# 两句都够长（段长够 CAPTION_BEAT_MIN_CHARS 才会切句），切出来正好两句
+BEAT_TEXT_TWO = (
+    "仿真能批量造数据，但任务经常做不成。"
+    "失败之后没有人回头改场景，误差就一直累积下去。"
+)
+# 第二句很短：它按字数分到的时长会明显小于第一句（用来测「太短不切」）
+BEAT_TEXT_SHORT_TAIL = (
+    "这句话写得比较长，用来占住这一段里的绝大部分时间。短短一句。"
+)
+# 三句：用来测「一句沿用之后又换一张图」这种跨多句的判定
+BEAT_TEXT_THREE = (
+    "这一段的第一句讲的是同一个机制的某一步骤，所以配第一张图就够了。"
+    "第二句其实还在讲同一件事，于是继续沿用刚才那张图不换。"
+    "第三句换了个话题，讲的是另外一件事，这里要换一张新的图。"
+)
+
+
+class TestPerBeatAlignment:
+    """`Scene.beats[i]` 必须就是第 i 句 —— 句数与顺序都要与编码侧一致。"""
+
+    def test_beats_follow_split_caption_beats(self):
+        beats = build_scene_beats(text=BEAT_TEXT_TWO, picks=["f1", "f2"], duration=20.0)
+        assert [beat.text for beat in beats] == split_caption_beats(BEAT_TEXT_TWO)
+        assert len(beats) == 2
+
+    def test_first_beat_never_switches(self):
+        """第 0 句就是这一段原本那张卡，不该再单独叠一层。"""
+        beats = build_scene_beats(text=BEAT_TEXT_TWO, picks=["f1", "f2"], duration=20.0)
+        assert [beat.image for beat in beats] == ["", "f2"]
+
+    def test_sentence_count_mismatch_keeps_one_card(self):
+        """存下来的句数对不上（稿子变了 / 切句规则改了）→ 整段不切，宁可不动也不许错位。"""
+        assert build_scene_beats(text=BEAT_TEXT_TWO, picks=["f1"], duration=20.0) == []
+        assert (
+            build_scene_beats(text=BEAT_TEXT_TWO, picks=["f1", "f2", "f3"], duration=20.0)
+            == []
+        )
+
+    def test_no_picks_keeps_the_old_single_card(self):
+        """没有逐句数据（老数据复用 / 启发式兜底）→ 空列表 = 整段一张图。"""
+        assert build_scene_beats(text=BEAT_TEXT_TWO, picks=None, duration=20.0) == []
+
+    def test_build_scenes_lands_beats_on_the_body_scene(self, tmp_path):
+        scenes = build_scenes(
+            segments=[{"speaker": "A", "text": BEAT_TEXT_TWO}],
+            timings=[_timing(0, 7.0, 27.0)],
+            audio_duration=27.0,
+            assets=make_pool(tmp_path),
+            image_for_segment=["f1"],
+            fallback_id="illustration",
+            beats_for_segment=[["f1", "f2"]],
+        )
+        body = [scene for scene in scenes if scene.speaker]
+        assert len(body) == 1
+        assert [beat.image for beat in body[0].beats] == ["", "f2"]
+        # scene.image 仍然只认逐段那一列（老逻辑、复用/重建都依赖它）
+        assert body[0].image.name == "f1.png"
+
+    def test_build_scenes_without_beats_is_the_old_single_card(self, tmp_path):
+        """老数据那条路一点都不变：不传 beats_for_segment，beats 就是空列表。"""
+        scenes = build_scenes(
+            segments=[{"speaker": "A", "text": BEAT_TEXT_TWO}],
+            timings=[_timing(0, 7.0, 27.0)],
+            audio_duration=27.0,
+            assets=make_pool(tmp_path),
+            image_for_segment=["f1"],
+            fallback_id="illustration",
+        )
+        body = [scene for scene in scenes if scene.speaker]
+        assert body[0].beats == []
+        assert body[0].image.name == "f1.png"
+
+
+class TestPerBeatCoverAndOutroGuard:
+    """守卫 a：封面段（headline 非空）与片尾品牌段一律不逐句切画面。"""
+
+    def test_cover_segment_never_switches(self):
+        beats = build_scene_beats(
+            text=BEAT_TEXT_TWO,
+            picks=["cover", "f2"],
+            duration=20.0,
+            headline="这三行字是封面大字标题",
+        )
+        assert [beat.image for beat in beats] == ["", ""]
+
+    def test_outro_brand_segment_never_switches(self):
+        beats = build_scene_beats(
+            text=BEAT_TEXT_TWO, picks=["f1", "f2"], duration=20.0, brand="outro"
+        )
+        assert [beat.image for beat in beats] == ["", ""]
+
+    def test_build_scenes_freezes_the_frames_that_carry_the_headline(self, tmp_path):
+        """整条链：headline 落到第一帧之后，那一段的 beats 一句都不换。"""
+        scenes = build_scenes(
+            segments=[{"speaker": "A", "text": BEAT_TEXT_TWO}],
+            timings=[_timing(0, 7.0, 27.0)],
+            audio_duration=27.0,
+            assets=make_pool(tmp_path),
+            image_for_segment=["cover"],
+            fallback_id="illustration",
+            beats_for_segment=[["cover", "f2"]],
+            headline="这三行字是封面大字标题",
+            cover_caption="论文原题",
+        )
+        body = [scene for scene in scenes if scene.speaker]
+        assert body[0].headline == "这三行字是封面大字标题"
+        assert [beat.image for beat in body[0].beats] == ["", ""]
+
+
+class TestPerBeatSameImageGuard:
+    """守卫 b：和上一句选到同一张图就不切（图没变，别做无意义的溶解）。"""
+
+    def test_same_image_as_previous_sentence_is_not_a_switch(self):
+        beats = build_scene_beats(text=BEAT_TEXT_TWO, picks=["f1", "f1"], duration=20.0)
+        assert [beat.image for beat in beats] == ["", ""]
+
+    def test_changed_image_is_a_switch(self):
+        beats = build_scene_beats(text=BEAT_TEXT_TWO, picks=["f1", "f2"], duration=20.0)
+        assert [beat.image for beat in beats] == ["", "f2"]
+
+    def test_switch_back_after_a_repeat_is_still_a_switch(self):
+        """一句沿用之后又换一张：只有「和上一句不同」才算切。"""
+        beats = build_scene_beats(
+            text=BEAT_TEXT_THREE, picks=["f1", "f1", "f2"], duration=60.0
+        )
+        assert len(beats) == 3
+        assert [beat.image for beat in beats] == ["", "", "f2"]
+
+
+class TestPerBeatShortSentenceGuard:
+    """守卫 c：按字数估出来的时长 < BEAT_IMAGE_MIN_SEC 的句子不切画面。"""
+
+    def test_short_sentence_does_not_switch(self):
+        beats = build_scene_beats(
+            text=BEAT_TEXT_SHORT_TAIL, picks=["f1", "f2"], duration=6.0
+        )
+        assert split_caption_beats(BEAT_TEXT_SHORT_TAIL)[-1] == "短短一句。"
+        assert [beat.image for beat in beats] == ["", ""]
+
+    def test_long_enough_sentence_switches(self):
+        beats = build_scene_beats(
+            text=BEAT_TEXT_SHORT_TAIL, picks=["f1", "f2"], duration=20.0
+        )
+        assert [beat.image for beat in beats] == ["", "f2"]
+
+    def test_threshold_is_the_same_window_the_encoder_uses(self):
+        """判据就是 `beat_windows` 按字数分给这一句的时长（与编码侧同一条）。"""
+        texts = split_caption_beats(BEAT_TEXT_SHORT_TAIL)
+        short_window = beat_windows(texts, 6.0)[1]
+        long_window = beat_windows(texts, 20.0)[1]
+        assert short_window[1] - short_window[0] < BEAT_IMAGE_MIN_SEC
+        assert long_window[1] - long_window[0] >= BEAT_IMAGE_MIN_SEC
+
+
+class TestPerBeatAssignmentNormalization:
+    """模型逐句作答的归一化：单位是句，沿用/纠错规则与逐段那条完全一致。"""
+
+    VALID = {"cover", "f1", "f2", "illustration"}
+
+    def _normalize(self, raw, beat_counts):
+        return _normalize_per_beat(
+            raw, beat_counts=beat_counts, valid_ids=self.VALID, default_id="illustration"
+        )
+
+    def test_one_pick_per_sentence(self):
+        result = self._normalize(
+            [
+                {"sentence": 0, "image_id": "cover"},
+                {"sentence": 1, "image_id": "f2"},
+                {"sentence": 2, "image_id": "f1"},
+            ],
+            [2, 1],
+        )
+        assert result == [["cover", "f2"], ["f1"]]
+
+    def test_missing_sentence_carries_forward(self):
+        result = self._normalize(
+            [{"sentence": 0, "image_id": "f1"}, {"sentence": 3, "image_id": "f2"}], [2, 2]
+        )
+        assert result == [["f1", "f1"], ["f1", "f2"]]
+
+    def test_leading_gap_uses_the_neutral_image(self):
+        result = self._normalize([{"sentence": 2, "image_id": "f2"}], [2, 1])
+        assert result == [["illustration", "illustration"], ["f2"]]
+
+    def test_invented_image_ids_are_rejected(self):
+        result = self._normalize(
+            [{"sentence": 0, "image_id": "f99"}, {"sentence": 1, "image_id": "f1"}], [2]
+        )
+        assert result == [["illustration", "f1"]]
+
+    def test_generate_pseudo_id_is_accepted(self):
+        result = self._normalize([{"sentence": 1, "image_id": "generate"}], [2])
+        assert result == [["illustration", "generate"]]
+
+    def test_accepts_segment_and_beat_keys(self):
+        """模型也可能按「第几段第几句」作答，两种写法都要认。"""
+        result = self._normalize(
+            [{"segment": 1, "beat": 1, "image_id": "f2"}], [2, 2]
+        )
+        assert result == [["illustration", "illustration"], ["illustration", "f2"]]
+
+    def test_segment_only_answer_lands_on_the_first_sentence(self):
+        """模型整段作答时，选择落在这一段第一句上（比整段丢掉强）。"""
+        result = self._normalize(
+            [{"segment": 0, "image_id": "f1"}, {"segment": 1, "image_id": "f2"}], [2, 2]
+        )
+        assert result == [["f1", "f1"], ["f2", "f2"]]
+
+    @pytest.mark.parametrize(
+        "raw", ["不是列表", [], None, [{"bad": 1}], [{"sentence": "x"}], [{"sentence": 99}]]
+    )
+    def test_garbage_returns_none(self, raw):
+        """什么都没认出来 → None（调用方回退启发式），不能返回一堆空图。"""
+        assert self._normalize(raw, [2, 1]) is None
+
+    def test_empty_beat_counts_returns_none(self):
+        assert self._normalize([{"sentence": 0, "image_id": "f1"}], []) is None
+
+
+class TestPerBeatNotes:
+    """逐句的 `why` 收成每段一句：取这一段**第一句**的理由，缺失项不延续。"""
+
+    VALID = {"cover", "f1"}
+
+    def test_keeps_the_first_sentence_note_of_each_segment(self):
+        notes = _beat_notes_by_segment(
+            [
+                {"sentence": 0, "image_id": "cover", "why": "开场点出论文主题"},
+                {"sentence": 1, "image_id": "f1", "why": "这一句的解释"},
+            ],
+            beat_counts=[2, 1],
+            valid_ids=self.VALID,
+        )
+        assert notes == ["开场点出论文主题", ""]
+
+    def test_missing_note_is_not_carried_forward(self):
+        notes = _beat_notes_by_segment(
+            [{"sentence": 0, "image_id": "f1", "why": "讲误差"}],
+            beat_counts=[1, 1],
+            valid_ids=self.VALID,
+        )
+        assert notes == ["讲误差", ""]
+
+    def test_note_for_a_rejected_pick_is_dropped(self):
+        notes = _beat_notes_by_segment(
+            [{"sentence": 0, "image_id": "f99", "why": "编造图的理由"}],
+            beat_counts=[1],
+            valid_ids=self.VALID,
+        )
+        assert notes == [""]
+
+    @pytest.mark.parametrize("raw", ["不是列表", [], None, [{"bad": 1}]])
+    def test_garbage_yields_empty_notes(self, raw):
+        assert _beat_notes_by_segment(raw, beat_counts=[2], valid_ids=self.VALID) == [""]
+
+
+class TestPerBeatPrompt:
+    """送进去的脚本行换成逐句的（仍然只有这一次调用）。"""
+
+    def test_lines_are_per_sentence_with_segment_and_beat_labels(self):
+        messages = build_assign_messages(
+            [{"speaker": "A", "text": "x"}, {"speaker": "B", "text": "y"}],
+            [{"id": "f1", "caption": "Figure 1: architecture"}],
+            beats_per_segment=[["第一句。", "第二句。"], ["第三句。"]],
+        )
+        user = messages[-1]["content"]
+        assert "[0] 第1段 第1/2句 主播A：第一句。" in user
+        assert "[1] 第1段 第2/2句 主播A：第二句。" in user
+        assert "[2] 第2段 第1/1句 主播B：第三句。" in user
+        assert "共 2 段、3 句" in user
+        assert "每一句" in user
+
+    def test_system_asks_for_one_pick_per_sentence(self):
+        system = build_assign_messages(
+            [{"speaker": "A", "text": "x"}],
+            [{"id": "f1", "caption": "y"}],
+            beats_per_segment=[["一句。"]],
+        )[0]["content"]
+        assert "每一句" in system
+        assert "sentence" in system  # 输出字段：逐句作答的编号
+
+    def test_falls_back_to_per_segment_lines_without_beats(self):
+        """没有切句信息时退回逐段行（老调用点照旧能用）。"""
+        user = build_assign_messages(
+            [{"speaker": "A", "text": "第一段内容"}], [{"id": "f1", "caption": "c"}]
+        )[-1]["content"]
+        assert "[0] 主播A：第一段内容" in user
+        assert "【脚本分段】" in user
+
+    def test_empty_beats_fall_back_too(self):
+        """所有段都没文本时不能出一份「0 句」的脚本给模型。"""
+        user = build_assign_messages(
+            [{"speaker": "A", "text": ""}],
+            [{"id": "f1", "caption": "c"}],
+            beats_per_segment=[[]],
+        )[-1]["content"]
+        assert "【脚本分段】" in user
+
+
+class TestPerBeatHeuristicFallback:
+    """启发式兜底逐句沿用本段那张 —— **不在本地瞎猜**哪一句该换图。"""
+
+    def test_heuristic_per_beat_repeats_the_segment_pick(self):
+        segment_picks = heuristic_per_segment(3, ["f1", "f2"], "illustration")
+        beats = heuristic_per_beat(segment_picks, [2, 1, 2])
+        assert [picks[0] for picks in beats] == segment_picks
+        assert beats == [
+            [segment_picks[0]] * 2,
+            [segment_picks[1]] * 1,
+            [segment_picks[2]] * 2,
+        ]
+
+    def test_heuristic_never_produces_a_switch(self):
+        segment_picks = heuristic_per_segment(3, ["f1", "f2"], "illustration")
+        beats = heuristic_per_beat(segment_picks, [2, 1, 2])
+        for picks in beats:
+            scene_beats = build_scene_beats(
+                text=BEAT_TEXT_TWO, picks=picks, duration=20.0
+            )
+            assert all(beat.image == "" for beat in scene_beats)
+
+    def test_heuristic_per_beat_without_text_has_no_beats(self):
+        assert heuristic_per_beat(["f1", "f2"], [0, 0]) == [[], []]
+
+
+class TestPerBeatGenerateCost:
+    """成本守卫：`generate` 的单位是段（合并之后），不是句。"""
+
+    def test_generate_is_merged_within_a_segment(self):
+        """同一段里隔一句的 generate 只能合成**一张**现场生成的图。"""
+        picks = [["generate", "f1", "generate"], ["f1"]]
+        flat = [pick for segment in picks for pick in segment]
+        naive_runs = group_generate_runs(flat)  # 按句算：两个组 = 两张图
+        collapsed = collapse_generate_within_segments(picks)
+        assert collapsed == [["generate", "generate", "generate"], ["f1"]]
+        runs = group_generate_runs([segment[0] for segment in collapsed])
+        assert len(naive_runs) == 2
+        assert len(runs) == 1
+
+    def test_run_count_never_exceeds_the_segment_count(self):
+        """合并之后，生成组数 ≤ 段数 —— 与逐段时代的量级一致。"""
+        picks = [["generate", "f1"], ["generate", "generate"], ["f1", "f2"], ["generate"]]
+        collapsed = collapse_generate_within_segments(picks)
+        segment_picks = [segment[0] if segment else "" for segment in collapsed]
+        assert len(group_generate_runs(segment_picks)) <= len(picks)
+
+    def test_clean_segments_are_untouched(self):
+        picks = [["f1", "f2"], ["f2", "illustration"]]
+        assert collapse_generate_within_segments(picks) == picks
+
+
+# 一段静音 WAV：合成视频要真的编码，所以得起一个能用的音频轨
+def _silent_wav(path: Path, seconds: float = 2.0) -> Path:
+    import wave
+
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b"\x00\x00" * int(8000 * seconds))
+    return path
+
+
+class TestPerBeatReuse:
+    """规矩 3：逐句画面跟 `scene.image` 一样存下来，重新合成时复用、不许调模型。"""
+
+    def test_stored_beats_are_reused_without_touching_the_model(self, tmp_path):
+        from app.services.video import compose_video
+
+        class ExplodingLLM:
+            mock = False
+
+            def _chat_json(self, *a, **k):
+                raise AssertionError("复用模式下不该再调用模型")
+
+        pool_dir = tmp_path / "assets"
+        pool_dir.mkdir()
+        cover = make_png(pool_dir / "cover.png")
+        f1 = make_png(pool_dir / "f1.png")
+        illu = make_png(pool_dir / "illu.png")
+        audio = _silent_wav(tmp_path / "a.wav")
+
+        segments = [
+            {"speaker": "A", "text": "第一段"},
+            {"speaker": "B", "text": "第二段"},
+        ]
+        timings = [_timing(0, 0.0, 1.0), _timing(1, 1.0, 2.0)]
+
+        result = compose_video(
+            segments=segments,
+            timings=timings,
+            audio_path=audio,
+            audio_duration=2.0,
+            cover_path=str(cover),
+            figures=[{"id": "f1", "path": str(f1), "caption": "Figure 1"}],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "work",
+            output_path=tmp_path / "out.mp4",
+            title="t",
+            llm=ExplodingLLM(),
+            preset_scenes=[
+                {"index": 0, "image": "cover", "beats": [{"text": "第一段", "image": ""}]},
+                {"index": 1, "image": "f1", "beats": [{"text": "第二段", "image": ""}]},
+            ],
+            preset_assets={"cover": str(cover), "f1": str(f1), "illustration": str(illu)},
+        )
+        assert result.assignment == "reused"
+        assert [scene["image"] for scene in result.scenes] == ["cover", "f1"]
+        # 逐句画面一起复用（存的是施加过守卫的结果：这两段都只有一句）
+        assert [scene["beats"] for scene in result.scenes] == [
+            [{"text": "第一段", "image": ""}],
+            [{"text": "第二段", "image": ""}],
+        ]
+
+
+class TestPerBeatFreshGeneration:
+    """真跑一次生成：选图那次调用换成逐句行，结果落成 `scene.image` + `Scene.beats`。
+
+    模型用假的（不该为了跑测试去花一次真调用），但它走的是**生产同一条路**：
+    `build_assign_messages` → `_normalize_per_beat` → `image_for_segment` → `build_scenes`。
+    """
+
+    class FakeAssignLLM:
+        """只答选图那一次调用；要点与封面标题返回空。"""
+
+        mock = False
+
+        def __init__(self):
+            self.assign_calls: list[list[dict]] = []
+
+        def _chat_json(self, messages, *, max_tokens, temperature=0.6):
+            if "图文编排" in messages[0]["content"]:
+                self.assign_calls.append(messages)
+                return {
+                    "assignments": [
+                        {"sentence": 0, "image_id": "cover", "why": "开场点题"},
+                        {"sentence": 1, "image_id": "cover", "why": "同一件事"},
+                        {"sentence": 2, "image_id": "f1", "why": "讲机制"},
+                        {"sentence": 3, "image_id": "f2", "why": "换了话题"},
+                    ]
+                }
+            return {"points": []}
+
+        def _chat(self, *args, **kwargs):
+            return ""
+
+    def test_one_call_picks_every_sentence_and_lands_on_beats(self, tmp_path):
+        from app.services.video import compose_video
+
+        pool_dir = tmp_path / "assets"
+        pool_dir.mkdir()
+        cover = make_png(pool_dir / "cover.png")
+        f1 = make_png(pool_dir / "f1.png")
+        f2 = make_png(pool_dir / "f2.png")
+        illu = make_png(pool_dir / "illu.png")
+        audio = _silent_wav(tmp_path / "a.wav", seconds=8)
+
+        llm = self.FakeAssignLLM()
+        # 每段 4 秒、每段两句 → 每句约 1.8 秒，够长，不会被「太短不切」挡掉
+        result = compose_video(
+            segments=[
+                {"speaker": "A", "text": BEAT_TEXT_TWO},
+                {"speaker": "B", "text": BEAT_TEXT_TWO},
+            ],
+            timings=[_timing(0, 0.0, 4.0), _timing(1, 4.0, 8.0)],
+            audio_path=audio,
+            audio_duration=8.0,
+            cover_path=str(cover),
+            figures=[
+                {"id": "f1", "path": str(f1), "caption": "Figure 1"},
+                {"id": "f2", "path": str(f2), "caption": "Figure 2"},
+            ],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "work",
+            output_path=tmp_path / "out.mp4",
+            title="STEPQuant: Quantization",
+            llm=llm,
+        )
+
+        # 选图只有这一次调用（不因为改成逐句而多调）
+        assert len(llm.assign_calls) == 1, "选图仍然只能调一次模型"
+        prompt = llm.assign_calls[0][-1]["content"]
+        assert "第1段 第1/2句" in prompt and "第2段 第2/2句" in prompt
+
+        assert result.assignment == "model"
+        # scene.image = 这一段**第一句**选到的那张（老逻辑照旧）
+        assert [scene["image"] for scene in result.scenes] == ["cover", "f1"]
+        # 第一段是封面（带封面大字标题）→ 一句都不切；第二段第一句 f1、第二句 f2 → 切一次
+        assert [len(scene["beats"]) for scene in result.scenes] == [2, 2]
+        assert [beat["image"] for beat in result.scenes[0]["beats"]] == ["", ""]
+        assert [beat["image"] for beat in result.scenes[1]["beats"]] == ["", "f2"]
+        # 理由按「这一段第一句」收
+        assert result.scenes[0]["why"] == "开场点题"
+        assert result.scenes[1]["why"] == "讲机制"

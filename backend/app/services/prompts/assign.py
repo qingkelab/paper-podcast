@@ -1,7 +1,17 @@
-"""逐段选图：为脚本的每一段挑一张配图，并写一句「为什么配这张」。
+"""逐句选图：为脚本的**每一句**挑一张配图，并写一句「为什么配这张」。
 
-`_normalize_per_segment` / `heuristic_*` 是兜底：模型给不出、或者返回的段数对不上时，
-不能让视频缺画面，所以有确定性的启发式分配。
+单位是**句**，不再是段（一段 2~4 句、10~20 秒，以前整段只有一张图，
+于是「一句话讲完了画面还停在那儿」，见 `docs/BEAT_MOTION.md`）。
+选图仍然只调一次模型，只是脚本行从「逐段」换成「逐句」。
+`scene.image` 仍然是这一段**第一句**选到的那张（老逻辑、复用/重建那条链都依赖它），
+逐句的差别落在 `Scene.beats` 上。
+
+句子怎么切不在这个文件里：`build_assign_messages` 收调用方切好的句子
+（`video.split_caption_beats`，纯文本、确定性）—— **编码侧用的是同一个函数**，
+两侧句数必须一致，所以切句这件事只能有一个出处。
+
+`_normalize_per_beat` / `_normalize_per_segment` / `heuristic_*` 是兜底：
+模型给不出、或者返回的对不上时，不能让视频缺画面，所以有确定性的启发式分配。
 """
 
 from __future__ import annotations
@@ -16,6 +26,7 @@ __all__ = [
     "ASSIGN_SYSTEM",
     "build_assign_messages",
     "heuristic_assignment",
+    "heuristic_per_beat",
     "heuristic_per_segment",
 ]
 
@@ -32,57 +43,96 @@ ASSIGN_WHY_MAX_CHARS = 40
 
 ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排。
 
-听众能听到主播的对话，同时看到画面。你的任务是让**每一段话配上意思相符的图**：
+听众能听到主播的对话，同时看到画面。你的任务是让**每一段里的每一句**都配上意思相符的图：
 听众听到某个概念时，屏幕上正好是讲这个概念的图。图不对文比没有图更糟。
 
 你会拿到：
-- 脚本分段列表（编号、内容）
+- 脚本**逐句**列表（每行前面是**句号**；行里标着这句属于第几段、第几句，以及主播）
 - 可用图片列表（id 与图注）
 
-请为**每一段**指定一张图。判断依据是这一段在讲什么，以及哪张图正好在讲同一件事。
+请为**每一句**指定一张图。判断依据是这句话在讲什么，以及哪张图正好在讲同一件事。
 
 【重要规则】
 - 图注可能是英文，脚本是中文，你要按**语义**判断，不要按字面。
-- 若某一段的内容和任何一张图都对不上，就填 `generate` —— 系统会为这一段
-  **现场画一张专门的示意图**。连续几段讲同一件事时都填 `generate`，
-  系统会把它们合并成一张图，不要每段都标。
+- 相邻几句如果确实在讲同一件事，就**填同一张图**：图没变的那一句本来就不会切画面，
+  系统会自己跳过，所以重复填一张图不花任何代价；**话题变了就换图** ——
+  画面跟着话走是这条流水线的目的，这一句换了对象/环节/结论时就别再沿用上一张。
+- 若某一句的内容和任何一张图都对不上，就填 `generate` —— 系统会为它
+  **现场画一张专门的示意图**。连续几句讲同一件事时都填 `generate`，
+  系统会把它们合并成一张图，不要隔一句就标一个。
 - `illustration` 是一张概括全文的信息图，只在「需要一个中性过渡画面」时用
   （例如开场收尾）。**不要为了填满而硬塞一张不相关的原图。**
 - `cover` 是论文首页，适合开场介绍论文时用；正文讨论具体内容时不要用它。
-- 能对上论文原图的段落**优先用原图**（原图最准确）；原图对不上才填 `generate`。
-- 相邻段落如果确实在讲同一件事，用同一张图是正常的；话题变了就换图。
+- 能对上论文原图的句子**优先用原图**（原图最准确）；原图对不上才填 `generate`。
+- 片头那几句（画面上顶着封面标题）与片尾的品牌收尾段**不用换图**：
+  全部填这一段第一句用的那张就行（系统在那几帧本来就不切画面）。
 - 图片 id 只能从给出的列表里选，不要编造。
-- 每一项还要写一句 `why`：**这一段和这张图的共同点是什么**。
+- 每一项还要写一句 `why`：**这一句和这张图的共同点是什么**。
   它是给人看的检查依据 —— 复查时只看 `why` 就能判断选得对不对，不必重读全稿。
   一句话，不超过 20 个字，不要复述图注、不要写「内容相关」这种空话。
 
 只输出 JSON：
-{"assignments": [{"segment": 0, "image_id": "cover", "why": "开场点出论文主题"},
-                 {"segment": 1, "image_id": "f1", "why": "都在讲量化误差分布"}, ...]}
-每个脚本段都要有一项，`why` 不要遗漏。除了这个 JSON 不要输出任何解释。"""
+{"assignments": [{"sentence": 0, "image_id": "cover", "why": "开场点出论文主题"},
+                 {"sentence": 1, "image_id": "f1", "why": "都在讲量化误差分布"}, ...]}
+每一句都要有一项（`sentence` 用脚本行前面的**句号**），`why` 不要遗漏。
+除了这个 JSON 不要输出任何解释。"""
 
 
 def build_assign_messages(
-    segments: list[dict[str, Any]], assets: list[dict[str, Any]]
+    segments: list[dict[str, Any]],
+    assets: list[dict[str, Any]],
+    *,
+    beats_per_segment: list[list[str]] | None = None,
 ) -> list[dict[str, str]]:
-    script_lines = []
-    for index, segment in enumerate(segments):
-        text = (segment.get("text") or "").strip().replace("\n", " ")
-        speaker = segment.get("speaker") or "A"
-        script_lines.append(f"[{index}] 主播{speaker}：{text}")
+    """组「逐句选图」这一次调用的两条消息。
+
+    `beats_per_segment[i]` 是第 i 段切出来的句子**文本**（调用方用
+    `video.split_caption_beats` 切好传进来）。给了它就按**句**出行，每行标出
+    「第几段、第几句」和行首的**句号**（模型按句号作答，见 `_normalize_per_beat`）。
+
+    没给（或者所有段都没有文本）就退回原来的**逐段**行 —— 老调用点与老单测照旧能用。
+    """
+    script_lines: list[str] = []
+    total_beats = (
+        sum(len(beats) for beats in beats_per_segment) if beats_per_segment else 0
+    )
+    if beats_per_segment and total_beats > 0:
+        cursor = 0
+        for index, segment in enumerate(segments):
+            beats = beats_per_segment[index] if index < len(beats_per_segment) else []
+            speaker = segment.get("speaker") or "A"
+            for beat_index, beat in enumerate(beats):
+                text = " ".join(str(beat or "").split())
+                script_lines.append(
+                    f"[{cursor}] 第{index + 1}段 第{beat_index + 1}/{len(beats)}句"
+                    f" 主播{speaker}：{text}"
+                )
+                cursor += 1
+        header = (
+            f"【脚本逐句】共 {len(segments)} 段、{total_beats} 句"
+            f"（行首编号是**句号**，0 到 {total_beats - 1}）"
+        )
+        ask = "请为每一句脚本指定一张意思相符的图（几句讲同一件事就填同一张，这是正常的），输出 JSON。"
+    else:
+        for index, segment in enumerate(segments):
+            text = (segment.get("text") or "").strip().replace("\n", " ")
+            speaker = segment.get("speaker") or "A"
+            script_lines.append(f"[{index}] 主播{speaker}：{text}")
+        header = f"【脚本分段】共 {len(segments)} 段（编号 0 到 {len(segments)-1}）"
+        ask = "请为每一段脚本指定一张意思相符的图，输出 JSON。"
 
     asset_lines = []
     for asset in assets:
         caption = (asset.get("caption") or asset.get("label") or "").strip()
         asset_lines.append(f"- {asset['id']}: {caption[:160]}")
 
-    user = f"""【脚本分段】共 {len(segments)} 段（编号 0 到 {len(segments)-1}）
+    user = f"""{header}
 {chr(10).join(script_lines)}
 
 【可用图片】共 {len(assets)} 张
 {chr(10).join(asset_lines)}
 
-请为每一段脚本指定一张意思相符的图，输出 JSON。"""
+{ask}"""
     return [
         {"role": "system", "content": ASSIGN_SYSTEM},
         {"role": "user", "content": user},
@@ -171,6 +221,147 @@ def _assignment_notes(
         if note:
             notes[segment] = note[:ASSIGN_WHY_MAX_CHARS]
     return [notes.get(index, "") for index in range(count)]
+
+
+def _beat_offsets(beat_counts: list[int]) -> list[int]:
+    """每段第一句在**全局句号**里的位置。"""
+    offsets: list[int] = []
+    cursor = 0
+    for count in beat_counts:
+        offsets.append(cursor)
+        cursor += max(int(count), 0)
+    return offsets
+
+
+def _flat_sentence_items(
+    raw: Any, *, beat_counts: list[int]
+) -> list[tuple[int, dict[str, Any]]] | None:
+    """把模型给的每一项映射到**全局句号**，返回 [(句号, 原项)]。
+
+    认两种写法（两种都可能出现，因为脚本行上「句号」和「第几段第几句」都写着）：
+    - `sentence`：全局句号，最直接；
+    - `segment` + `beat`：段号 + 段内句序。`beat` 缺失时按该段**第一句**算 ——
+      模型偶尔会整段作答，那时它的选择只能落在这一段开头，剩下的句子走「沿用上一句」，
+      总比整段丢掉强。
+    """
+    if not isinstance(raw, list) or not beat_counts:
+        return None
+    offsets = _beat_offsets(beat_counts)
+    total = sum(max(int(count), 0) for count in beat_counts)
+    if total <= 0:
+        return None
+
+    items: list[tuple[int, dict[str, Any]]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        index: int | None = None
+        raw_sentence = item.get("sentence")
+        if raw_sentence is not None:
+            try:
+                candidate = int(raw_sentence)
+            except (TypeError, ValueError):
+                candidate = -1
+            if 0 <= candidate < total:
+                index = candidate
+        if index is None:
+            try:
+                segment = int(item.get("segment"))
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= segment < len(beat_counts) or beat_counts[segment] <= 0:
+                continue
+            try:
+                beat = int(item.get("beat", 0))
+            except (TypeError, ValueError):
+                beat = 0
+            beat = max(0, min(beat, beat_counts[segment] - 1))
+            index = offsets[segment] + beat
+        items.append((index, item))
+    return items
+
+
+def _normalize_per_beat(
+    raw: Any,
+    *,
+    beat_counts: list[int],
+    valid_ids: set[str],
+    default_id: str,
+) -> list[list[str]] | None:
+    """把模型给的**逐句**分配整理成「每段一个列表，列表里每句一个图片 id」。
+
+    做法是先把逐句结果**摊平**成一条句子序列，再交给 `_normalize_per_segment` ——
+    沿用/纠错规则（漏掉的句子沿用上一句、编造的 id 丢掉、开头缺口用中性图）
+    与逐段那条完全一致，不另开一套，两边的行为也就不会漂移。
+
+    返回 `None` 表示模型什么都没给出（调用方回退启发式）；`[]` 不会出现 ——
+    只要有一段被采纳，返回的就是每段一一对应的列表。
+
+    句子的切分**不在**这里做：`beat_counts[i]` 是调用方用 `split_caption_beats`
+    切出来的句数，与编码侧同一个函数（见模块开头）。
+    """
+    items = _flat_sentence_items(raw, beat_counts=beat_counts)
+    if items is None:
+        return None
+    total = sum(max(int(count), 0) for count in beat_counts)
+    flat = _normalize_per_segment(
+        [{"segment": index, "image_id": item.get("image_id")} for index, item in items],
+        count=total,
+        valid_ids=valid_ids,
+        default_id=default_id,
+    )
+    if flat is None:
+        return None
+    offsets = _beat_offsets(beat_counts)
+    return [
+        flat[offsets[index] : offsets[index] + max(int(count), 0)]
+        for index, count in enumerate(beat_counts)
+    ]
+
+
+def _beat_notes_by_segment(
+    raw: Any, *, beat_counts: list[int], valid_ids: set[str]
+) -> list[str]:
+    """把逐句的 `why` 收成**每段一句**（取这一段**第一句**的理由）。
+
+    为什么不是「每段一条/每句一条」：存进 `video.scenes[i].why` 的那句话说的是
+    「这一段为什么配这张图」，而这一段的画面就是它第一句那张图，理由也应当对应它。
+    缺失项**不延续**（和 `_assignment_notes` 同一条规矩：拿别的句子的理由顶上是假信息）。
+    """
+    count = len(beat_counts)
+    if count == 0:
+        return []
+    items = _flat_sentence_items(raw, beat_counts=beat_counts)
+    if items is None:
+        return [""] * count
+    total = sum(max(int(c), 0) for c in beat_counts)
+    flat = _assignment_notes(
+        [{**item, "segment": index} for index, item in items],
+        count=total,
+        valid_ids=valid_ids,
+    )
+    offsets = _beat_offsets(beat_counts)
+    return [
+        flat[offsets[index]] if max(int(beat_count), 0) > 0 else ""
+        for index, beat_count in enumerate(beat_counts)
+    ]
+
+
+def heuristic_per_beat(
+    per_segment: list[str], beat_counts: list[int]
+) -> list[list[str]]:
+    """逐句的兜底：**沿用本段那一张**，一句也不换。
+
+    为什么不在本地猜「哪一句该换图」：那是编。模型不可用时我们并不知道哪一句在讲什么，
+    按字数、按关键词硬切只会造出「画面在换、但和正在讲的话无关」的效果 ——
+    正是用户否掉推拉镜头（「跟内容无关的放大移动没有价值」）的那条理由。
+    所以逐句这一版宁可整段一张图：`scene.image` 照旧逐段分配，`beats` 的 image 全空。
+    """
+    result: list[list[str]] = []
+    for index, count in enumerate(beat_counts):
+        pick = per_segment[index] if index < len(per_segment) else ""
+        result.append([pick] * max(int(count), 0))
+    return result
 
 
 def heuristic_assignment(count: int, figure_count: int) -> list[int]:

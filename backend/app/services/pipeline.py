@@ -385,6 +385,10 @@ class Pipeline:
             # `video.scenes[i].point` 里，缺了才由维护脚本单独补一次（见 AGENTS.md）
             llm=None,
             analysis=version.get("analysis") or {},
+            # `preset_scenes` 里除了 image / point / focus / why，还带着**逐句**的画面安排
+            # （`beats`）—— 逐句配图和 `scene.image` 一样是「选图」那一步的产物，
+            # 重新合成时一并复用，不再问模型（规矩 3，见 docs/BEAT_MOTION.md）。
+            # 老数据的 scenes 没有 beats，compose_video 会走「整段一张图」那条老路。
             preset_scenes=stored.get("scenes") or None,
             preset_assets=stored.get("assets") or None,
             # 封面标题同样是「写一次、以后复用」的数据，重合成时不该换一句

@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +69,7 @@ from .design import *  # noqa: F401,F403
 # 新代码请直接用上面对应的模块（类型 → video_core，画面 → video_render，ffmpeg → video_encode）。
 from .video_core import (
     _SENTENCE_END,
+    Beat,
     CaptionBand,
     ImageAsset,
     Scene,
@@ -77,6 +78,7 @@ from .video_core import (
     VideoResult,
 )
 from .video_render import (  # noqa: F401
+    BeatLayers,
     FigurePanels,
     _caption_line_parts,
     _fit_subtitle,
@@ -93,6 +95,7 @@ from .video_render import (  # noqa: F401
     build_panel_catalog,
     image_card_markup,
     progress_bar_svg,
+    render_beat_layers,
     render_caption_band,
     render_chrome,
     render_endcard,
@@ -122,9 +125,12 @@ from .prompts.assign import (  # noqa: F401
     ASSIGN_SYSTEM,
     ASSIGN_WHY_MAX_CHARS,
     _assignment_notes,
+    _beat_notes_by_segment,
+    _normalize_per_beat,
     _normalize_per_segment,
     build_assign_messages,
     heuristic_assignment,
+    heuristic_per_beat,
     heuristic_per_segment,
 )
 from .prompts.cover import (  # noqa: F401
@@ -176,6 +182,7 @@ def build_scenes(
     points: list[str] | None = None,
     focuses: list[dict[str, Any] | None] | None = None,
     whys: list[str] | None = None,
+    beats_for_segment: list[list[str]] | None = None,
     headline: str = "",
     cover_caption: str = "",
 ) -> list[Scene]:
@@ -186,6 +193,11 @@ def build_scenes(
 
     `image_for_segment[i]` 是第 i 段脚本要显示的图片 id —— 逐段指定而不是
     「从某段开始一直用到下一张图」，这样才能保证画面跟着话题走。
+
+    `beats_for_segment[i][j]` 是第 i 段**第 j 句**选到的图片 id（句子由
+    `split_caption_beats` 切出来，与编码侧同一套规则）。给了它就落成 `Scene.beats`，
+    逐句换画面才有依据；不给（老数据 / 启发式兜底）就是空列表 = 整段一张图。
+    **这一段第一句那张图必须等于 `image_for_segment[i]`**（`scene.image` 由后者来）。
 
     `points[i]` 是第 i 段的「要点强调行」文案（可为空串 → 这一段不显示强调行）。
 
@@ -234,24 +246,30 @@ def build_scenes(
         )
 
     # ---- 正文：逐段按语义配图 ----
+    #
+    # 逐句的选图结果先挂着（`body_beat_picks`），等整条时间轴定型之后再落成
+    # `Scene.beats` —— 「封面段」与「这一句太短」这两条守卫要看的是**最终**的
+    # headline 与时长（见函数末尾）。
+    body_beat_picks: list[tuple[Scene, list[str]]] = []
     for index, timing in enumerate(ordered):
         segment = segments[index] if index < len(segments) else {}
         asset = asset_for(index)
-        scenes.append(
-            Scene(
-                start=float(timing.start),
-                end=float(timing.end),
-                image=asset.path,
-                kind=asset.kind,
-                speaker=str(segment.get("speaker") or getattr(timing, "speaker", "") or "A"),
-                text=str(segment.get("text") or ""),
-                caption=asset.caption,
-                point=(points[index] if points and index < len(points) else ""),
-                focus=(focuses[index] if focuses and index < len(focuses) else None),
-                why=(whys[index] if whys and index < len(whys) else ""),
-                brand=str(segment.get("brand") or ""),
-            )
+        scene = Scene(
+            start=float(timing.start),
+            end=float(timing.end),
+            image=asset.path,
+            kind=asset.kind,
+            speaker=str(segment.get("speaker") or getattr(timing, "speaker", "") or "A"),
+            text=str(segment.get("text") or ""),
+            caption=asset.caption,
+            point=(points[index] if points and index < len(points) else ""),
+            focus=(focuses[index] if focuses and index < len(focuses) else None),
+            why=(whys[index] if whys and index < len(whys) else ""),
+            brand=str(segment.get("brand") or ""),
         )
+        scenes.append(scene)
+        if beats_for_segment is not None and index < len(beats_for_segment):
+            body_beat_picks.append((scene, list(beats_for_segment[index])))
 
     # ---- 封面帧：第一帧必须是论文首页，而且要有大字标题 ----
     #
@@ -309,6 +327,21 @@ def build_scenes(
     for index in range(len(scenes) - 1):
         if scenes[index].end < scenes[index + 1].start:
             scenes[index].end = scenes[index + 1].start
+
+    # ---- 逐句画面：把逐句选图落成 `Scene.beats` ----
+    #
+    # 放在最后一步是因为守卫要的是**最终**值：封面段得等 headline 落到那几帧上
+    # （见上面「封面帧」那一段），「这一句太短」得按补齐空隙之后的时长估。
+    # 没有逐句选图（`beats_for_segment is None`：老数据复用、启发式兜底）时一句都不动，
+    # `beats` 保持空列表 = 整段一张图，老视频的行为一点不变。
+    for scene, picks in body_beat_picks:
+        scene.beats = build_scene_beats(
+            text=scene.text,
+            picks=picks,
+            duration=scene.duration,
+            headline=scene.headline,
+            brand=scene.brand,
+        )
 
     return scenes
 
@@ -479,6 +512,62 @@ def split_caption_beats(text: str, *, max_beats: int = CAPTION_BEAT_MAX) -> list
     if buffer.strip():
         merged.append(buffer.strip())
     return _split_beats_by_lines(merged)
+
+
+def build_scene_beats(
+    *,
+    text: str,
+    picks: list[str] | None,
+    duration: float,
+    headline: str = "",
+    brand: str = "",
+) -> list[Beat]:
+    """把**逐句**选图落成 `Scene.beats`，三条守卫在这里一次性施加。
+
+    ⚠️ **耦合**：句子必须用 `split_caption_beats` 切 —— 编码侧（`_render_scene_layers`
+    的字幕带、`beat_windows_aligned` 的换句时刻）用的是**同一个函数**，
+    只有两边切法一致，`Scene.beats[i]` 才真的对应第 i 句。切句规则一改两边一起错位。
+
+    三条守卫（见 `docs/BEAT_MOTION.md`「什么时候不切画面」，全部有测试）：
+
+    - **封面段与片尾品牌段一律不切**（`headline` 非空 / `brand == "outro"`）：
+      封面要始终是「论文首页 + 标题」，第一帧必须是论文首页是产品要求。
+    - **和上一句同一张图 → 空**：图没变就别动，无意义的溶解只会让人以为卡了一下。
+    - **太短的句子 → 空**：按字数估的时长 < `BEAT_IMAGE_MIN_SEC` 时几个字一闪而过，
+      比不切更难看。时长估算用编码侧同一个 `beat_windows`。
+
+    第 0 句**永远**是空：它就是这一段原本那张卡（段级转场负责它和上一段的差别），
+    所以这里没有「第 0 句单独一层」这回事。
+
+    `picks` 为 None（没有逐句数据）或句数对不上时返回**空列表** = 整段一张图。
+    句数对不上说明调用方的切句与这里不一致（稿子变了 / 切句规则改了），
+    这时宁可整段不切，也不能让第 i 句配到别人那一句的图上。
+    """
+    beats_text = split_caption_beats(text)
+    if not beats_text:
+        return []
+    if picks is None:
+        return []
+    if len(picks) != len(beats_text):
+        logger.warning(
+            "逐句配图的句数对不上（图 %d / 句 %d），这一段不切画面", len(picks), len(beats_text)
+        )
+        return []
+
+    # 封面段与片尾品牌段：整段不切（beats 照旧逐句给出来，image 全空）
+    frozen = bool(headline) or brand == "outro"
+    windows = beat_windows(beats_text, duration)
+
+    beats: list[Beat] = []
+    for index, beat_text in enumerate(beats_text):
+        image = ""
+        if not frozen and index > 0:
+            changed = picks[index] != picks[index - 1]
+            span = windows[index][1] - windows[index][0]
+            if changed and span >= BEAT_IMAGE_MIN_SEC:
+                image = picks[index]
+        beats.append(Beat(text=beat_text, image=image))
+    return beats
 
 
 def _beat_lines(text: str) -> int:
@@ -702,13 +791,20 @@ def _render_point_layer(point: str, path: Path, *, layout: Layout, session: Any)
     return path
 
 
-def _render_band_layer(beat: str, path: Path, *, layout: Layout, session: Any) -> Path:
-    """字幕带层：单独一层是为了「字幕逐句出现」（每句一条带子按时序叠上去）。"""
+def _render_band_layer(
+    beat: str, path: Path, *, layout: Layout, session: Any, chip: bool = True
+) -> Path:
+    """字幕带层：单独一层是为了「字幕逐句出现」（每句一条带子按时序叠上去）。
+
+    `chip=False` = 这一句**先不要把数字胶囊画出来**（数字用普通文字颜色，位置不变）：
+    它留给逐句强调层晚 0.12 秒在同一处点亮，否则强调层叠上去等于没叠
+    （见 docs/BEAT_MOTION.md）。默认 `True`，一处没给就是原来的观感。
+    """
     if session is None:
-        return render_caption_band(beat, path, layout=layout)
+        return render_caption_band(beat, path, layout=layout, chip=chip)
     from .htmlpage import caption_band_page
 
-    session.render(caption_band_page(beat, layout), path, work_dir=path.parent)
+    session.render(caption_band_page(beat, layout, chip=chip), path, work_dir=path.parent)
     return path
 
 
@@ -820,19 +916,37 @@ class RenderedLayers:
     # 逐帧抓下来的聚光灯动画（Tier B）：第 i 段是这一段的帧序列，没有就是空列表
     focus_frames: list[list[Path]]
     image_ids: list[str]
+    # **逐句**的两层（见 docs/BEAT_MOTION.md）：第 i 段第 j 句的一张图片卡 / 一个数字强调层。
+    # 空列表 = 这一段没有逐句图层（老数据 `beats=[]` 天然如此）—— 编码侧拿到空列表
+    # 走的就是改动前那条滤镜链，所以这两个字段的默认值必须是空列表而不是 `None`。
+    beat_cards: list[list[Path | None]] = field(default_factory=list)
+    beat_chips: list[list[Path | None]] = field(default_factory=list)
     endcard_count: int = 0
     beat_count: int = 0
+    chip_count: int = 0
     backend: str = "svg"
 
 
 def _render_scene_layers(
-    scenes: list[Scene], layout: Layout, work_dir: Path
+    scenes: list[Scene],
+    layout: Layout,
+    work_dir: Path,
+    *,
+    assets: dict[str, ImageAsset] | None = None,
+    pauses: list[Any] | None = None,
 ) -> RenderedLayers:
     """把每一段画面渲染成「骨架 + 图片卡 + 字幕带 + 强调行 + 聚光灯」几层文件。
 
     分层的意义（见 AGENTS.md「转场与语音驱动的动效」一节）：骨架全程不动、
     只有图片卡在换，画面上就是「同一页里图在变」，而不是每段重画一整页。
     字幕再单独成层，才能做到「字幕逐句出现」。
+
+    逐句那两层（`render_beat_layers`）也在这里渲染：它要**先**算出来，
+    因为字幕带要不要画那颗数字胶囊取决于这一句有没有强调层（上面 `chip=`）。
+
+    `assets` 是素材池（`Beat.image` 是素材 id，要换成真实文件路径），
+    `pauses` 是说话停顿 —— `render_beat_layers` 算逐句窗口用的是和编码侧
+    **同一个** `beat_windows_aligned`，不给就会按字数估，两边的「太短不切」判据会错位。
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     result = RenderedLayers(
@@ -849,6 +963,22 @@ def _render_scene_layers(
             beats = split_caption_beats(scene.text)
             bands: list[CaptionBand] = []
             card_path: Path | None = None
+            # 逐句图层（见 docs/BEAT_MOTION.md）：**先算出来**，因为下面那条字幕带要不要
+            # 画数字胶囊取决于这一句有没有强调层。片尾品牌卡既不分句也不叠图层，跳过。
+            beat_layers = BeatLayers()
+            if scene.brand != "outro":
+                beat_layers = render_beat_layers(
+                    scene,
+                    index=index,
+                    work_dir=work_dir,
+                    layout=layout,
+                    assets=assets,
+                    pauses=pauses,
+                    session=session,
+                )
+            result.beat_cards.append(list(beat_layers.cards))
+            result.beat_chips.append(list(beat_layers.chips))
+            result.chip_count += sum(1 for chip in beat_layers.chips if chip is not None)
 
             if scene.brand == "outro":
                 # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
@@ -873,7 +1003,18 @@ def _render_scene_layers(
                 if len(beats) > 1:
                     for beat_index, beat in enumerate(beats):
                         band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
-                        _render_band_layer(beat, band_path, layout=layout, session=session)
+                        # 这一句有强调层 → 带子里先不画胶囊，留给强调层点亮（见 BEAT_MOTION）
+                        has_chip = (
+                            beat_index < len(beat_layers.chips)
+                            and beat_layers.chips[beat_index] is not None
+                        )
+                        _render_band_layer(
+                            beat,
+                            band_path,
+                            layout=layout,
+                            session=session,
+                            chip=not has_chip,
+                        )
                         bands.append(CaptionBand(text=beat, image=band_path))
                         result.band_paths.append(band_path)
                     result.beat_count += 1
@@ -993,8 +1134,22 @@ def compose_video(
         default_id = default_asset_id(pool)
         figure_ids = [i for i in pool if i not in ("cover", "illustration")]
 
-    # 逐段语义匹配：优先让模型判断「这一段在讲什么、哪张图正好在讲同一件事」
+    # 逐句切分：**必须**用 split_caption_beats。
+    #
+    # ⚠️ 耦合：编码侧（`_render_scene_layers` 的字幕带、`beat_windows_aligned` 的换句时刻）
+    # 用的是**同一个**函数，所以两边句数与顺序天然一致，`Scene.beats[i]` 就是第 i 句。
+    # 切句规则一改两边一起错位 —— 切句这件事只能有这一个出处（见 docs/BEAT_MOTION.md）。
+    beat_texts = [
+        split_caption_beats(str(segment.get("text") or "")) for segment in segments
+    ]
+    beat_counts = [len(texts) for texts in beat_texts]
+
+    # 逐句语义匹配：优先让模型判断「这句话在讲什么、哪张图正好在讲同一件事」
     image_for_segment: list[str] | None = None
+    # 逐句选图：`beat_picks[i][j]` = 第 i 段第 j 句选到的图。
+    # **None 表示没有逐句数据**（老数据复用 / 启发式不猜）。这时 `build_scenes` 一句都不切，
+    # `Scene.beats` 保持空列表 = 整段一张图（老行为）。
+    beat_picks: list[list[str]] | None = None
     # 逐段「为什么配这张图」（模型写的，或从上次合成里复用）。只入库、不渲染。
     assignment_whys: list[str] = [""] * len(segments)
     strategy = "heuristic"
@@ -1024,37 +1179,90 @@ def compose_video(
         if missing:
             logger.info("其中有 %d 段引用的图已失效，回退到中性图", missing)
 
+        # 逐句画面**一起复用**（规矩 3：重新合成不许调模型）。逐句配图是「选图」那一步的
+        # 产物，跟 `scene.image` 一样存下来复用，否则「只是转了个配图」会让画面分配全变。
+        # **老数据没有 beats** → 保持 None，`build_scenes` 走整段一张图那条路，一点不变。
+        if any(isinstance(sc, dict) and sc.get("beats") for sc in preset_scenes):
+            reused_beats: list[list[str]] = []
+            dropped = 0
+            for index in range(len(segments)):
+                raw_beats = (stored.get(index) or {}).get("beats")
+                picks: list[str] = []
+                if isinstance(raw_beats, list) and len(raw_beats) == beat_counts[index]:
+                    for beat_index, beat in enumerate(raw_beats):
+                        if not isinstance(beat, dict):
+                            continue
+                        # 稿子/切句规则变了的话，存下来的句子对不上，整段不切（宁可不动）
+                        if str(beat.get("text") or "") != beat_texts[index][beat_index]:
+                            picks = []
+                            dropped += 1
+                            break
+                        asset_id = str(beat.get("image") or "")
+                        # 图被删了就按「这一句不切」处理（沿用本段那张），
+                        # 比塞一张别的图更贴近当初的选择
+                        picks.append(
+                            asset_id if asset_id in pool and pool[asset_id].exists else ""
+                        )
+                elif beat_counts[index]:
+                    dropped += 1
+                reused_beats.append(picks or [""] * beat_counts[index])
+            beat_picks = reused_beats
+            reused_switches = sum(1 for picks in reused_beats for pick in picks if pick)
+            logger.info(
+                "逐句画面：复用上次的 %d 处换图（%d 段）", reused_switches, len(reused_beats)
+            )
+            if dropped:
+                logger.info("其中有 %d 段的逐句分配已经对不上当前稿子，退回整段一张图", dropped)
+
     elif llm is not None and not getattr(llm, "mock", True):
         assets = [
             {"id": asset.id, "caption": asset.caption}
             for asset in pool.values()
         ]
+        total_beats = sum(beat_counts)
         try:
             data = llm._chat_json(
-                build_assign_messages(segments, assets),
-                # 每段一项，现在每项除了 id 还多一句 why（中文 20 字 ≈ 25 token），
-                # 所以预算是 110/段 —— 卡着 60 会让长稿的尾部整段缺项，
-                # 而缺项的表现是「后半程画面回到中性图」，看起来像模型没干活。
-                max_tokens=max(2500, len(segments) * 110),
+                build_assign_messages(segments, assets, beats_per_segment=beat_texts),
+                # 单位是**句**（以前是段）：每句一项，每项除了 id 还多一句 why
+                # （中文 20 字 ≈ 25 token），所以预算按**句数**给 110/句 ——
+                # 卡着 60 会让长稿的尾部整段缺项，而缺项的表现是「后半程画面回到中性图」，
+                # 看起来像模型没干活。
+                max_tokens=max(2500, total_beats * 110),
                 temperature=0.2,
             )
-            candidate = _normalize_per_segment(
+            candidate_beats = _normalize_per_beat(
                 data.get("assignments"),
-                count=len(segments),
+                beat_counts=beat_counts,
                 valid_ids=set(pool),
                 default_id=default_id,
             )
-            if candidate:
-                image_for_segment = candidate
+            if candidate_beats:
+                beat_picks = candidate_beats
+                # `scene.image` 仍然是这一段**第一句**选到的那张：老逻辑
+                # （video.scenes[i].image）、复用/重建那条链、TestPresetReuse 全都依赖它，
+                # 逐句的差别只落在 `Scene.beats` 上。
+                image_for_segment = [
+                    picks[0] if picks else default_id for picks in candidate_beats
+                ]
                 strategy = "model"
-                assignment_whys = _assignment_notes(
+                assignment_whys = _beat_notes_by_segment(
                     data.get("assignments"),
-                    count=len(segments),
+                    beat_counts=beat_counts,
                     valid_ids=set(pool),
                 )
-                distinct = len(set(candidate))
+                distinct = len(set(image_for_segment))
+                switches = sum(
+                    1
+                    for picks in candidate_beats
+                    for index in range(1, len(picks))
+                    if picks[index] != picks[index - 1]
+                )
                 logger.info(
-                    "逐段配图由模型完成：%d 段用了 %d 张不同的图", len(candidate), distinct
+                    "逐句配图由模型完成：%d 段 %d 句用了 %d 张不同的图（%d 句与前一句不同）",
+                    len(image_for_segment),
+                    total_beats,
+                    distinct,
+                    switches,
                 )
                 # 抽查几条理由：这是「图文到底符不相符」在日志里唯一看得见的证据
                 # （以前只能靠人重读全稿）。空着的位置不打，所以只报「几段有」。
@@ -1070,13 +1278,41 @@ def compose_video(
                         sample[:300],
                     )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("模型逐段配图失败，退回均匀分布：%s", exc)
+            logger.warning("模型逐句配图失败，退回均匀分布：%s", exc)
 
     if image_for_segment is None:
         image_for_segment = heuristic_per_segment(
             len(segments), figure_ids, default_id
         )
-        logger.info("逐段配图使用均匀分布（退化方案，不保证图文相符）")
+        # 逐句兜底：**沿用本段那一张**，不在本地猜哪句该换图（那是编，见 heuristic_per_beat）。
+        beat_picks = heuristic_per_beat(image_for_segment, beat_counts)
+        logger.info("逐句配图使用均匀分布（退化方案，不保证图文相符，逐句沿用本段那张）")
+
+    # ---- 现场生成的配图：单位仍然是**段** ----
+    #
+    # ⚠️ 单位变了：`generate` 现在是**逐句**选出来的（以前只有逐段）。
+    # 同一段里「一句有原图、一句没原图」很常见，直接按句喂给 group_generate_runs
+    # 会让生成组数随句数放大 —— 每组一次模型调用（实测约 10 秒 / 3000+ token），
+    # 成本就失控了。所以先把**同一段内**的 generate 合并到整段：同一段里的句子本来
+    # 就在讲同一件事（选图就是按「这句在讲什么」选的），整段共用一张现场生成的图。
+    # 合并之后 `group_generate_runs` / `merge_runs_to_cap` / `MAX_TOPIC_IMAGES`
+    # 的「单位」仍然是**段**，量级与合并前一致。
+    if beat_picks is not None:
+        collapsed = collapse_generate_within_segments(beat_picks)
+        if collapsed != beat_picks:
+            logger.info(
+                "同一段内的 generate 已合并到整段：%d 段（按句算有 %d 句选了 generate）",
+                sum(1 for before, after in zip(beat_picks, collapsed) if before != after),
+                sum(1 for picks in beat_picks for pick in picks if pick == GENERATE_ID),
+            )
+            # 整段改成 generate 的，段级那张图（`scene.image`）也跟着改成 generate，
+            # 否则 `scene.image` 会和 `beats` 打架（段级那张图与逐句的安排对不上）。
+            # ⚠️ 不能拿 `beats[0]` 反推段级那张图：第 0 句的 image **恒为空**
+            # （它就是这一段原本那张卡），拿它反推会把 scene.image 清成空串。
+            for index, (before, after) in enumerate(zip(beat_picks, collapsed)):
+                if before != after and after and index < len(image_for_segment):
+                    image_for_segment[index] = after[0]
+        beat_picks = collapsed
 
     # ---- 没有对应原图的段落：现场生成专门的配图 ----
     #
@@ -1111,11 +1347,19 @@ def compose_video(
                 continue  # 这一组生成失败 → 保持 generate，下面会退回中性图
             for index in range(start_segment, min(end_segment, len(image_for_segment))):
                 image_for_segment[index] = asset.id
+                if beat_picks is not None and index < len(beat_picks):
+                    # 这一段的每一句都指向同一张（上面已经按段合并过，句里那几张是同一个话题）
+                    beat_picks[index] = [asset.id] * len(beat_picks[index])
 
     # 生成失败或未生成的部分退回中性图，保证不会出现空画面
     image_for_segment = [
         pick if pick != GENERATE_ID else default_id for pick in image_for_segment
     ]
+    if beat_picks is not None:
+        beat_picks = [
+            [pick if pick != GENERATE_ID else default_id for pick in picks]
+            for picks in beat_picks
+        ]
     logger.info(
         "配图构成：原图/封面 %d 张，现场生成 %d 张，中性兜底 %d 段",
         len(figure_ids),
@@ -1280,12 +1524,22 @@ def compose_video(
         points=points,
         focuses=focuses,
         whys=assignment_whys,
+        # 逐句选图 → `Scene.beats`（三条守卫在 build_scene_beats 里施加）
+        beats_for_segment=beat_picks,
         headline=cover_headline,
         cover_caption=title,
     )
 
     layout = layout_for(orientation)
-    layers = _render_scene_layers(scenes, layout, work_dir)
+    # 说话停顿：用来把字幕换句对准真实的停顿（检测失败就是空列表 → 退回按字数）。
+    # **必须在渲染图层之前拿到**：`render_beat_layers` 里的「这一句太短不切」用的是
+    # `beat_windows_aligned` —— 编码侧同一个函数、同一组停顿，两边算出的窗口必须一致，
+    # 否则会出现「渲染时判它够长、编码时又跳过」（白渲染一堆用不上的卡）。
+    pauses = detect_pauses(audio_path)
+    if pauses:
+        logger.info("检测到 %d 处说话停顿，字幕换句将对齐到停顿", len(pauses))
+
+    layers = _render_scene_layers(scenes, layout, work_dir, assets=pool, pauses=pauses)
     image_ids = layers.image_ids
 
     transitions = plan_transitions(scenes, image_ids, cards=layers.cards, slides=layers.slides)
@@ -1296,15 +1550,14 @@ def compose_video(
             transitions[frame_index] = Transition()
     moved = sum(1 for item in transitions if item.kind not in ("", "none"))
     logger.info(
-        "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧，字幕分句 %d 段，转场 %d 处）",
-        len(layers.slides), layers.endcard_count, layers.beat_count, moved,
+        "已渲染 %d 帧画面（其中片尾品牌卡 %d 帧，字幕分句 %d 段，逐句卡 %d 个，"
+        "数字强调 %d 个，转场 %d 处）",
+        len(layers.slides), layers.endcard_count, layers.beat_count,
+        sum(1 for row in layers.beat_cards for card in row if card is not None),
+        layers.chip_count, moved,
     )
 
-    # 说话停顿：用来把字幕换句对准真实的停顿（检测失败就是空列表 → 退回按字数）
-    pauses = detect_pauses(audio_path)
-    if pauses:
-        logger.info("检测到 %d 处说话停顿，字幕换句将对齐到停顿", len(pauses))
-
+    # 说话停顿在上面（渲染图层之前）已经算过了
     result = encode_video(
         scenes,
         layers.slides,
@@ -1318,10 +1571,17 @@ def compose_video(
         transitions=transitions,
         focus_overlays=layers.focus_rows,
         focus_animations=layers.focus_frames,
+        # **逐句**的两层（见 docs/BEAT_MOTION.md）：少了这两个参数，上面渲染出来的
+        # 逐句卡与数字强调层就只是躺在磁盘上 —— 这一步才是「动效真的进片」的那根线。
+        beat_cards=layers.beat_cards,
+        beat_chips=layers.beat_chips,
         layout=layout,
     )
     result.assignment = strategy
     result.renderer = layers.backend
+    # 正文场景与 segments 一一对应：片头封面帧与片尾品牌卡都没有主播（`speaker` 为空），
+    # 所以「有主播」这个选择器筛出来的就是正文（老测试里也是这么筛的）。
+    body_scenes = [scene for scene in scenes if scene.speaker]
     result.scenes = [
         {
             "index": index,
@@ -1332,6 +1592,15 @@ def compose_video(
             # 「为什么配这张图」（模型写的）。**只存不渲染**：它是复查图文相符的依据，
             # 也让「同一张图连讲多段」这种判断有迹可循，不必再重读全稿。
             "why": assignment_whys[index] if index < len(assignment_whys) else "",
+            # **逐句画面**一起存：它和 image 一样是「选图」那一步的产物，
+            # 重新合成时复用（规矩 3：重新合成不许调模型），画面才不会因为重做而全变。
+            # 存的是 build_scene_beats 施加过守卫之后的结果（真正的画面安排）。
+            "beats": [
+                {"text": beat.text, "image": beat.image}
+                for beat in (
+                    body_scenes[index].beats if index < len(body_scenes) else []
+                )
+            ],
         }
         for index in range(min(len(segments), len(image_for_segment)))
     ]
@@ -1350,12 +1619,17 @@ def compose_video(
         )
     )
 
+    # 中间图层编码完就没用了，删掉省磁盘。**逐句的那两层也要删** ——
+    # 它们是这一轮新增的中间产物，一段两句就是两三个文件，一集几十段攒下来不少
+    # （`chip-*.png` 之前没人删，实测跑一次测试就留下好几个）。
     for temp_path in [
         *layers.slides,
         *layers.band_paths,
         *layers.point_paths,
         *layers.card_paths,
         *layers.focus_paths,
+        *(card for row in layers.beat_cards for card in row if card is not None),
+        *(chip for row in layers.beat_chips for chip in row if chip is not None),
     ]:
         try:
             temp_path.unlink(missing_ok=True)
@@ -1370,8 +1644,35 @@ def compose_video(
 # --------------------------------------------------------------------------
 
 
+def collapse_generate_within_segments(
+    beat_picks: list[list[str]],
+) -> list[list[str]]:
+    """把**同一段内**的 `generate` 合并到整段：一段里只要有一句要现场生成，整段都算它。
+
+    为什么需要这一步：单位从「段」变成「句」之后，`generate` 是**逐句**选的 ——
+    同一段里「一句挑到原图、另一句挑不到」很常见。按句喂给 `group_generate_runs`
+    会切出一堆只在段内连续的小组，组数随句数放大，而**每组一次模型调用**
+    （实测每张约 10 秒 / 3000+ token），成本和耗时立刻失控。
+
+    同一段里的句子本来就在讲同一件事（选图就是按「这句在讲什么」挑的），
+    所以整段共用一个「现场生成的图」是合理的近似；合并之后组数 ≤ 段数，
+    与逐段时代的量级一致（见 `docs/BEAT_MOTION.md`）。
+    """
+    collapsed: list[list[str]] = []
+    for picks in beat_picks:
+        if GENERATE_ID in picks:
+            collapsed.append([GENERATE_ID] * len(picks))
+        else:
+            collapsed.append(list(picks))
+    return collapsed
+
+
 def group_generate_runs(picks: list[str]) -> list[tuple[int, int]]:
-    """把连续的 generate 段落合并成 [起, 止) 区间。
+    """把连续的 generate **段落**合并成 [起, 止) 区间。
+
+    ⚠️ **单位是段**：入参是逐段的 `image_for_segment`，不是逐句的选图 ——
+    逐句的 `generate` 在调用之前已经被 `collapse_generate_within_segments`
+    合并到整段了（否则组数会随句数放大，见那个函数的说明）。
 
     必须合并：一段一张图的话，21 段脚本会生成十几张，每张一次模型调用
     （实测单张约 10 秒、3000+ token），成本和耗时都不可控。

@@ -589,15 +589,10 @@ def point_row_page(point: str, layout: Layout) -> Page:
     )
 
 
-def caption_band_page(text: str, layout: Layout) -> Page:
-    """底部那条字幕带单独一层（「字幕逐句出现」用）。
-
-    画幅是 `layout.width × (band 高)`，位置固定叠在 `y=layout.subtitle_top`，
-    所以它盖住的就是底图那一条空字幕区。字号比整页字幕大（观众真正在读的就是这两行），
-    竖直居中 —— 照搬整页那条基线会让一两行字顶在上沿、下面空一大片。
-    """
-    band_h = layout.height - layout.subtitle_top
-    css = BASE_CSS + f"""
+def _band_css(band_h: int) -> str:
+    """字幕带那一层的排版 CSS。**带子和「只有胶囊」那一层共用这一份** ——
+    两处各写一份的话，胶囊就会歪几个像素，而这种错位在小方块上看得很清楚。"""
+    return BASE_CSS + f"""
     html, body {{ height: {band_h}px; }}
     .page {{ height: {band_h}px; }}
     .band-text {{
@@ -607,14 +602,74 @@ def caption_band_page(text: str, layout: Layout) -> Page:
       font-size: {SUBTITLE_BAND_MAX_FONT:.0f}px; line-height: 1.36; color: {SUBTITLE_TEXT};
     }}
     """
+
+
+def _band_body(text: str, layout: Layout) -> str:
+    """字幕带的 body（带子和胶囊层共用：排版一样，胶囊才落在同一个地方）。"""
     attrs = _fit_attrs(
         max_font=SUBTITLE_BAND_MAX_FONT, min_font=24, lines=3, height=True
     )
-    body = (
+    return (
         f'<div class="page"><div class="band-text" {attrs}>'
         f"{_figure_text(' '.join((text or '').split()))}</div></div>"
     )
-    return Page(html=_document(css, _layout_vars(layout), body), width=layout.width, height=band_h)
+
+
+def caption_band_page(text: str, layout: Layout, *, chip: bool = True) -> Page:
+    """底部那条字幕带单独一层（「字幕逐句出现」用）。
+
+    画幅是 `layout.width × (band 高)`，位置固定叠在 `y=layout.subtitle_top`，
+    所以它盖住的就是底图那一条空字幕区。字号比整页字幕大（观众真正在读的就是这两行），
+    竖直居中 —— 照搬整页那条基线会让一两行字顶在上沿、下面空一大片。
+
+    `chip=False`：**不画那颗数字胶囊**（底色去掉、数字用普通文字颜色），
+    数字仍然落在同一个像素位置（只有颜色变，不碰 padding/字号）。
+    逐句强调层晚 0.12 秒在同一处点亮它 —— 不这么做的话带子里本来就画了胶囊，
+    叠上去等于什么都没发生（实测两帧的强调色像素数一模一样）。
+    默认 `True` 保持不变：「一页到底」的 `render_slide` 与老数据都按原样出片。
+    """
+    band_h = layout.height - layout.subtitle_top
+    css = _band_css(band_h) if chip else _band_css(band_h) + CHIP_OFF_CSS
+    return Page(
+        html=_document(css, _layout_vars(layout), _band_body(text, layout)),
+        width=layout.width,
+        height=band_h,
+    )
+
+
+# 「只有数字胶囊」那一层的附加 CSS：**排版一模一样，只把字变透明**。
+# 这样胶囊和整条字幕带里那颗**逐像素重合**（同一个排版引擎、同一套自适应字号），
+# 而不是照 `_char_width` 那张近似表另算一遍坐标（那必然差几个像素）。
+CHIP_CSS = """
+html, body, .page { background: transparent; }
+.band-text, .band-text .num { color: transparent; }
+"""
+
+
+# 「先不要这颗胶囊」那一版的附加 CSS：**排版一模一样，只去掉底色、把数字改回普通文字色**。
+# 只动颜色、不动 `padding`/字号/行高，所以数字仍然落在字幕带里的同一个位置 ——
+# 逐句强调层随后在同一处点亮它，「句子先出现 → 0.12 秒后那颗数字被点出来」才看得见。
+CHIP_OFF_CSS = """
+.band-text .num { background: transparent; color: inherit; }
+"""
+
+
+def caption_chip_page(text: str, layout: Layout) -> Page:
+    """**只画数字强调胶囊、其余全透明**的一层（叠在字幕带之上，用来「弹」出来）。
+
+    为什么不是自己算胶囊坐标：字幕带里那颗胶囊的位置由浏览器的真实字体度量 +
+    `fitText` 的自适应字号决定，另算一遍必然错位；这里保留完全相同的 DOM/CSS，
+    只把文字颜色改透明，胶囊就落在原处。
+    """
+    band_h = layout.height - layout.subtitle_top
+    return Page(
+        html=_document(
+            _band_css(band_h) + CHIP_CSS, _layout_vars(layout), _band_body(text, layout)
+        ),
+        width=layout.width,
+        height=band_h,
+        transparent=True,
+    )
 
 
 # 聚光灯从上一处**移到**这一处要用多久。这个数字不大是有原因的：
@@ -874,7 +929,9 @@ __all__ = [
     "ENDCARD_CSS",
     "FOCUS_CSS",
     "FOCUS_MORPH_SEC",
+    "CHIP_CSS",
     "caption_band_page",
+    "caption_chip_page",
     "endcard_page",
     "focus_overlay_page",
     "image_card_page",

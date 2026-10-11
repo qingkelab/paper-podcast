@@ -679,7 +679,8 @@ resvg 按宽度缩放而不是拉伸、强调行长度中英文必须分开定�
 | 模型调用、重试、结果解析 | `services/llm.py` / `services/llm_parse.py` |
 | 无密钥时的假数据 | `services/llm_mock.py` |
 | 版式与配色令牌（坐标 / 字号 / 颜色 / `Layout`） | `services/design.py` |
-| 视频编排：场景、转场、时长对齐 | `services/video.py` |
+| 视频编排：场景、逐句配图、转场、时长对齐 | `services/video.py` |
+| 逐句画面动效（什么时候换图/换聚光灯，为什么这么定） | `docs/BEAT_MOTION.md` |
 | SVG 画面（幻灯片 / 图片卡 / 强调行 / 字幕带 / 片尾） | `services/video_render.py` |
 | 视频里的数据类型（`Scene` / `VideoResult` / `VideoError` …） | `services/video_core.py` |
 | ffmpeg 编码与静帧 | `services/video_encode.py` |

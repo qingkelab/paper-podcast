@@ -15,13 +15,14 @@ from __future__ import annotations
 import base64
 import html
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from ..branding import BRAND_CTA_SUBTITLE, BRAND_CTA_TITLE, logo_path
 from .audio_track import Pause, align_boundaries
 from .design import (
+    BEAT_IMAGE_MIN_SEC,
     BG_COLOR,
     BRAND_DARK,
     BRAND_DARK_PANEL,
@@ -86,6 +87,7 @@ from .video_core import ImageAsset, Scene, VideoError
 logger = logging.getLogger("app.services.video")
 
 __all__ = [
+    "BeatLayers",
     "FigurePanels",
     "_caption_line_parts",
     "_fit_subtitle",
@@ -102,7 +104,9 @@ __all__ = [
     "build_panel_catalog",
     "image_card_markup",
     "progress_bar_svg",
+    "render_beat_layers",
     "render_caption_band",
+    "render_caption_chip",
     "render_chrome",
     "render_endcard",
     "render_focus_overlay",
@@ -572,15 +576,25 @@ def _number_runs(line: str) -> list[tuple[str, bool]]:
 
 
 def _caption_line_parts(
-    line: str, *, baseline: float, font_size: float, layout: Layout = PORTRAIT
+    line: str,
+    *,
+    baseline: float,
+    font_size: float,
+    layout: Layout = PORTRAIT,
+    chip: bool = True,
 ) -> list[str]:
     """渲染字幕的一行：数字用强调色 + 浅色底标出来，其余照常。
 
     为什么值得单独做：一期论文解读里真正有信息量的往往就是那个「67%」，
     而它夹在一整行灰白文字里最容易被读漏。强调它不需要任何模型输出，也不会看错。
+
+    `chip=False` 时**不画胶囊**、数字也用普通文字颜色（整行就是一段普通文字）。
+    逐句强调层（`render_caption_chip`）晚 0.12 秒在同一处把它点亮 ——
+    带子里本来就画了胶囊的话，那一层叠上去等于没叠（见 docs/BEAT_MOTION.md）。
+    默认 `True`：`render_slide` 那条「一页到底」的路一点不变。
     """
     runs = _number_runs(line)
-    if not any(is_number for _, is_number in runs):
+    if not chip or not any(is_number for _, is_number in runs):
         return [
             f'<text x="{layout.subtitle_left}" y="{baseline:.0f}" '
             f'font-family="{FONT_STACK}" font-size="{font_size:.0f}" '
@@ -807,8 +821,101 @@ def render_focus_overlay(
     return output_path
 
 
+def _band_layout(
+    text: str, layout: Layout
+) -> tuple[float, list[str], float, float, int]:
+    """字幕带（以及只画胶囊那一层）共用的排版：字号、折行、首行基线、行高、带高。
+
+    **两层必须共用这一份**：胶囊的位置是从基线推出来的，各算一遍就会歪。
+    """
+    band_h = layout.height - layout.subtitle_top
+    font_size, lines = _fit_subtitle(text, max_lines=3, max_size=CAPTION_BAND_MAX_FONT)
+    line_height = font_size * 1.36
+    block_h = line_height * len(lines)
+    # 竖直居中：整页字幕是从固定基线往下排的，这里只有一两行，
+    # 照搬那个基线会让文字顶在上沿、下面空一大片
+    first_baseline = (band_h - block_h) / 2 + font_size * 0.95
+    return font_size, lines, first_baseline, line_height, band_h
+
+
+def _chip_rects(
+    line: str, *, baseline: float, font_size: float, layout: Layout = PORTRAIT
+) -> list[str]:
+    """一行里每个数字（带单位）的**胶囊矩形**。
+
+    几何跟 `_caption_line_parts` 里那一段逐字一致 —— 那条带子里的胶囊是同一套数
+    算出来的，所以两层叠上去是重合的，不是「差不多」。
+    """
+    parts: list[str] = []
+    cursor = layout.subtitle_left
+    for text_run, is_number in _number_runs(line):
+        width = sum(_char_width(char) for char in text_run) * font_size
+        if is_number:
+            parts.append(
+                f'<rect x="{cursor - 3:.1f}" y="{baseline - font_size * 0.92:.1f}" '
+                f'width="{width + 6:.1f}" height="{font_size * 1.22:.1f}" rx="4" '
+                f'fill="{POINT_BG}"/>'
+            )
+        cursor += width
+    return parts
+
+
+def render_caption_chip(
+    text: str,
+    output_path: Path,
+    *,
+    speaker: str = "",
+    layout: Layout = PORTRAIT,
+    session: Any | None = None,
+) -> Path | None:
+    """**只画这一句里的数字强调胶囊**、其余全透明的一层；句子里没有数字就返回 None。
+
+    为什么要单独一层：这一层要「晚于自己那句字幕 0.12 秒再弹出来」，而字幕带是静止的
+    一整层 —— 只有把要动的那一小块抠出来，才能让它自己长出来。
+
+    位置与整条字幕带里那颗胶囊**对齐**：HTML 路径复用 `htmlpage.caption_chip_page`
+    （同一份 DOM/CSS，只把字变透明，所以是同一个排版引擎算出来的同一处）；
+    SVG 路径复用 `_chip_rects`（与 `_caption_line_parts` 同一组数）。
+    `speaker` 现在还不影响配色（按主播上色的胶囊还没有产品需求），留着是为了不改签名。
+    """
+    clean = " ".join((text or "").split())
+    if not clean or not _NUMBER_TOKEN.search(clean):
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if session is not None:
+        from .htmlpage import caption_chip_page
+
+        session.render(caption_chip_page(clean, layout), output_path, work_dir=output_path.parent)
+        return output_path
+
+    font_size, lines, first_baseline, line_height, band_h = _band_layout(clean, layout)
+    rects: list[str] = []
+    for offset, line in enumerate(lines):
+        rects.extend(
+            _chip_rects(
+                line,
+                baseline=first_baseline + offset * line_height,
+                font_size=font_size,
+                layout=layout,
+            )
+        )
+    if not rects:
+        return None
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{band_h}" '
+        f'viewBox="0 0 {layout.width} {band_h}">',
+        *rects,
+        "</svg>",
+    ]
+    # 不画底：这一层只有胶囊，其余必须透明（不透明的话整条字幕带会被它盖白）
+    _rasterize_custom("\n".join(parts), output_path, width=layout.width, height=band_h)
+    return output_path
+
+
 def render_caption_band(
-    text: str, output_path: Path, *, layout: Layout = PORTRAIT
+    text: str, output_path: Path, *, layout: Layout = PORTRAIT, chip: bool = True
 ) -> Path:
     """只渲染底部那条字幕带，用于「字幕逐句出现」。
 
@@ -817,9 +924,12 @@ def render_caption_band(
 
     字号比整页字幕放大到 38：观众真正在读的是这两行，而一句比一整段短得多，
     放得下更大的字（放不下会自动往小退，见 `_fit_subtitle`）。
+
+    `chip=False`：这一句的**数字不画胶囊**（普通文字颜色、位置不变）。
+    只有「这一句有逐句强调层」时才会这么渲染 —— 否则强调层叠上去看不出来
+    （见 docs/BEAT_MOTION.md「让数字强调真的看得见」）。默认 `True`，老路径不受影响。
     """
-    band_h = layout.height - layout.subtitle_top
-    font_size, lines = _fit_subtitle(text, max_lines=3, max_size=CAPTION_BAND_MAX_FONT)
+    font_size, lines, first_baseline, line_height, band_h = _band_layout(text, layout)
 
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{band_h}" '
@@ -828,17 +938,11 @@ def render_caption_band(
         f'<rect width="{layout.width}" height="2" fill="{SUBTITLE_RULE}"/>',
     ]
 
-    if lines:
-        line_height = font_size * 1.36
-        block_h = line_height * len(lines)
-        # 竖直居中：整页字幕是从固定基线往下排的，这里只有一两行，
-        # 照搬那个基线会让文字顶在上沿、下面空一大片
-        first_baseline = (band_h - block_h) / 2 + font_size * 0.95
-        for offset, line in enumerate(lines):
-            baseline = first_baseline + offset * line_height
-            parts.extend(
-                _caption_line_parts(line, baseline=baseline, font_size=font_size)
-            )
+    for offset, line in enumerate(lines):
+        baseline = first_baseline + offset * line_height
+        parts.extend(
+            _caption_line_parts(line, baseline=baseline, font_size=font_size, chip=chip)
+        )
 
     parts.append("</svg>")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -846,9 +950,108 @@ def render_caption_band(
         "\n".join(parts),
         output_path,
         width=layout.width,
-        height=layout.height - layout.subtitle_top,
+        height=band_h,
     )
     return output_path
+
+
+# --------------------------------------------------------------------------
+# 逐句画面：每一句自己的一张图片卡（见 docs/BEAT_MOTION.md）
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class BeatLayers:
+    """一段画面里**逐句**的两层：每句一张图片卡、每句一个数字强调层（没有就是 None）。
+
+    字段名与 `video.RenderedLayers` 里要加的那两个一致，所以那边接过去几乎不用改：
+    `cards` = 这一句要不要换画面（空 = 不换），`chips` = 这一句的数字胶囊层。
+    """
+
+    cards: list[Path | None] = field(default_factory=list)
+    chips: list[Path | None] = field(default_factory=list)
+
+
+def _beat_image_path(value: Any, assets: dict[str, Any] | None) -> Path | None:
+    """`Beat.image`（素材 id）→ 真实文件路径。认不出 / 文件不在就 None（= 这一句不换）。"""
+    if not value:
+        return None
+    if assets:
+        asset = assets.get(str(value))
+        if asset is not None:
+            candidate = Path(getattr(asset, "path", asset))
+            if candidate.exists():
+                return candidate
+            return None
+    candidate = Path(str(value))
+    return candidate if candidate.exists() else None
+
+
+def render_beat_layers(
+    scene: Scene,
+    *,
+    index: int = 0,
+    work_dir: Path,
+    layout: Layout = PORTRAIT,
+    assets: dict[str, Any] | None = None,
+    pauses: list[Pause] | None = None,
+    session: Any | None = None,
+) -> BeatLayers:
+    """把一段画面里的**逐句**图层渲染出来（逐句图片卡 + 逐句数字强调层）。
+
+    三条守卫都在这里（注释里各写了为什么）：
+    **封面段与片尾段永远不切画面**、**和上一句同图不切**、**这一句太短不切**
+    （用 `beat_windows_aligned` 算出来的**实际窗口时长**判，不是按字数估的）。
+
+    句子的时间窗和解码侧用的是同一个函数、同一组参数 —— 两边各算一遍就会错位。
+    """
+    beats = list(getattr(scene, "beats", None) or [])
+    layers = BeatLayers(cards=[None] * len(beats), chips=[None] * len(beats))
+    # 只有一句的段落没有「逐句」可言：字幕带那条路也是 `len(beats) > 1` 才拆
+    if len(beats) <= 1:
+        return layers
+
+    texts = [beat.text or "" for beat in beats]
+    windows = beat_windows_aligned(
+        texts, scene.duration, start=scene.start, pauses=pauses
+    )
+    # 守卫①：封面段（headline 非空）要始终是「论文首页 + 标题」，片尾是品牌卡。
+    # 「第一帧必须是论文首页」是产品要求，所以这里是硬守卫。
+    allow_cards = not (scene.headline or "").strip() and scene.brand != "outro"
+    current = Path(str(scene.image))
+
+    for beat_index, beat in enumerate(beats):
+        # 数字强调层：和「换不换画面」无关，每一句都可以有
+        chip_path = work_dir / f"chip-{index:04d}-{beat_index}.png"
+        layers.chips[beat_index] = render_caption_chip(
+            beat.text or "", chip_path, layout=layout, session=session
+        )
+
+        path = _beat_image_path(beat.image, assets)
+        if path is None or not allow_cards:
+            continue
+        if beat_index == 0:
+            # 第 0 句不需要单独一层：它就是这一段原本的那张卡
+            current = path
+            continue
+        # 守卫②：跟上一句是同一张图 —— 图没变就别动，无意义的溶解只会让人以为卡了一下
+        if path == current:
+            continue
+        beat_start, beat_end = windows[beat_index]
+        # 守卫③：这一句太短（按**实际窗口**判）：几个字一闪而过比不切更难看
+        if (beat_end - beat_start) < BEAT_IMAGE_MIN_SEC:
+            continue
+
+        card_path = work_dir / f"beat-{index:04d}-{beat_index}.png"
+        # 逐句卡用和本段同一套排版（`render_image_card`），只有图换了 ——
+        # 边框、裁切、叠放坐标因此一个字都不用改
+        render_image_card(
+            replace(scene, image=path, headline=""), card_path, layout=layout
+        )
+        layers.cards[beat_index] = card_path
+        current = path
+
+    return layers
 
 
 def render_endcard(

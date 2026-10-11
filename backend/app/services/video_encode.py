@@ -15,6 +15,7 @@ ffmpeg / ffprobe 的探测（`ffmpeg_available` / `probe_media_duration`）也�
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -24,7 +25,11 @@ from .audio_track import Pause
 
 # 版式/配色/节奏令牌的**老家**在 design.py（video.py 只是把它们再导出给老调用点）
 from .design import (
+    BEAT_CARD_FADE,
+    BEAT_IMAGE_MIN_SEC,
     CAPTION_FADE_SEC,
+    CHIP_POP_DELAY,
+    CHIP_POP_SEC,
     FOCUS_FADE_SEC,
     FPS,
     POINT_SLIDE_SEC,
@@ -88,6 +93,33 @@ def probe_media_duration(path: Path) -> float | None:
 
 
 
+def _file_signature(path: Path | None) -> str | None:
+    """图层文件的指纹，用来判「这一句的卡和上一句是不是同一张」。
+
+    为什么按**内容**而不是路径：同一张素材渲染出来的卡是确定性的（同样的图、同样的
+    排版 → 同样的字节），换了个文件名其实是同一张。拿路径比就会多做一次
+    「看起来像卡了一下」的无意义溶解 —— 正是守卫要拦的那种。
+    """
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
+    cached = _SIGNATURE_CACHE.get(key)
+    if cached is None:
+        try:
+            cached = hashlib.blake2b(path.read_bytes(), digest_size=16).hexdigest()
+        except OSError:
+            return None
+        _SIGNATURE_CACHE[key] = cached
+    return cached
+
+
+_SIGNATURE_CACHE: dict[str, str] = {}
+
+
 def encode_video(
     scenes: list[Scene],
     slide_paths: list[Path],
@@ -102,6 +134,8 @@ def encode_video(
     transitions: list[Transition] | None = None,
     focus_overlays: list[Path | None] | None = None,
     focus_animations: list[list[Path]] | None = None,
+    beat_cards: list[list[Path | None]] | None = None,
+    beat_chips: list[list[Path | None]] | None = None,
     waveform: bool = True,
     layout: Layout = PORTRAIT,
 ) -> VideoResult:
@@ -159,6 +193,11 @@ def encode_video(
     # Tier B：某些段的聚光灯是**逐帧抓下来的帧序列**（而不是一张静态图）。
     # 与 foci 互斥 —— 同一段要么叠静态图，要么叠序列。
     focus_anims = focus_animations or [[] for _ in scenes]
+    # **逐句**的两层（见 docs/BEAT_MOTION.md）：第 i 段第 j 句的一张卡 / 一个数字强调层。
+    # 空列表 / None 一律表示「这一句不换画面、不弹强调」—— 所以老数据（不给这两个参数）
+    # 走的滤镜链和以前完全一样。
+    beat_rows = beat_cards or [[] for _ in scenes]
+    chip_rows = beat_chips or [[] for _ in scenes]
     plan = transitions or [Transition() for _ in scenes]
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
@@ -234,6 +273,17 @@ def encode_video(
             graph = [f"[{chrome_in}:v]scale={layout.width}:{layout.height}[v0]"]
             last, node = "v0", 0
 
+            # 这一段的字幕分句 + 时间窗。**先算出来**：逐句图片卡和逐句数字强调层
+            # 用的就是这一组窗口（`beat_windows_aligned` 对齐真实停顿），
+            # 两边各算一遍必然错位 —— 这也是「同一组窗口」在这里只算一次的原因。
+            scene_bands = bands[index] if index < len(bands) else []
+            windows = beat_windows_aligned(
+                [band.text for band in scene_bands],
+                scene.duration,
+                start=scene.start,
+                pauses=pauses,
+            )
+
             # ---- 转场：发生在这一段**内部**，所以总帧数一个都不变 ----
             card = cards[index] if cards and index < len(cards) else None
             if (
@@ -285,6 +335,42 @@ def encode_video(
                     f"[{last}][ca{node}]overlay={layout.image_box_left}:{layout.image_top}[v{node}]"
                 )
                 last = f"v{node}"
+
+            # ---- 逐句图片卡：这一句讲了另一件事 → 在**图片窗口里**溶解过去 ----
+            #
+            # 为什么是「窗口里」而不是整页：整页换掉会连标题/图注/字幕/进度条一起闪，
+            # 而这一层是**不透明整卡**在图片框内换 —— 新卡淡入盖住旧卡，就是那段溶解。
+            # 淡入的起点是**这一句的起点**（`windows`，和字幕带同一组），
+            # 所以「话讲到这一句」和「画面换过去」是同一个时刻。
+            # 第 0 句不叠：它就是这一段原本的那张卡。
+            beat_row = beat_rows[index] if index < len(beat_rows) else []
+            # 守卫①：封面段（headline 非空）永远要是「论文首页 + 标题」，片尾是品牌卡 ——
+            # 数据侧已经拦了一道，这里再兜一层（「第一帧必须是论文首页」是产品要求）
+            if beat_row and not (scene.headline or "").strip() and scene.brand != "outro":
+                showing = _file_signature(card)
+                for beat_index, beat_card in enumerate(beat_row):
+                    if beat_index == 0 or beat_card is None or beat_index >= len(windows):
+                        continue
+                    beat_start, beat_end = windows[beat_index]
+                    # 守卫③：这一句太短（按**实际窗口时长**判，不是按字数估）
+                    if (beat_end - beat_start) < BEAT_IMAGE_MIN_SEC:
+                        continue
+                    # 守卫②：和上一句是同一张图 —— 图没变就别动
+                    signature = _file_signature(beat_card)
+                    if signature is not None and signature == showing:
+                        continue
+                    beat_in = add_image(beat_card)
+                    node += 1
+                    graph.append(
+                        f"[{beat_in}:v]format=rgba,fade=t=in:st={beat_start:.3f}:"
+                        f"d={BEAT_CARD_FADE:.2f}:alpha=1[bk{node}]"
+                    )
+                    graph.append(
+                        f"[{last}][bk{node}]overlay={layout.image_box_left}:{layout.image_top}:"
+                        f"enable='gte(t,{beat_start:.3f})'[v{node}]"
+                    )
+                    last = f"v{node}"
+                    showing = signature
 
             # ---- 图内聚光灯：讲到哪一块就把那一块框出来，其余压暗 ----
             #
@@ -360,14 +446,11 @@ def encode_video(
             last = f"v{node}"
 
             # ---- 字幕：第 0 句从一开始就在，后面的按窗口淡入 ----
-            scene_bands = bands[index] if index < len(bands) else []
-            windows = beat_windows_aligned(
-                [band.text for band in scene_bands],
-                scene.duration,
-                start=scene.start,
-                pauses=pauses,
-            )
-            for band, (beat_start, _beat_end) in zip(scene_bands, windows):
+            # （`scene_bands` / `windows` 在上面就算好了 —— 逐句卡和 chip 用的就是同一组）
+            chip_row = chip_rows[index] if index < len(chip_rows) else []
+            for beat_index, (band, (beat_start, _beat_end)) in enumerate(
+                zip(scene_bands, windows)
+            ):
                 band_in = add_image(band.image)
                 node += 1
                 graph.append(
@@ -377,6 +460,26 @@ def encode_video(
                 graph.append(
                     f"[{last}][cap{node}]overlay=x=0:y={layout.subtitle_top}:"
                     f"enable='gte(t,{beat_start:.3f})'[v{node}]"
+                )
+                last = f"v{node}"
+
+                # ---- 逐句数字强调：紧跟**它自己那一句**的字幕带 ----
+                #
+                # 比这一句的字幕晚 `CHIP_POP_DELAY` 出现（先读到句子，再看到那个数字被点出来），
+                # 而且必须排在条带之后 —— 它是叠在那条带子上的（和声波条同一类顺序问题）。
+                chip = chip_row[beat_index] if beat_index < len(chip_row) else None
+                if chip is None:
+                    continue
+                chip_start = beat_start + CHIP_POP_DELAY
+                chip_in = add_image(chip)
+                node += 1
+                graph.append(
+                    f"[{chip_in}:v]format=rgba,fade=t=in:st={chip_start:.3f}:"
+                    f"d={CHIP_POP_SEC:.2f}:alpha=1[chp{node}]"
+                )
+                graph.append(
+                    f"[{last}][chp{node}]overlay=x=0:y={layout.subtitle_top}:"
+                    f"enable='gte(t,{chip_start:.3f})'[v{node}]"
                 )
                 last = f"v{node}"
 
