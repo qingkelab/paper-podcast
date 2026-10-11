@@ -679,25 +679,39 @@ resvg 按宽度缩放而不是拉伸、强调行长度中英文必须分开定�
 | 模型调用、重试、结果解析 | `services/llm.py` / `services/llm_parse.py` |
 | 无密钥时的假数据 | `services/llm_mock.py` |
 | 版式与配色令牌（坐标 / 字号 / 颜色 / `Layout`） | `services/design.py` |
-| 视频编排：场景、转场、SVG 画面、时长对齐 | `services/video.py` |
+| 视频编排：场景、转场、时长对齐 | `services/video.py` |
+| SVG 画面（幻灯片 / 图片卡 / 强调行 / 字幕带 / 片尾） | `services/video_render.py` |
+| 视频里的数据类型（`Scene` / `VideoResult` / `VideoError` …） | `services/video_core.py` |
 | ffmpeg 编码与静帧 | `services/video_encode.py` |
 | HTML 画面 / Chrome 截图 | `services/htmlpage.py` / `htmlframe.py` |
 | 流水线各阶段（解析→解读→脚本→TTS→视频） | `services/pipeline.py` |
-| 接口（契约先改 `docs/API.md`） | `api/routes.py` |
-| 账号、会话、归属 | `auth.py` |
+| 单集接口（建 / 列表 / 详情 / 删除 / 重试） | `api/routes/episodes.py` |
+| 账号接口 | `api/routes/auth.py` |
+| 专辑接口 | `api/routes/albums.py` |
+| 分享与公开页（含免登录资源通道） | `api/routes/share.py` |
+| 产物读取（封面 / 原图 / 信息图 / 下载 / Range） | `api/routes/media.py` |
+| 封面标题 + 重新合成 + 静帧 | `api/routes/cover.py` |
+| 系统信息（health / options / usage / showcase） | `api/routes/system.py` |
+| 接口的公共件（router、依赖、序列化、鉴权归属、配额） | `api/routes/shared.py` |
+| 账号库（scrypt 口令 / 会话 cookie / 归属判定） | `app/auth.py` |
 | 表结构与查询 | `db.py` |
 | PDF 抽文本 / 配图与图注 / 子图切分 / 信息图 | `services/{ingest,figures,panels,illustration}.py` |
 | 账号以外的前端页面 | `frontend/src/views/*` 与 `components/*` |
 | 前端 Mock（离线演示）素材与文案 | `frontend/src/api/mock*.ts` |
 
-**拆分照这两条规矩做，别合回去**：
+**拆分照这三条规矩做，别合回去**：
 
 1. **文案与渲染分开**。文案（prompt + 模型输出的归一化）在 `services/prompts/` 包里；
-   渲染在 `video.py` / `htmlpage.py`。前者天天改、后者一个月动一次 ——
-   混在一个 3600 行的文件里，改一句口吻就得先读一遍滤镜链。
-2. **拆分靠「文件末尾再导出」保兼容**。搬走的东西在 `video.py` 末尾再导出一次，
+   渲染在 `video_render.py` / `htmlpage.py`。前者天天改、后者一个月动一次 ——
+   混在一个文件里，改一句口吻就得先读一遍滤镜链。
+2. **分层单向，别让门面变成必经之路**。视频那条链是
+   `design → video_core → video_render → video_encode → video`，
+   每一层单独 `import` 都能成立（早期用「在 `video.py` 末尾再导出」换兼容，
+   结果 `video_encode` 反向依赖 `video`，直接 import 会炸半初始化模块。
+   **不要再用末尾再导出**）。
+3. **兼容靠「门面再导出」**：被搬走的名字在 `video.py` / `llm.py` 里再导出一次，
    所以几十处老调用点（含 `tests/test_video.py` 的 60 多个 import）一个字都不用改。
-   新增拆分照这个模式做；**不要**为了躲循环导入去写函数内的 import（先把依赖归位）。
+   **不要**为了躲循环导入去写函数内的 import（先把依赖归位）。
 
 
 ## Mock 模式

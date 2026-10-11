@@ -2,11 +2,15 @@
 
 这里是「编码」这一件事的全部：每段滤镜链怎么拼、每段多少帧、进度条怎么推进、
 音频怎么封进去、失败怎么报错 —— 改编码不必读版式，改版式也不必读滤镜链。
-画面本身怎么画（坐标、SVG/HTML）在 `video.py`，版式与配色令牌在 `design.py`。
+画面本身怎么画（坐标、SVG/HTML）在 `video_render.py`，版式与配色令牌在 `design.py`。
+ffmpeg / ffprobe 的探测（`ffmpeg_available` / `probe_media_duration`）也只被这一条路径用，
+所以一起放在这里。
 
-依赖方向：本模块 import `video`（要用它的渲染函数与类型）。所以 `video` 只能
-**在文件末尾**再导出本模块（那时它已全部定义完）—— 请始终通过 `video` 引用本模块，
-不要直接 `import app.services.video_encode`（会撞上半初始化的循环导入）。
+分层：`design → video_core → video_render → video_encode → video`（本层是第 4 层）。
+本模块**只**从 `video_core`（类型）与 `video_render`（画面）取东西，**不 import `video.py`** ——
+所以 `import app.services.video_encode` 能独立成立，这正是这一轮拆分修掉的东西；
+门面 `video.py` 反过来 import 本模块，再由它统一对外。
+想改画面 → `video_render.py`；想改场景编排 / 转场 / 素材池 → `video.py`。
 """
 
 from __future__ import annotations
@@ -33,21 +37,55 @@ from .design import (
     WAVEFORM_RENDER_SIZE,
     Layout,
 )
-from .video import (
+from .video_core import (
     CaptionBand,
     Scene,
     Transition,
     VideoError,
     VideoResult,
+)
+from .video_render import (
     _rasterize_custom,
     beat_windows_aligned,
-    ffmpeg_available,
-    probe_media_duration,
     progress_bar_svg,
 )
 
 # 沿用原来的 logger 名：main.py 的日志 format 里带 %(name)s，搬家不该换掉日志通道。
 logger = logging.getLogger("app.services.video")
+
+__all__ = [
+    "capture_poster",
+    "encode_video",
+    "ffmpeg_available",
+    "probe_media_duration",
+]
+
+
+def ffmpeg_available() -> bool:
+    """系统里有没有 ffmpeg。调用方（流水线）靠它决定「这一步要不要做」。"""
+    return shutil.which("ffmpeg") is not None
+
+
+def probe_media_duration(path: Path) -> float | None:
+    """用 ffprobe 读容器时长。读不到就返回 None。"""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    try:
+        return round(float(result.stdout.strip()), 3)
+    except (TypeError, ValueError):
+        return None
+
 
 
 def encode_video(

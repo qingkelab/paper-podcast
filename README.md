@@ -202,10 +202,10 @@ paper-podcast/
 │   │   ├── voices.py              音色目录
 │   │   ├── auth.py                账号与会话（scrypt 口令 / httpOnly cookie）
 │   │   ├── worker.py              异步任务队列（串行消费 + 自动重试）
-│   │   ├── api/routes.py          HTTP 接口
+│   │   ├── api/routes/            HTTP 接口（按资源分文件：episodes/auth/albums/share/media/cover/system）
 │   │   └── services/
 │   │       ├── ingest.py          PDF/链接/文本 → 干净正文
-│   │       ├── prompts.py         Prompt 工程（本产品的核心资产）
+│   │       ├── prompts/           Prompt 工程（按功能分文件，本产品的核心资产）
 │   │       ├── llm.py             方舟客户端 + JSON 容错 + Mock
 │   │       ├── podcast_tts.py     播客 WebSocket 协议 + Mock
 │   │       ├── figures.py         封面渲染 + 论文原图提取
