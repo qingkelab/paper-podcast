@@ -31,6 +31,7 @@ from .design import (
     BEAT_IMAGE_MIN_SEC,
     CAPTION_FADE_SEC,
     CHIP_POP_DELAY,
+    CLAUSE_FADE_SEC,
     CHIP_POP_FPS,
     CHIP_POP_SEC,
     FOCUS_FADE_SEC,
@@ -478,11 +479,35 @@ def encode_video(
                 )
                 last = f"v{node}"
 
+                # ---- 这一句按小句依次出现：把后续状态的整条带子按时序叠上去 ----
+                #
+                # 每一张都是「同一套排版、只把还没轮到的小句变透明」，所以叠上去看到的是
+                # 「读到哪里，字长到哪里」。**必须排在强调层之前**：这些带子是不透明的，
+                # 排在后面会把刚点亮的胶囊盖掉（那正是「叠上去等于没叠」那条老坑的变种）。
+                for reveal_index, (reveal, moment) in enumerate(band.reveals):
+                    reveal_in = add_image(reveal)
+                    node += 1
+                    at = beat_start + moment
+                    graph.append(
+                        f"[{reveal_in}:v]format=rgba,fade=t=in:st={at:.3f}:"
+                        f"d={CLAUSE_FADE_SEC}:alpha=1[rv{node}]"
+                    )
+                    graph.append(
+                        f"[{last}][rv{node}]overlay=x=0:y={layout.subtitle_top}:"
+                        f"enable='gte(t,{at:.3f})'[v{node}]"
+                    )
+                    last = f"v{node}"
+
                 # ---- 逐句数字强调：紧跟**它自己那一句**的字幕带 ----
                 #
                 # 比这一句的字幕晚 `CHIP_POP_DELAY` 出现（先读到句子，再看到那个数字被点出来），
                 # 而且必须排在条带之后 —— 它是叠在那条带子上的（和声波条同一类顺序问题）。
-                chip_start = beat_start + CHIP_POP_DELAY
+                # 带子里那个数字**在第几个小句**决定它什么时候能点亮：整句按小句出现时，
+                # 还没轮到的小句是透明的，这时候弹一颗空胶囊等于「框里没字」
+                # —— 所以 `chip_delay` 由渲染侧按小句时间表算好（见 plan_reveals）。
+                chip_start = beat_start + (
+                    CHIP_POP_DELAY if band.chip_delay is None else band.chip_delay
+                )
                 frame_row = (
                     chip_frame_rows[index] if index < len(chip_frame_rows) else []
                 )

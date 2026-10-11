@@ -22,6 +22,7 @@ from app.services.design import (
     IMAGE_BOX_H,
     IMAGE_BOX_LEFT,
     IMAGE_TOP,
+    NUMBER_BG,
     POINT_BG,
     PORTRAIT,
     SUBTITLE_TOP,
@@ -122,13 +123,13 @@ def sha256(path: Path) -> str:
 
 
 def capsule_bbox(path: Path) -> tuple[int, int, int, int] | None:
-    """数字胶囊（`POINT_BG`）的包围盒。带底 `SUBTITLE_BG` 与它只差 6 个灰阶，
-    所以容差取 3 —— 再宽一点整条带子都会被算成胶囊。"""
+    """数字胶囊（`NUMBER_BG`）的包围盒。带底 `SUBTITLE_BG` 与它差 24.8 个亮度级
+    （旧值只差 3.4，那时容差一放宽整条带子都会被算成胶囊），这里仍保守取 3。"""
     import pymupdf
 
     pix = pymupdf.Pixmap(str(path))
     n, width, height, samples = pix.n, pix.width, pix.height, pix.samples
-    target = tuple(int(POINT_BG[i : i + 2], 16) for i in (1, 3, 5))
+    target = tuple(int(NUMBER_BG[i : i + 2], 16) for i in (1, 3, 5))
     xs: list[int] = []
     ys: list[int] = []
     for y in range(height):
@@ -452,7 +453,7 @@ class TestCaptionChipLayer:
 
             pix = pymupdf.Pixmap(str(path))
             n, width, samples = pix.n, pix.width, pix.samples
-            target = tuple(int(POINT_BG[i : i + 2], 16) for i in (1, 3, 5))
+            target = tuple(int(NUMBER_BG[i : i + 2], 16) for i in (1, 3, 5))
             total = 0
             for y in range(region[1], region[3]):
                 for x in range(region[0], region[2]):
@@ -548,16 +549,17 @@ def _ink_bbox(path: Path) -> tuple[int, int, int, int] | None:
 
 
 def count_capsule_pixels(path: Path, region: tuple[int, int, int, int]) -> int:
-    """数一帧里**胶囊底色**（`POINT_BG`）的像素。
+    """数一帧里**胶囊底色**（`NUMBER_BG`）的像素。
 
-    容差必须取 **3**：带子底色 `SUBTITLE_BG`(#f4f7fa) 与胶囊底 `POINT_BG`(#eef4fb)
-    只差 6 个灰阶，容差放到 10 会把整条带子都数进去（实测 4729 个，两帧一样）。
+    容差取 **3**：底色 `SUBTITLE_BG`(#f4f7fa) 与胶囊底相差 24.8 个亮度级，
+    容差放到 10 不会再把整条带子数进去 —— 但**旧值 #eef4fb 只差 3.4**，
+    当年正是「容差一放大就两帧一样」把「叠上去看不出来」那个 bug 藏住了。
     """
     import pymupdf
 
     pix = pymupdf.Pixmap(str(path))
     n, width, samples = pix.n, pix.width, pix.samples
-    target = tuple(int(POINT_BG[i : i + 2], 16) for i in (1, 3, 5))
+    target = tuple(int(NUMBER_BG[i : i + 2], 16) for i in (1, 3, 5))
     total = 0
     for y in range(region[1], region[3]):
         for x in range(region[0], region[2]):
@@ -674,14 +676,15 @@ class TestWholeChainWithBeats:
     def test_the_digit_pops_out_only_after_its_own_sentence(self, tmp_path, monkeypatch):
         """数字强调：这一句起点前没有胶囊底，chip 淡入完成后**明显多出一大片**。
 
-        数的颜色是**胶囊底色** `POINT_BG`（#eef4fb）—— 它是这一层唯一独有的颜色。
+        数的颜色是**胶囊底色** `NUMBER_BG` —— 它是这一层唯一独有的颜色。
         实测（本机这段两秒的片子里，胶囊所在方块 ROI 14259 像素）：
         `before(t=2.86)=75`，`after(t=3.50)=1046`（13.9 倍）；整条字幕带 125 → 2044。
         剩下的那点零头是带子里文字的**抗锯齿边**恰好落在胶囊色的容差里，与是否弹胶囊无关。
 
-        ⚠️ **容差只能取 3**：带子底色 `SUBTITLE_BG`(#f4f7fa) 与胶囊底只差 6 个灰阶，
+        ⚠️ **容差只能取 3**：当年带子底色 `SUBTITLE_BG`(#f4f7fa) 与胶囊底只差 3.4 个亮度级，
         容差放到 10 会把整条带子都数进去（实测两帧都是 4729 个，两帧一样 —— 等于什么都没测，
-        那正是「叠上去看不出来」这个 bug 当初躲掉检测的原因）。
+        那正是「叠上去看不出来」这个 bug 当初躲掉检测的原因）。现在胶囊底换成了
+        `NUMBER_BG`(#cfe0f8，差 24.8)，判据更稳，但这条注释留着提醒「别把容差放大」。
         这里的数字会随编码器量化小幅浮动（同一个 ROI 换一张底图，实测 222→1467 / 75→1046），
         所以判据留了余量：倍数 > 3、绝对数 > 500。
         """
@@ -700,8 +703,10 @@ class TestWholeChainWithBeats:
         chips: list[bool] = []
         real_band_layer = video_module._render_band_layer
 
-        def spy(beat, path, *, layout, session, chip=True):
-            produced = real_band_layer(beat, path, layout=layout, session=session, chip=chip)
+        def spy(beat, path, *, layout, session, chip=True, hidden_from=None):
+            produced = real_band_layer(
+                beat, path, layout=layout, session=session, chip=chip, hidden_from=hidden_from
+            )
             chips.append(chip)
             (kept / Path(produced).name).write_bytes(Path(produced).read_bytes())
             return produced

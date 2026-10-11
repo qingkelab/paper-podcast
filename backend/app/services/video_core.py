@@ -74,6 +74,132 @@ class Scene:
         return max(self.end - self.start, 0.05)
 
 
+# 小句的分界符。**只在这几个停顿处切**：逗号/顿号/分号/冒号 ——
+# 句号不切（那是另一句字幕的事了）。
+#
+# 为什么放在这一层：`htmlpage`（页面）和 `video_render`（SVG 降级路径）都要用它，
+# 而这两边谁都不能 import 对方（`htmlpage` 惰性依赖 `video`，反向就成环了）。
+CLAUSE_BREAKS = "，,、；;：:"
+
+
+def clause_spans(text: str) -> list[tuple[int, int]]:
+    """把一句话切成**小句**（含标点），返回每个小句在原文里的区间。
+
+    用途是「字幕按小句依次出现」：一句 30 字的话念 10 秒，整句在第 0.35 秒就全出现了，
+    中间 10 秒画面上什么都不变 —— 实测全片有 52.5%~67.7% 的时长落在这种
+    「≥4 秒没有任何可见变化」里（见 docs/VIDEO_QA.md）。按小句依次出现，
+    观众读到哪里、画面长到哪里，也顺带把那些空档填上。
+
+    **判据必须确定**：同一句话在任何机器上切出同样的区间（不看字体、不看宽度），
+    否则渲染侧和编码侧算出来的时间点会对不上。
+    只有一个小句（整句没有标点）时返回空列表 —— 那说明没得「依次出现」。
+    """
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char in CLAUSE_BREAKS:
+            spans.append((start, index + 1))
+            start = index + 1
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans if len(spans) > 1 else []
+
+
+def plan_reveals(
+    text: str,
+    duration: float,
+    *,
+    min_seconds: float | None = None,
+    min_gap: float | None = None,
+    tail_hold: float | None = None,
+    max_reveals: int | None = None,
+) -> list[tuple[int, float]]:
+    """把「这一句的小句依次出现」排成时间表：`[(藏起从第几个小句起, 相对本句起点的秒数)]`。
+
+    每个状态都是一张整条带子（同一套排版，只把还没轮到的小句变成透明），
+    所以「显露」这件事在编码侧就是按时序叠一张同样的带子。
+
+    规则（全是时间，与字体、宽度无关 —— 渲染侧和编码侧不会各算一个样）：
+
+    - 只有一个小句、或这一句**太短**（`min_seconds`）→ 不做（一闪而过比不动更难看）；
+    - 第 k 个小句出现的时刻 = 按**小句字数**占整句的比例 × 时长。我们没有逐字时间戳，
+      同一段里语速基本恒定，按字数分是能达到的最好近似（和 `beat_windows` 一个道理）；
+    - 两次显露至少隔 `min_gap`，挨太近的直接跳过（并把那部分小句并进下一次）；
+    - **最后一个状态一定是「全都显示」**，而且至少留 `tail_hold` 才结束 ——
+      否则最后那个小句永远不会出现（这是最容易写错的地方：只按「边界时刻」排，
+      靠近句尾的那一刀会被 `tail_hold` 挡掉，那一小句就永远藏着）；
+    - 一次最多分 `max_reveals` 次（每多一次就多渲染一张整条带子）。
+    """
+    from .design import (
+        CLAUSE_REVEAL_MAX,
+        CLAUSE_REVEAL_MIN_GAP,
+        CLAUSE_REVEAL_MIN_SEC,
+        CLAUSE_REVEAL_TAIL_HOLD,
+    )
+
+    min_seconds = CLAUSE_REVEAL_MIN_SEC if min_seconds is None else min_seconds
+    min_gap = CLAUSE_REVEAL_MIN_GAP if min_gap is None else min_gap
+    tail_hold = CLAUSE_REVEAL_TAIL_HOLD if tail_hold is None else tail_hold
+    max_reveals = CLAUSE_REVEAL_MAX if max_reveals is None else max_reveals
+
+    spans = clause_spans(text)
+    if not spans or duration < min_seconds:
+        return []
+    lengths = [max(1, end - begin) for begin, end in spans]
+    total = sum(lengths)
+    latest = duration - tail_hold
+    if latest <= 0.4:
+        return []
+
+    # ① 候选：每个小句边界的时刻（按字数占比）。最后一个状态必须是「全都显示」，
+    #    所以边界只能落在 `latest` 之前，否则那条边界的意义就没了。
+    candidates: list[tuple[int, float]] = []
+    for order in range(1, len(spans)):
+        moment = sum(lengths[:order]) / total * duration
+        if moment > latest:
+            break
+        candidates.append((order + 1, moment))
+    if not candidates:
+        return []
+
+    # ② 间隔：挨得太近的边界并进下一次（一次显露要看得见，连着闪不如不闪）
+    kept: list[tuple[int, float]] = []
+    for entry in candidates:
+        if kept and entry[1] - kept[-1][1] < min_gap:
+            continue
+        kept.append(entry)
+
+    # ③ 数量：中间状态最多 `max_reveals - 1` 个（剩一个位置留给「全都显示」）。
+    #    **均匀取，不是取前几个**：贪心取前面几个会让「全都显示」落在句子一半处，
+    #    后半句又变回一动不动（实测 4 小句 12 秒的句子：1.8 / 4.7 / 5.8 之后全静止）。
+    if len(kept) > max_reveals - 1:
+        step = (len(kept) - 1) / (max_reveals - 1)
+        picked: list[tuple[int, float]] = []
+        for index in range(max_reveals - 1):
+            entry = kept[min(len(kept) - 1, int(round(index * step)))]
+            if not picked or entry[0] != picked[-1][0]:
+                picked.append(entry)
+        kept = picked
+
+    # ④ 收尾：一个「全都显示」的状态，紧跟在最后一个中间状态之后（能早就早，
+    #    但不能早过 `min_gap`，也不能晚过 `latest`）。
+    if kept and kept[-1][0] >= len(spans):
+        return kept
+    # 收尾时刻**尽量落在最后一个小句边界**上（那是「全都显示」最自然的时刻）：
+    # 上面第 ③ 步可能把最后那条边界砍掉（它排在中间状态的位置上），
+    # 但「全都显示」这一张正好可以顶上那个时刻 —— 不然最后一个小句会提前两三秒出现，
+    # 后半句又变回一动不动。至少要晚过上一个状态 `min_gap`，也不能晚过 `latest`。
+    previous = kept[-1][1] if kept else 0.0
+    final_moment = min(latest, max(candidates[-1][1], previous + min_gap))
+    kept.append((len(spans), final_moment))
+    # 两个状态挨太近就并掉前一个（前一个本来只多显示一个小句）
+    while len(kept) > 1 and kept[-1][1] - kept[-2][1] < min_gap * 0.5:
+        kept.pop(-2)
+    return kept
+
+
+
+
 @dataclass
 class CaptionBand:
     """一句字幕：文字（用来按字数分配时长）+ 渲染好的底部字幕带图片。
@@ -89,6 +215,16 @@ class CaptionBand:
     # 把要动的那一小块抠出来、在编码时按这句的起点淡入 —— 整条带子重新淡入是另一回事。
     # 句子里没有数字/关键词时为 None（那就不动）。
     chip: Path | None = None
+    # **这一句按小句依次出现的后续状态**：`(这一状态的整条带子, 相对本句起点的秒数)`。
+    # 每个状态都是「前 N 个小句可见、其余透明」的同一张带子（排版完全一致，只改颜色），
+    # 编码时按秒数依次叠上去 —— 观众看到的是「读到哪里，字长到哪里」。
+    # 时长由 `plan_reveals` 按小句字数分配，渲染侧算完存进来，编码侧直接用（不各算一遍）。
+    reveals: tuple[tuple[Path, float], ...] = ()
+    # 强调层相对本句起点**什么时候点亮**。`None` = 用默认的 `CHIP_POP_DELAY`（0.12 秒）。
+    # 为什么不能固定：整句按小句出现时，被强调的数字可能在第 3 个小句里 ——
+    # 它还没出现的时候弹一颗空胶囊，观众看到的是「一个框里没有字」。
+    # 所以渲染侧按小句时间表把它推到「那个小句出现之后」。
+    chip_delay: float | None = None
 
 
 @dataclass

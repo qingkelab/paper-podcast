@@ -68,6 +68,7 @@ from .design import *  # noqa: F401,F403
 # `from app.services.video import encode_video` 就行，一个字都不用改。
 # 新代码请直接用上面对应的模块（类型 → video_core，画面 → video_render，ffmpeg → video_encode）。
 from .video_core import (
+    plan_reveals,
     _SENTENCE_END,
     Beat,
     CaptionBand,
@@ -78,6 +79,7 @@ from .video_core import (
     VideoResult,
 )
 from .video_render import (  # noqa: F401
+    emphasis_clause_index,
     BeatLayers,
     FigurePanels,
     _caption_line_parts,
@@ -792,20 +794,55 @@ def _render_point_layer(point: str, path: Path, *, layout: Layout, session: Any)
     return path
 
 
+def _chip_delay_for(text: str, plan: list[tuple[int, float]]) -> float:
+    """强调层要等它自己那个小句出现之后再点亮：算出相对本句起点的延迟。
+
+    没有显露计划（短句、或 SVG 降级）时就是原来的 `CHIP_POP_DELAY`。
+    有计划时：看被强调的数字落在第几个小句，取「第一个会显示到它的那个状态」的时刻，
+    再加一个 `CHIP_POP_DELAY`（先读到那句话，再看到数字被点出来）。
+    """
+    from .design import CHIP_POP_DELAY
+
+    if not plan:
+        return CHIP_POP_DELAY
+    clause = emphasis_clause_index(text)
+    # ⚠️ 第 0 张带子也是一个「状态」，它的时刻是 0：那张带子的状态是「从第 1 个小句起藏起来」，
+    # 所以第 0 个小句**从一开始就看得见**。少了这一步，数字落在第一小句里的句子
+    # 会被推迟到第一次显露之后才点亮（实测：数字明明在第一句，却要等 4.2 秒）。
+    for hidden_from, moment in [(1, 0.0), *plan]:
+        if hidden_from > clause:
+            return moment + CHIP_POP_DELAY
+    return CHIP_POP_DELAY
+
+
 def _render_band_layer(
-    beat: str, path: Path, *, layout: Layout, session: Any, chip: bool = True
+    beat: str,
+    path: Path,
+    *,
+    layout: Layout,
+    session: Any,
+    chip: bool = True,
+    hidden_from: int | None = None,
 ) -> Path:
     """字幕带层：单独一层是为了「字幕逐句出现」（每句一条带子按时序叠上去）。
 
     `chip=False` = 这一句**先不要把数字胶囊画出来**（数字用普通文字颜色，位置不变）：
     它留给逐句强调层晚 0.12 秒在同一处点亮，否则强调层叠上去等于没叠
     （见 docs/BEAT_MOTION.md）。默认 `True`，一处没给就是原来的观感。
+
+    `hidden_from=N` = 从第 N 个小句起先不显示（同一套排版、只把颜色变透明）——
+    「按小句依次出现」用的就是它的 N 个变体（见 `video_core.plan_reveals`）。
+    **SVG 降级路径不实现它**（理由见 `render_caption_band` 的注释）。
     """
     if session is None:
         return render_caption_band(beat, path, layout=layout, chip=chip)
     from .htmlpage import caption_band_page
 
-    session.render(caption_band_page(beat, layout, chip=chip), path, work_dir=path.parent)
+    session.render(
+        caption_band_page(beat, layout, chip=chip, hidden_from=hidden_from),
+        path,
+        work_dir=path.parent,
+    )
     return path
 
 
@@ -1009,12 +1046,28 @@ def _render_scene_layers(
                 _render_card_layer(scene, card_path, layout=layout, session=session)
                 result.card_paths.append(card_path)
                 if len(beats) > 1:
+                    # 小句时间表和编码侧用的是**同一个** `beat_windows_aligned`
+                    # （字幕带、逐句卡、强调层三处都是它），所以这里算出来的相对时刻
+                    # 在编码那一侧加上 `beat_start` 就是绝对时刻，不会差一帧。
+                    windows = beat_windows_aligned(
+                        beats, scene.duration, start=scene.start, pauses=pauses
+                    )
                     for beat_index, beat in enumerate(beats):
                         band_path = work_dir / f"band-{index:04d}-{beat_index}.png"
                         # 这一句有强调层 → 带子里先不画胶囊，留给强调层点亮（见 BEAT_MOTION）
                         has_chip = (
                             beat_index < len(beat_layers.chips)
                             and beat_layers.chips[beat_index] is not None
+                        ) or (
+                            beat_index < len(beat_layers.chip_frames)
+                            and bool(beat_layers.chip_frames[beat_index])
+                        )
+                        # 小句依次出现（HTML 路径才有：SVG 那条路不做，见 render_caption_band）
+                        beat_start, beat_end = windows[beat_index]
+                        plan = (
+                            plan_reveals(beat, beat_end - beat_start)
+                            if session is not None
+                            else []
                         )
                         _render_band_layer(
                             beat,
@@ -1022,8 +1075,34 @@ def _render_scene_layers(
                             layout=layout,
                             session=session,
                             chip=not has_chip,
+                            # 有显露计划时，第 0 张只显示第 0 个小句
+                            hidden_from=1 if plan else None,
                         )
-                        bands.append(CaptionBand(text=beat, image=band_path))
+                        reveals: list[tuple[Path, float]] = []
+                        for reveal_index, (hidden_from, moment) in enumerate(plan):
+                            reveal_path = (
+                                work_dir / f"band-{index:04d}-{beat_index}-r{reveal_index}.png"
+                            )
+                            _render_band_layer(
+                                beat,
+                                reveal_path,
+                                layout=layout,
+                                session=session,
+                                chip=not has_chip,
+                                hidden_from=hidden_from,
+                            )
+                            reveals.append((reveal_path, moment))
+                            result.band_paths.append(reveal_path)
+                        bands.append(
+                            CaptionBand(
+                                text=beat,
+                                image=band_path,
+                                reveals=tuple(reveals),
+                                chip_delay=(
+                                    _chip_delay_for(beat, plan) if has_chip else None
+                                ),
+                            )
+                        )
                         result.band_paths.append(band_path)
                     result.beat_count += 1
 

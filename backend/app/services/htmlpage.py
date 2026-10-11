@@ -72,6 +72,7 @@ from .design import (
     FOCUS_DIM_ALPHA,
     FONT_STACK,
     FRAME_STROKE,
+    NUMBER_BG,
     POINT_BAR,
     POINT_BAR_W,
     POINT_BG,
@@ -102,7 +103,8 @@ if TYPE_CHECKING:  # 只为类型注解；运行时不导入，避免与 video.p
 # 压暗的「洞」比框线本身大一圈：框线是压着边界画的，不大一圈的话框线自己会被压暗
 FOCUS_PAD = 5
 
-NUMBER_BG = POINT_BG
+# 胶囊底色与强调行底色**不是同一个色**：直接来自 design（理由与实测数据见它的注释）。
+# 这里保留这两个名字是因为老调用点（含测试）按 `htmlpage.NUMBER_BG` 引用。
 NUMBER_TEXT = POINT_TEXT
 
 # 整页字幕的字号区间。上限沿用老路径 `_fit_subtitle` 的 max_size=30，
@@ -128,6 +130,58 @@ def _figure_text(text: str) -> str:
             out.append(html_lib.escape(text[cursor : match.start()]))
         out.append(f'<span class="num">{html_lib.escape(match.group(0))}</span>')
         cursor = match.end()
+    if cursor < len(text):
+        out.append(html_lib.escape(text[cursor:]))
+    return "".join(out)
+
+
+# 小句的分界符。**只在这几个停顿处切**：逗号/顿号/分号/冒号 ——
+# 句号不切（那是另一句字幕的事了），括号引号里的内容也不单独成句。
+_CLAUSE_BREAKS = "，,、；;：:"
+
+
+def clause_spans(text: str) -> list[tuple[int, int]]:
+    """把一句话切成**小句**（含标点），返回每个小句在原文里的区间。
+
+    「小句」这个词是给「字幕别一次性全冒出来」用的：一句 30 字的话念 10 秒，
+    整句在第 0.35 秒就全出现了，中间 10 秒画面上什么都不变 —— 实测全片有
+    52.5%~67.7% 的时长落在这种「≥4 秒没有任何可见变化」里（见 docs/VIDEO_QA.md）。
+    按小句依次出现，观众读到哪里、画面长到哪里，也顺带把那些空档填上。
+
+    **判据必须确定**：同一句话在任何机器上切出同样的区间（不看字体、不看宽度），
+    否则渲染侧和编码侧算出来的时间点会对不上。
+    """
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char in _CLAUSE_BREAKS:
+            spans.append((start, index + 1))
+            start = index + 1
+    if start < len(text):
+        spans.append((start, len(text)))
+    # 只有一个小句（整句没有标点）时返回空：那说明没得「依次出现」
+    return spans if len(spans) > 1 else []
+
+
+def _clause_text(text: str, *, hidden_from: int | None = None) -> str:
+    """把正文按小句包成 `<span class="clause">`；`hidden_from` 之后的小句先不显示。
+
+    「先不显示」用的是 `color: transparent`（继承给里面的 `.num`），**不是** `display:none`：
+    字号自适应是在**文字全在**的前提下量出来的，把字拿掉会让每一帧的字号和换行都不一样 ——
+    观众看到的是文字在跳。透明只改颜色，排版一个像素都不动。
+    """
+    spans = clause_spans(text)
+    if not spans:
+        return _figure_text(text)
+    out: list[str] = []
+    cursor = 0
+    for order, (begin, end) in enumerate(spans):
+        if begin > cursor:
+            out.append(html_lib.escape(text[cursor:begin]))
+        hidden = hidden_from is not None and order >= hidden_from
+        css = "clause clause-hidden" if hidden else "clause"
+        out.append(f'<span class="{css}">{_figure_text(text[begin:end])}</span>')
+        cursor = end
     if cursor < len(text):
         out.append(html_lib.escape(text[cursor:]))
     return "".join(out)
@@ -611,18 +665,28 @@ def _band_css(band_h: int) -> str:
     """
 
 
-def _band_body(text: str, layout: Layout) -> str:
-    """字幕带的 body（带子和胶囊层共用：排版一样，胶囊才落在同一个地方）。"""
+def _band_body(text: str, layout: Layout, *, hidden_from: int | None = None) -> str:
+    """字幕带的 body（带子和胶囊层共用：排版一样，胶囊才落在同一个地方）。
+
+    `hidden_from=N`：第 N 个小句起先不显示（用于「字幕按小句依次出现」，见 `_clause_text`）。
+    """
     attrs = _fit_attrs(
         max_font=SUBTITLE_BAND_MAX_FONT, min_font=24, lines=3, height=True
     )
+    clean = " ".join((text or "").split())
     return (
         f'<div class="page"><div class="band-text" {attrs}>'
-        f"{_figure_text(' '.join((text or '').split()))}</div></div>"
+        f"{_clause_text(clean, hidden_from=hidden_from)}</div></div>"
     )
 
 
-def caption_band_page(text: str, layout: Layout, *, chip: bool = True) -> Page:
+def caption_band_page(
+    text: str,
+    layout: Layout,
+    *,
+    chip: bool = True,
+    hidden_from: int | None = None,
+) -> Page:
     """底部那条字幕带单独一层（「字幕逐句出现」用）。
 
     画幅是 `layout.width × (band 高)`，位置固定叠在 `y=layout.subtitle_top`，
@@ -637,8 +701,14 @@ def caption_band_page(text: str, layout: Layout, *, chip: bool = True) -> Page:
     """
     band_h = layout.height - layout.subtitle_top
     css = _band_css(band_h) if chip else _band_css(band_h) + CHIP_OFF_CSS
+    if hidden_from is not None:
+        css += CLAUSE_HIDDEN_CSS
     return Page(
-        html=_document(css, _layout_vars(layout), _band_body(text, layout)),
+        html=_document(
+            css,
+            _layout_vars(layout),
+            _band_body(text, layout, hidden_from=hidden_from),
+        ),
         width=layout.width,
         height=band_h,
     )
@@ -655,6 +725,15 @@ def caption_band_page(text: str, layout: Layout, *, chip: bool = True) -> Page:
 # 数字位置上没有一个深色像素，那句话读成「这套方法在 ▭ 任务上把精度保住了 ▭。」。
 # 之所以一直没暴露：早先的验证量的是「强调色像素变多了」，药丸确实变多了，
 # 只是变多的那颗药丸里没有字。
+# 「这一小句还没轮到」的 CSS。**只改颜色**：字号自适应与换行都建立在文字全在的前提上，
+# 用 display:none / visibility:hidden 都会让每一帧的字号或占位不一样（看起来像文字在跳）。
+# 里面那颗胶囊也要一起隐掉（它有底色，光把文字变透明会留下一个空药丸）。
+CLAUSE_HIDDEN_CSS = """
+.band-text .clause-hidden, .band-text .clause-hidden .num { color: transparent; }
+.band-text .clause-hidden .num { background: transparent; }
+"""
+
+
 CHIP_CSS = """
 html, body, .page { background: transparent; }
 .band-text { color: transparent; }

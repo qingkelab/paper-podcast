@@ -60,6 +60,7 @@ from .design import (
     FOCUS_DIM_ALPHA,
     FOCUS_LABEL_CHARS,
     FONT_STACK,
+    NUMBER_BG,
     FRAME_STROKE,
     POINT_BAR,
     POINT_BAR_W,
@@ -612,7 +613,9 @@ def _caption_line_parts(
             parts.append(
                 f'<rect x="{cursor - 3:.1f}" y="{baseline - font_size * 0.92:.1f}" '
                 f'width="{width + 6:.1f}" height="{font_size * 1.22:.1f}" rx="4" '
-                f'fill="{POINT_BG}"/>'
+                # 胶囊底与强调行底**不是同一个色**（见 design.NUMBER_BG 的实测注释）——
+                # 两条渲染路径必须同色，否则同一句话在 HTML 版和 SVG 版里深浅不一样
+                f'fill="{NUMBER_BG}"/>'
             )
         parts.append(
             f'<text x="{cursor:.1f}" y="{baseline:.0f}" '
@@ -857,7 +860,9 @@ def _chip_rects(
             parts.append(
                 f'<rect x="{cursor - 3:.1f}" y="{baseline - font_size * 0.92:.1f}" '
                 f'width="{width + 6:.1f}" height="{font_size * 1.22:.1f}" rx="4" '
-                f'fill="{POINT_BG}"/>'
+                # 胶囊底与强调行底**不是同一个色**（见 design.NUMBER_BG 的实测注释）——
+                # 两条渲染路径必须同色，否则同一句话在 HTML 版和 SVG 版里深浅不一样
+                f'fill="{NUMBER_BG}"/>'
             )
         cursor += width
     return parts
@@ -949,8 +954,30 @@ def render_caption_chip_frames(
     return session.render_frames(page, times, work_dir, prefix=prefix, work_dir=work_dir)
 
 
+def emphasis_clause_index(text: str) -> int:
+    """这一句里**第一个被强调的数字**落在第几个小句（没有数字 / 没有小句 → 0）。
+
+    用途只有一个：整句按小句依次出现时，强调层要等那个小句出现之后再点亮 ——
+    否则观众先看到一颗**空胶囊**（框里没字），等小句出现才「补上字」。
+    """
+    from .video_core import clause_spans
+
+    match = _NUMBER_TOKEN.search(text or "")
+    if match is None:
+        return 0
+    for order, (begin, end) in enumerate(clause_spans(text)):
+        if begin <= match.start() < end:
+            return order
+    return 0
+
+
 def render_caption_band(
-    text: str, output_path: Path, *, layout: Layout = PORTRAIT, chip: bool = True
+    text: str,
+    output_path: Path,
+    *,
+    layout: Layout = PORTRAIT,
+    chip: bool = True,
+    hidden_from: int | None = None,
 ) -> Path:
     """只渲染底部那条字幕带，用于「字幕逐句出现」。
 
@@ -963,6 +990,11 @@ def render_caption_band(
     `chip=False`：这一句的**数字不画胶囊**（普通文字颜色、位置不变）。
     只有「这一句有逐句强调层」时才会这么渲染 —— 否则强调层叠上去看不出来
     （见 docs/BEAT_MOTION.md「让数字强调真的看得见」）。默认 `True`，老路径不受影响。
+
+    `hidden_from` **在 SVG 这条路上不生效**（这是有意的）：小句显露要按小句把文字变透明，
+    而这条路的排版是自己按 `_char_width` 表算的、逐**行**画的，再实现一遍小句映射
+    等于把同一件事写两遍。HTML 路径才是默认路径（见 docs/RENDERING.md），
+    降级时退回「整句一起出现」——少了一件事，不会画错。
     """
     font_size, lines, first_baseline, line_height, band_h = _band_layout(text, layout)
 

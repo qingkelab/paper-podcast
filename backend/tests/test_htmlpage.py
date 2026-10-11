@@ -185,8 +185,13 @@ class TestRenderedPageFacts:
         assert hits > 30, f"封面上的品牌绿短杠没画出来（命中 {hits} 个像素）"
 
     def test_number_highlight_has_a_background(self, session, tmp_path):
-        """数字要带浅蓝底 —— 这是「突出解读」的一部分，不是装饰。"""
-        from app.services.design import PORTRAIT, POINT_BG
+        """数字要带浅蓝底 —— 这是「突出解读」的一部分，不是装饰。
+
+        底色用的是 `NUMBER_BG`（**不是**强调行那条宽底的 `POINT_BG`）：胶囊只有 30×24px，
+        用强调行那个浅色等于没画 —— 实测旧值跟字幕带底色只差 3.4 个亮度级，
+        当年「数字被自己那层底色吃掉」的 bug 就是这么躲过检测的。
+        """
+        from app.services.design import NUMBER_BG, PORTRAIT
         from app.services.htmlpage import caption_band_page
 
         out = session.render(
@@ -195,7 +200,7 @@ class TestRenderedPageFacts:
             work_dir=tmp_path,
         )
         at, width, height = _pixels(out)
-        want = _hex(POINT_BG)
+        want = _hex(NUMBER_BG)
         hits = sum(
             1
             for y in range(0, height, 2)
@@ -1078,14 +1083,16 @@ class TestChipSpringActuallyPops:
         )
 
     def _measure(self, path):
-        """量胶囊（浅蓝底 #eef4fb）的宽度 + 里面数字（#17416f）的像素数。
+        """量胶囊（浅蓝底 `NUMBER_BG`）的宽度 + 里面数字（#17416f）的像素数。
 
         判据都要**带容差**：截图有 1~2 个灰阶的抖动，缩放后边缘还是渐变的。
         **半透明那几帧量不出来**（PNG 是预乘 alpha：不透明度 0.44 时 #eef4fb 会变成
         一百多的灰），所以取「量得到胶囊」的帧为准 —— 静止值也从里面取。
         """
+        from app.services.design import NUMBER_BG
+
         at, width, height = _pixels(path)
-        pill = _hex("#eef4fb")
+        pill = _hex(NUMBER_BG)
         digit = _hex("#17416f")
         left, right, dark = None, None, 0
         for y in range(0, height):
