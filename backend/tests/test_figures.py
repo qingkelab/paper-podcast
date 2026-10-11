@@ -624,6 +624,19 @@ class TestIllustrationIsWhite:
             for colour in self.DARK_LEGACY:
                 assert colour not in prompt, f"{name} prompt 里还留着深色 {colour}"
 
+    def test_prompts_ban_the_default_style(self):
+        """禁用的「默认风格」要写进 prompt —— 模型没被限制时会回到最熟的那一套。
+
+        这几条不是审美偏好：模型默认交出来的就是「一屏居中大字 + 渐变背景 +
+        所有元素一起淡入 + 四角小标签」，而我们的图要贴进白底视频画面里、
+        还要跟旁边那张论文原图看起来像一家人。
+        """
+        from app.services.illustration import ILLUSTRATION_SYSTEM, TOPIC_SYSTEM
+
+        for name, prompt in (("信息图", ILLUSTRATION_SYSTEM), ("段落配图", TOPIC_SYSTEM)):
+            for banned in ("居中大字", "淡入淡出", "四角", "发光"):
+                assert banned in prompt, f"{name} prompt 里没写「不要{banned}」"
+
     def test_both_paths_share_one_palette(self):
         """「模型画成功」和「退回本地兜底」两种结果必须同一套色 ——
         否则同一期播客里会一半白底一半深色，比全深色还难看。"""

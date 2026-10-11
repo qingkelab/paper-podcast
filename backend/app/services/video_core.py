@@ -173,6 +173,10 @@ class VideoResult:
     # 存下来是为了「同一篇论文，两台机器出的画面不一样」这类问题有一句话可查 ——
     # 两条路径都在，出片时用了哪条光看 MP4 是看不出来的。
     renderer: str = "svg"
+    # **成片自查**的结果（`video_qa.qa_video`）：最长静止多久、响度多少、音画差多少。
+    # 这三件事只有成片里才看得出来（分层测试能证明「会动」，证明不了「有 10 秒没动」），
+    # 所以合成完顺手量一次存下来 —— 光打日志的话，回头看某集「当时是什么水平」就查不到了。
+    qa: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -187,4 +191,5 @@ class VideoResult:
             "poster": self.poster_path,
             "renderer": self.renderer,
             "title_pending": self.title_pending,
+            "qa": self.qa,
         }

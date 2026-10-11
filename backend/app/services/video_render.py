@@ -32,6 +32,9 @@ from .design import (
     CAPTION_BAND_MAX_FONT,
     CAPTION_COLOR,
     CAPTION_FADE_SEC,
+    CHIP_POP_BUMP_DELAY,
+    CHIP_POP_FPS,
+    CHIP_SPRING_SEC,
     COVER_ACCENT_GAP,
     COVER_ACCENT_H,
     COVER_ACCENT_W,
@@ -914,6 +917,38 @@ def render_caption_chip(
     return output_path
 
 
+def render_caption_chip_frames(
+    text: str,
+    work_dir: Path,
+    *,
+    index: int = 0,
+    beat_index: int = 0,
+    layout: Layout = PORTRAIT,
+    session: Any | None = None,
+) -> list[Path]:
+    """数字胶囊「弹一下」的帧序列（Tier B）；不做或没有 Chrome 时返回空列表。
+
+    **只在这一句恰好有一个数字时做**：这一层是靠整层缩放动的，轴心只有一个点 ——
+    一句话里两个数字隔了半个屏，峰值 1.09 会把远的那颗推偏 45px（对不上带子里的数字）。
+    一个数字时轴心就是它自己，对齐误差恒为 0。`caption_chip_page` 里也有同一道守卫
+    （两道都留着：那道管「页面自己不会乱动」，这道管「不白抓 10 帧」）。
+    """
+    if session is None:
+        return []
+    clean = " ".join((text or "").split())
+    if len(_NUMBER_TOKEN.findall(clean)) != 1:
+        return []
+    from .htmlpage import caption_chip_page
+
+    page = caption_chip_page(clean, layout, spring=True)
+    # 帧要覆盖「等待鼓包」那一段（`CHIP_POP_BUMP_DELAY`）+ 弹簧本身
+    span = CHIP_POP_BUMP_DELAY + CHIP_SPRING_SEC
+    count = max(2, int(round(span * CHIP_POP_FPS)))
+    times = [step / CHIP_POP_FPS for step in range(count + 1)]
+    prefix = f"chip-{index:04d}-{beat_index}"
+    return session.render_frames(page, times, work_dir, prefix=prefix, work_dir=work_dir)
+
+
 def render_caption_band(
     text: str, output_path: Path, *, layout: Layout = PORTRAIT, chip: bool = True
 ) -> Path:
@@ -970,6 +1005,9 @@ class BeatLayers:
 
     cards: list[Path | None] = field(default_factory=list)
     chips: list[Path | None] = field(default_factory=list)
+    # 「弹一下」那种逐帧抓的胶囊层（Tier B）：有帧序列时 `chips` 那一格是 None
+    # （静态图和帧序列不能同时叠，否则序列播完会被静态图顶掉）。
+    chip_frames: list[list[Path]] = field(default_factory=list)
 
 
 def _beat_image_path(value: Any, assets: dict[str, Any] | None) -> Path | None:
@@ -1006,7 +1044,11 @@ def render_beat_layers(
     句子的时间窗和解码侧用的是同一个函数、同一组参数 —— 两边各算一遍就会错位。
     """
     beats = list(getattr(scene, "beats", None) or [])
-    layers = BeatLayers(cards=[None] * len(beats), chips=[None] * len(beats))
+    layers = BeatLayers(
+        cards=[None] * len(beats),
+        chips=[None] * len(beats),
+        chip_frames=[[] for _ in beats],
+    )
     # 只有一句的段落没有「逐句」可言：字幕带那条路也是 `len(beats) > 1` 才拆
     if len(beats) <= 1:
         return layers
@@ -1021,11 +1063,24 @@ def render_beat_layers(
     current = Path(str(scene.image))
 
     for beat_index, beat in enumerate(beats):
-        # 数字强调层：和「换不换画面」无关，每一句都可以有
-        chip_path = work_dir / f"chip-{index:04d}-{beat_index}.png"
-        layers.chips[beat_index] = render_caption_chip(
-            beat.text or "", chip_path, layout=layout, session=session
+        # 数字强调层：和「换不换画面」无关，每一句都可以有。
+        # HTML 路径下这一步是**逐帧**的（弹簧「弹一下」，见 caption_chip_page 的注释）；
+        # 退回 SVG 时还是那张静态图 + 淡入。
+        frames = render_caption_chip_frames(
+            beat.text or "",
+            work_dir,
+            index=index,
+            beat_index=beat_index,
+            layout=layout,
+            session=session,
         )
+        if frames:
+            layers.chip_frames[beat_index] = frames
+        else:
+            chip_path = work_dir / f"chip-{index:04d}-{beat_index}.png"
+            layers.chips[beat_index] = render_caption_chip(
+                beat.text or "", chip_path, layout=layout, session=session
+            )
 
         path = _beat_image_path(beat.image, assets)
         if path is None or not allow_cards:

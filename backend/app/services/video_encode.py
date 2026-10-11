@@ -22,6 +22,8 @@ import subprocess
 from pathlib import Path
 
 from .audio_track import Pause
+from . import loudness
+from .motion import ffmpeg_ease as spring_ease
 
 # 版式/配色/节奏令牌的**老家**在 design.py（video.py 只是把它们再导出给老调用点）
 from .design import (
@@ -29,11 +31,14 @@ from .design import (
     BEAT_IMAGE_MIN_SEC,
     CAPTION_FADE_SEC,
     CHIP_POP_DELAY,
+    CHIP_POP_FPS,
     CHIP_POP_SEC,
     FOCUS_FADE_SEC,
     FPS,
     POINT_SLIDE_SEC,
     PORTRAIT,
+    SPRING_SLIDE_OVERSHOOT,
+    SPRING_SLIDE_PEAK_RATIO,
     PROGRESS_BAR_H,
     SPEAKER_WAVE_COLORS,
     VIDEO_CRF,
@@ -136,6 +141,7 @@ def encode_video(
     focus_animations: list[list[Path]] | None = None,
     beat_cards: list[list[Path | None]] | None = None,
     beat_chips: list[list[Path | None]] | None = None,
+    beat_chip_frames: list[list[list[Path]]] | None = None,
     waveform: bool = True,
     layout: Layout = PORTRAIT,
 ) -> VideoResult:
@@ -198,6 +204,8 @@ def encode_video(
     # 走的滤镜链和以前完全一样。
     beat_rows = beat_cards or [[] for _ in scenes]
     chip_rows = beat_chips or [[] for _ in scenes]
+    # 弹簧版胶囊：**帧序列**（Tier B）。与静态图互斥（同一句只会给其中一种）。
+    chip_frame_rows = beat_chip_frames or [[] for _ in scenes]
     plan = transitions or [Transition() for _ in scenes]
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
@@ -235,7 +243,7 @@ def encode_video(
                 counter += 1
                 return position
 
-            def add_sequence(paths: list[Path]) -> int:
+            def add_sequence(paths: list[Path], *, fps: int = FPS) -> int:
                 """挂一路图片序列（Tier B 逐帧抓下来的动画帧）。
 
                 序列是**有限**的：播完就该停在最后一帧，而 `overlay` 的
@@ -245,7 +253,7 @@ def encode_video(
                 nonlocal counter
                 first = paths[0]
                 pattern = first.parent / f"{first.stem.rsplit('-', 1)[0]}-%04d.png"
-                inputs.extend(["-framerate", str(FPS), "-i", str(pattern)])
+                inputs.extend(["-framerate", str(fps), "-i", str(pattern)])
                 position = counter
                 counter += 1
                 return position
@@ -430,9 +438,16 @@ def encode_video(
                 row_in = add_image(row)
                 node += 1
                 graph.append(f"[{row_in}:v]format=rgba[pt{node}]")
+                ease = spring_ease(
+                    POINT_SLIDE_SEC,
+                    overshoot=SPRING_SLIDE_OVERSHOOT,
+                    peak_ratio=SPRING_SLIDE_PEAK_RATIO,
+                )
+                # 滑入用**弹簧**而不是 `min(1, t/T)`：后者是匀速（实测就是「机器在滑」），
+                # 而 936px 的匀速位移最能看出「没有缓动」。过冲 2%（≈19px）后就地落定。
                 graph.append(
                     f"[{last}][pt{node}]overlay="
-                    f"x='-(W)+W*min(1,t/{POINT_SLIDE_SEC:.2f})':y={layout.point_top}[v{node}]"
+                    f"x='-(W)+W*{ease}':y={layout.point_top}[v{node}]"
                 )
                 last = f"v{node}"
 
@@ -467,10 +482,33 @@ def encode_video(
                 #
                 # 比这一句的字幕晚 `CHIP_POP_DELAY` 出现（先读到句子，再看到那个数字被点出来），
                 # 而且必须排在条带之后 —— 它是叠在那条带子上的（和声波条同一类顺序问题）。
+                chip_start = beat_start + CHIP_POP_DELAY
+                frame_row = (
+                    chip_frame_rows[index] if index < len(chip_frame_rows) else []
+                )
+                # ⚠️ 名字不能叫 `frames`：那个名字在这一层是**本片段的帧数**（下面 -frames:v 要用），
+                # 覆盖掉会变成「Expected number for frames:v but found: []」。
+                pop_frames = frame_row[beat_index] if beat_index < len(frame_row) else []
                 chip = chip_row[beat_index] if beat_index < len(chip_row) else None
+                if pop_frames:
+                    # 弹簧版：序列自带「弹一下 → 落定」，**不能再叠淡入**（叠了就把
+                    # 弹簧糊掉了）。序列自己的时间轴从 0 开始，所以要把它推到
+                    # `chip_start` 那一刻：`setpts` 平移 PTS + `enable` 门控。
+                    # 序列有限，`overlay` 的 `eof_action` 默认 repeat，
+                    # 所以播完就停在末帧（末帧是 scale=1，和静止状态重合）。
+                    chip_in = add_sequence(pop_frames, fps=CHIP_POP_FPS)
+                    node += 1
+                    graph.append(
+                        f"[{chip_in}:v]setpts=PTS+{chip_start:.3f}/TB,format=rgba[chp{node}]"
+                    )
+                    graph.append(
+                        f"[{last}][chp{node}]overlay=x=0:y={layout.subtitle_top}:"
+                        f"enable='gte(t,{chip_start:.3f})'[v{node}]"
+                    )
+                    last = f"v{node}"
+                    continue
                 if chip is None:
                     continue
-                chip_start = beat_start + CHIP_POP_DELAY
                 chip_in = add_image(chip)
                 node += 1
                 graph.append(
@@ -539,6 +577,10 @@ def encode_video(
         )
 
         # ---- 第二步：只封装音频，视频流直接 copy ----
+        # 顺带做**响度归一化**（这一遍是唯一处理音频的地方，不用再多一次转码）。
+        # 链条由 `loudness.normalization_chain` 按**实测值**给；测不出来
+        # （无音轨 / 数字静音 / 没装 ffmpeg）就整段跳过，退回原来的行为。
+        chain = loudness.normalization_chain(audio_path)
         mux = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(silent_path),
@@ -546,6 +588,7 @@ def encode_video(
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",   # 让浏览器能边下边播、可拖动
+            *(["-af", chain, "-ar", str(loudness.OUTPUT_SAMPLE_RATE)] if chain else []),
             "-shortest",
             str(output_path),
         ]

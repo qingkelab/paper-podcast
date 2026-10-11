@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 from .design import (
     BG_COLOR,
+    CAPTION_FADE_SEC,
     BRAND_DARK,
     BRAND_DARK_PANEL,
     BRAND_GOLD,
@@ -75,6 +76,11 @@ from .design import (
     POINT_BAR_W,
     POINT_BG,
     POINT_TEXT,
+    SPRING_POP_OVERSHOOT,
+    CHIP_POP_BUMP_DELAY,
+    CHIP_POP_DELAY,
+    CHIP_SPRING_SEC,
+    SPRING_POP_DECAY,
     SUBTITLE_BG,
     SUBTITLE_RULE,
     SUBTITLE_TEXT,
@@ -84,6 +90,7 @@ from .design import (
     cover_title_layout,
 )
 from .htmlframe import Page
+from .motion import js_spring
 
 if TYPE_CHECKING:  # 只为类型注解；运行时不导入，避免与 video.py 成环
     from .video import Scene
@@ -637,13 +644,22 @@ def caption_band_page(text: str, layout: Layout, *, chip: bool = True) -> Page:
     )
 
 
-# 「只有数字胶囊」那一层的附加 CSS：**排版一模一样，只把字变透明**。
+# 「只有数字胶囊」那一层的附加 CSS：**排版一模一样，只把非数字的字变透明**。
 # 这样胶囊和整条字幕带里那颗**逐像素重合**（同一个排版引擎、同一套自适应字号），
 # 而不是照 `_char_width` 那张近似表另算一遍坐标（那必然差几个像素）。
+#
+# ⚠️ **胶囊里的数字必须画成不透明**（`color: NUMBER_TEXT`）。这里踩过一次真坑：
+# 原来写的是 `.band-text, .band-text .num { color: transparent }` —— 数字也被抹掉了，
+# 于是这层盖上去是一颗**实心的浅蓝药丸**：数字被它自己那层底色吃掉。
+# 把两层（带子 `chip=False` + 强调层）合成一张图采像素才看出来 ——
+# 数字位置上没有一个深色像素，那句话读成「这套方法在 ▭ 任务上把精度保住了 ▭。」。
+# 之所以一直没暴露：早先的验证量的是「强调色像素变多了」，药丸确实变多了，
+# 只是变多的那颗药丸里没有字。
 CHIP_CSS = """
 html, body, .page { background: transparent; }
-.band-text, .band-text .num { color: transparent; }
-"""
+.band-text { color: transparent; }
+.band-text .num { color: %s; }
+""" % NUMBER_TEXT
 
 
 # 「先不要这颗胶囊」那一版的附加 CSS：**排版一模一样，只去掉底色、把数字改回普通文字色**。
@@ -654,22 +670,81 @@ CHIP_OFF_CSS = """
 """
 
 
-def caption_chip_page(text: str, layout: Layout) -> Page:
-    """**只画数字强调胶囊、其余全透明**的一层（叠在字幕带之上，用来「弹」出来）。
+def caption_chip_page(text: str, layout: Layout, *, spring: bool = False) -> Page:
+    """**只画数字强调胶囊（含胶囊里的数字）、其余全透明**的一层，叠在字幕带之上。
 
     为什么不是自己算胶囊坐标：字幕带里那颗胶囊的位置由浏览器的真实字体度量 +
     `fitText` 的自适应字号决定，另算一遍必然错位；这里保留完全相同的 DOM/CSS，
-    只把文字颜色改透明，胶囊就落在原处。
+    只把非数字的字变透明，胶囊就落在原处。
+
+    `spring=True` 给出**「弹一下」**的动画页（Tier B，逐帧抓）：
+    以那颗胶囊的中心为轴，整层缩放 `1 → 1.09 → 1`（阻尼弹簧，见 `services/motion.py`），
+    不透明度跟着字幕带自己的淡入走（胶囊不该比它那句字幕更早“长实”）。
+
+    **只在句子里恰好有一个数字时才做**，这不是偷懒：这一层是靠「整层缩放」动的，
+    而缩放的轴心只有一个点 —— 一句话里两个数字隔了 500px 时，峰值 1.09 会让
+    远的那颗偏离 45px（它的胶囊就对不上带子里那颗数字了）。一个数字时轴心就是
+    它自己的中心，**对齐误差恒为 0**。多个数字（或没有数字）由调用方走静态那条路。
     """
     band_h = layout.height - layout.subtitle_top
+    script = ""
+    if spring:
+        bump = js_spring(
+            CHIP_SPRING_SEC, overshoot=SPRING_POP_OVERSHOOT, decay=SPRING_POP_DECAY
+        )
+        script = _CHIP_SPRING_JS % {
+            "bump": bump,
+            "dur": CHIP_SPRING_SEC,
+            "delay": CHIP_POP_DELAY,
+            "bump_delay": CHIP_POP_BUMP_DELAY,
+            "fade": CAPTION_FADE_SEC,
+        }
     return Page(
         html=_document(
-            _band_css(band_h) + CHIP_CSS, _layout_vars(layout), _band_body(text, layout)
+            _band_css(band_h) + CHIP_CSS,
+            _layout_vars(layout),
+            _band_body(text, layout),
+            script=script,
         ),
         width=layout.width,
         height=band_h,
         transparent=True,
     )
+
+
+# 胶囊「弹一下」的页面脚本。两点注意：
+# 1. `window.prepare` 要**接在原来的后面**（FIT_JS 那个负责字号自适应，覆盖掉它
+#    字号就不对了）—— 所以先把旧函数存下来再链上去。
+# 2. 轴心用 `.page` 自己的矩形换算（`r.left - pr.left`），不吃「页面左上角是不是 (0,0)」
+#    这种隐含前提。
+_CHIP_SPRING_JS = """
+<script>
+(function () {
+  var nums = document.querySelectorAll('.band-text .num');
+  if (nums.length !== 1) { return; }
+  var page = document.querySelector('.page') || document.body;
+  var bump = %(bump)s;
+  var DUR = %(dur).3f, DELAY = %(delay).3f, FADE = %(fade).3f;
+  var BUMP_DELAY = %(bump_delay).3f;
+  var previous = window.prepare;
+  window.prepare = async function () {
+    if (previous) { await previous(); }
+    var r = nums[0].getBoundingClientRect();
+    var pr = page.getBoundingClientRect();
+    page.style.transformOrigin =
+      (r.left - pr.left + r.width / 2) + 'px ' + (r.top - pr.top + r.height / 2) + 'px';
+    page.style.opacity = '0';
+  };
+  window.seek = function (t) {
+    page.style.opacity = String(Math.min(1, (DELAY + t) / FADE));
+    // 鼓包整体推迟 `BUMP_DELAY`（那时胶囊已经看得清了），过了窗口就归零 ——
+    // 末帧因此是**精确的静止状态**，序列播完接上去不会跳。
+    var u = t - BUMP_DELAY;
+    page.style.transform = 'scale(' + (1 + (u <= 0 || u >= DUR ? 0 : bump(u))) + ')';
+  };
+})();
+</script>
+"""
 
 
 # 聚光灯从上一处**移到**这一处要用多久。这个数字不大是有原因的：
@@ -778,7 +853,10 @@ def focus_overlay_page(
 FOCUS_MORPH_CSS = """
 .focus-morph {
   animation-name: focus-morph;
-  animation-timing-function: cubic-bezier(.3,.7,.3,1);
+  /* 过冲一点点再落定：`.3,.7,.3,1` 是**单调**的（y 都不超过 1），
+     所以旧版看起来是「滑过去停住」而不是「被放到位」。这里把第二控制点的 y
+     抬到 1.28，峰值约 +2.5%（聚光灯要移动几百像素，再多就成了「甩」）。 */
+  animation-timing-function: cubic-bezier(.34,1.28,.5,1);
   animation-fill-mode: both;
 }
 @keyframes focus-morph {
@@ -889,7 +967,7 @@ html, body { background: %(dark)s; }
 }
 
 
-def _document(css: str, variables: str, body: str) -> str:
+def _document(css: str, variables: str, body: str, *, script: str = "") -> str:
     return f"""<!doctype html>
 <html lang="zh-Hans"><head><meta charset="utf-8">
 <style>
@@ -906,6 +984,7 @@ def _document(css: str, variables: str, body: str) -> str:
 <div class="page">
 {body}
 </div>
+{script}
 </body></html>
 """
 

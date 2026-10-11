@@ -271,6 +271,37 @@ cd frontend && pnpm test:units
 以及四条实测踩出来的坑（`showwaves` 在某些宽度全黑、声波条必须画在字幕带之后、
 resvg 按宽度缩放而不是拉伸、强调行长度中英文必须分开定）。那里是完整推导，这里只留结论。
 
+**弹簧缓动**（参考做法里的原话是「用弹簧和缓动曲线，**不要线性运动**」）：三处已经换掉 ——
+强调行滑入（原来是匀速 936px）、聚光灯位移（原曲线单调、无过冲）、逐句数字胶囊
+（原来只有淡入）。公式与三种形态（Python / ffmpeg 表达式 / 页面 JS）只在
+`services/motion.py` 写一遍，`tests/test_motion.py` 两两比数值。
+**过冲量分开定**：滑入 2%（936px → 19px），胶囊 9%（30px → 2.7px）。
+**改数字前先看 `docs/VIDEO_MOTION.md`**：峰值放早了会「啪」一下贴上去（0.08 秒走 96%）。
+
+### 成片自查 + 响度：只有成片里才看得出来的两件事
+
+分层测试能证明「字幕会换」，证明不了「整条片子里有 11 秒什么也没发生」。
+所以合成完对**成片**量三样并存进 `video.qa`：**最长静止多久**、**响度多少**、
+**音画长度差**（`services/video_qa.py` / `services/loudness.py`，判据怎么标定的见
+**`docs/VIDEO_QA.md`**）。命令行也能单独跑：`python -m app.services.video_qa <mp4> [音频]`。
+
+- **现状是不达标的，而且有数**：三条真实成片里分别有 52.5% / 58.0% / 67.7% 的时长
+  落在「≥4 秒没有任何可见变化」里（最长 11.5 / 9.5 / 11.0 秒）。空档本身不是 bug
+  （一句 30 字本来就要念 10 秒），但它现在是一条**可量的指标**。
+- **响度目标 -14 LUFS / true peak ≤ -1.5 dBFS**，在封装那一步用两遍法 `loudnorm` 做。
+  实测我们现在的片子在 **-18.1 LUFS**，而且**一部分素材到不了 -14**：
+  ffmpeg 自己报 `target_offset: 1.70`（要到 -14 得加 +4.14dB，峰值就 +2.7dBFS 了）。
+  要真踩到 -14 只能上压缩，那是会听得出来的音色改动，得单独决策。
+- **静音不是「很轻的声音」**：ebur128 对数字静音报 `-70.0 LUFS`（它的下限），
+  拿它算增益会得到「+56dB」。低于 `SILENCE_LUFS` 一律当测不到。
+- **逐句胶囊那条**：这一层原来把数字也一起变透明了，叠上去是一颗**实心药丸** ——
+  数字被自己的底色吃掉（合成两层采像素才发现：那句话读成「这套方法在 ▭ 任务上…」）。
+  判据要量「胶囊里数字的墨迹」，不能量「有没有强调色像素」（药丸一直在）。
+  「弹一下」只在**一句话恰好一个数字**时做：整层缩放只有一个轴心，两个数字会推偏 45px。
+- **页面渲染纪律**（`tests/test_render_discipline.py`）：逐帧页面里**不许**出现
+  CSS `transition`（不可 seek，抓到哪一帧取决于机器快慢）、`setTimeout/Interval`、
+  `Math.random()`。CSS `@keyframes` 和 `window.seek(t)` 是允许的 —— 别矫枉过正。
+
 
 ### 配图理由：`video.scenes[i].why`
 
@@ -676,11 +707,14 @@ resvg 按宽度缩放而不是拉伸、强调行长度中英文必须分开定�
 | 逐段选图 + 配图理由 | `services/prompts/assign.py` |
 | 脚本写短了 / 写长了怎么补 | `services/prompts/repair.py` |
 | 折行、去尾虚词这类文字小工具 | `services/prompts/text.py` |
+| 弹簧缓动（过冲多少、公式、ffmpeg/JS 两种形态） | `services/motion.py` |
+| 成片自查（静止空档 / 音画长度差）与响度目标 | `services/video_qa.py` / `services/loudness.py` |
 | 模型调用、重试、结果解析 | `services/llm.py` / `services/llm_parse.py` |
 | 无密钥时的假数据 | `services/llm_mock.py` |
 | 版式与配色令牌（坐标 / 字号 / 颜色 / `Layout`） | `services/design.py` |
 | 视频编排：场景、逐句配图、转场、时长对齐 | `services/video.py` |
-| 逐句画面动效（什么时候换图/换聚光灯，为什么这么定） | `docs/BEAT_MOTION.md` |
+| 逐句画面动效（什么时候换图/换聚光灯/弹一下，为什么这么定） | `docs/BEAT_MOTION.md` |
+| 成片自查与响度（判据怎么标定的、现状多少） | `docs/VIDEO_QA.md` |
 | SVG 画面（幻灯片 / 图片卡 / 强调行 / 字幕带 / 片尾） | `services/video_render.py` |
 | 视频里的数据类型（`Scene` / `VideoResult` / `VideoError` …） | `services/video_core.py` |
 | ffmpeg 编码与静帧 | `services/video_encode.py` |

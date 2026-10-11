@@ -110,6 +110,7 @@ from .video_encode import (  # noqa: F401
     ffmpeg_available,
     probe_media_duration,
 )
+from .video_qa import qa_video
 
 # --------------------------------------------------------------------------
 # 文案（prompt + 模型输出的归一化）搬去 `prompts/` 包了
@@ -921,6 +922,9 @@ class RenderedLayers:
     # 走的就是改动前那条滤镜链，所以这两个字段的默认值必须是空列表而不是 `None`。
     beat_cards: list[list[Path | None]] = field(default_factory=list)
     beat_chips: list[list[Path | None]] = field(default_factory=list)
+    # 逐句胶囊的**帧序列**（弹簧「弹一下」）。有序列时 `beat_chips` 那一格是 None：
+    # 静态图和帧序列不能同时叠（序列播完会被静态图顶掉，看起来像跳了一下）。
+    beat_chip_frames: list[list[list[Path]]] = field(default_factory=list)
     endcard_count: int = 0
     beat_count: int = 0
     chip_count: int = 0
@@ -978,7 +982,11 @@ def _render_scene_layers(
                 )
             result.beat_cards.append(list(beat_layers.cards))
             result.beat_chips.append(list(beat_layers.chips))
+            result.beat_chip_frames.append([list(row) for row in beat_layers.chip_frames])
             result.chip_count += sum(1 for chip in beat_layers.chips if chip is not None)
+            result.chip_count += sum(
+                1 for row in beat_layers.chip_frames if row
+            )
 
             if scene.brand == "outro":
                 # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
@@ -1575,6 +1583,7 @@ def compose_video(
         # 逐句卡与数字强调层就只是躺在磁盘上 —— 这一步才是「动效真的进片」的那根线。
         beat_cards=layers.beat_cards,
         beat_chips=layers.beat_chips,
+        beat_chip_frames=layers.beat_chip_frames,
         layout=layout,
     )
     result.assignment = strategy
@@ -1609,6 +1618,18 @@ def compose_video(
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()
     }
     result.hook = hook
+    # **成片自查**（最长静止 / 响度 / 音画长度差）。它扫一遍片子约 1.7 秒（2fps 抽样），
+    # 相对 40~95 秒的编码可以忽略；而这三件事**只有成片里看得出来** ——
+    # 分层测试能证明「字幕会换」，证明不了「整条片子里有 10 秒什么也没发生」。
+    # 自查绝不让出片失败：`qa_video` 自己吞掉所有异常，只回报测得的部分。
+    try:
+        report = qa_video(output_path, audio_path=audio_path)
+        result.qa = report.to_dict()
+        logger.info("成片自查：%s", report.summary())
+        for issue in report.issues():
+            logger.info("成片自查 · 待改：%s", issue)
+    except Exception:  # pragma: no cover - 自查本身不该影响出片
+        logger.warning("成片自查失败（不影响出片）", exc_info=True)
     result.poster_path = str(
         capture_poster(
             output_path,
@@ -1630,6 +1651,7 @@ def compose_video(
         *layers.focus_paths,
         *(card for row in layers.beat_cards for card in row if card is not None),
         *(chip for row in layers.beat_chips for chip in row if chip is not None),
+        *(frame for row in layers.beat_chip_frames for frames in row for frame in frames),
     ]:
         try:
             temp_path.unlink(missing_ok=True)

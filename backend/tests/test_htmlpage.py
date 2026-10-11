@@ -619,9 +619,17 @@ class TestFocusMorphRendering:
         positions = [border_left(path) for path in frames]
         assert all(pos is not None for pos in positions), positions
         assert positions[0] < positions[-1], f"框没有移动：{positions}"
-        assert all(
-            positions[i] <= positions[i + 1] + 2 for i in range(len(positions) - 1)
-        ), f"移动不单调：{positions}"
+
+        # **过冲**：缓动从 `.3,.7,.3,1`（单调、无过冲，看起来像「滑过去停住」）
+        # 换成了 `.34,1.28,.5,1`，所以「单调」这条断言已经不成立了 —— 改成量过冲**有多少**。
+        # 实测这段行程约 390px，末段从 534 回落 526，即过冲 8px ≈ 2%。
+        # 上限卡 5%：再大就成了「甩过去」，而这一层的用意是「讲解走到这里了」。
+        travel = positions[-1] - positions[0]
+        overshoot = max(positions) - positions[-1]
+        assert overshoot > 0, f"没有过冲（缓动没生效？）：{positions}"
+        assert overshoot <= travel * 0.05, (
+            f"过冲太大：{overshoot}px / 行程 {travel}px（{positions}）"
+        )
 
         static_path = session.render(
             focus_overlay_page(scene, PORTRAIT, target),
@@ -1033,3 +1041,108 @@ class TestPointRowFitsTheBox:
 
         info = self._measure(session, tmp_path, self.LONG, layout=LANDSCAPE)
         assert info["size"] == 44, f"横版放得下却缩了字号：{info['size']}px"
+
+
+@requires_chrome
+class TestChipSpringActuallyPops:
+    """逐句数字胶囊的「弹一下」：**逐帧抓出来的序列里必须真的有过冲**。
+
+    这条链上有一个很容易被忽略的坑：动画是 30fps 抓的，而弹簧的峰值只在 0.06 秒处 ——
+    如果峰值落在两帧之间，抓出来的序列里就没有过冲，弹簧白加了，看代码却完全看不出来。
+    **第二个坑**：胶囊自己也在淡入（跟着字幕带那条淡入走），峰值来的那一刻它还半透明呢 ——
+    所以鼓包整体推迟到 `CHIP_POP_BUMP_DELAY`（那时不透明度 0.91）。
+    实测（真抓帧、数胶囊宽度）：不推迟时 10 帧里**量不到任何过冲**；
+    推迟后 80 → **82** → 76px（静止 76px）。
+    """
+
+    ONE_NUMBER = "显存直降 68.7%，这就是同款方法"
+    TWO_NUMBERS = "16 个任务上精度 67%，显存只要三分之一"
+
+    def _frames(self, session, tmp_path, text):
+        from app.services.design import (
+            CHIP_POP_BUMP_DELAY,
+            CHIP_POP_FPS,
+            CHIP_SPRING_SEC,
+            PORTRAIT,
+        )
+        from app.services.htmlpage import caption_chip_page
+
+        page = caption_chip_page(text, PORTRAIT, spring=True)
+        span = CHIP_POP_BUMP_DELAY + CHIP_SPRING_SEC
+        count = int(round(span * CHIP_POP_FPS))
+        return session.render_frames(
+            page,
+            [step / CHIP_POP_FPS for step in range(count + 1)],
+            tmp_path / "chipframes",
+            work_dir=tmp_path,
+        )
+
+    def _measure(self, path):
+        """量胶囊（浅蓝底 #eef4fb）的宽度 + 里面数字（#17416f）的像素数。
+
+        判据都要**带容差**：截图有 1~2 个灰阶的抖动，缩放后边缘还是渐变的。
+        **半透明那几帧量不出来**（PNG 是预乘 alpha：不透明度 0.44 时 #eef4fb 会变成
+        一百多的灰），所以取「量得到胶囊」的帧为准 —— 静止值也从里面取。
+        """
+        at, width, height = _pixels(path)
+        pill = _hex("#eef4fb")
+        digit = _hex("#17416f")
+        left, right, dark = None, None, 0
+        for y in range(0, height):
+            for x in range(0, width):
+                r, g, b = at(x, y)
+                if all(abs((r, g, b)[k] - pill[k]) <= 10 for k in range(3)):
+                    left = x if left is None else min(left, x)
+                    right = x if right is None else max(right, x)
+                elif abs(r - digit[0]) < 60 and b - r >= 40 and r < 140:
+                    dark += 1
+        span = 0 if left is None else right - left + 1
+        return span, dark
+
+    def test_the_frames_really_overshoot(self, session, tmp_path):
+        from app.services.design import SPRING_POP_OVERSHOOT
+
+        spans = [self._measure(path)[0] for path in self._frames(session, tmp_path, self.ONE_NUMBER)]
+        visible = [span for span in spans if span > 0]
+        assert visible, f"胶囊一个像素都没画出来：{spans}"
+        rest = visible[-1]
+        assert max(visible) >= rest * (1 + SPRING_POP_OVERSHOOT * 0.5), (
+            f"抓下来的帧里没有过冲：静止 {rest}px / 最大 {max(visible)}px（{spans}）"
+        )
+
+    def test_the_last_frame_matches_the_static_layer(self, session, tmp_path):
+        """末帧必须和**静态那版**一样大：序列播完接上去不能跳一下。"""
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import caption_chip_page
+
+        frames = self._frames(session, tmp_path, self.ONE_NUMBER)
+        still = session.render(
+            caption_chip_page(self.ONE_NUMBER, PORTRAIT),
+            tmp_path / "chip-static.png",
+            work_dir=tmp_path,
+        )
+        last = self._measure(frames[-1])[0]
+        assert abs(last - self._measure(still)[0]) <= 2, (
+            f"末帧 {last}px 和静态版对不上：接上去会跳一下"
+        )
+
+    def test_the_digit_is_drawn_not_just_the_pill(self, session, tmp_path):
+        """**踩过的坑**：这一层原来把数字也一起变透明了，叠上去是一颗实心药丸 ——
+        数字被它自己的底色吃掉（合成图里那句话读成「这套方法在 ▭ 任务上…」）。
+        所以这里量的是「胶囊里有没有数字的墨迹」，不是「有没有强调色像素」。
+        """
+        frames = self._frames(session, tmp_path, self.ONE_NUMBER)
+        inks = [self._measure(path)[1] for path in frames]
+        visible = [self._measure(path) for path in frames if self._measure(path)[0] > 0]
+        assert visible and min(info[1] for info in visible) > 200, (
+            f"胶囊里没有数字的墨迹（逐帧墨迹数：{inks}）"
+        )
+
+    def test_two_numbers_fall_back_to_the_static_layer(self):
+        """一句话里两个数字 → **不做弹簧**：这一层是整层缩放，轴心只有一个点，
+        远的那颗会被推偏几十像素（对不上字幕带里的数字）。页面里那道守卫也要拦住。"""
+        from app.services.design import PORTRAIT
+        from app.services.htmlpage import caption_chip_page
+
+        page = caption_chip_page(self.TWO_NUMBERS, PORTRAIT, spring=True)
+        assert "nums.length !== 1" in page.html
