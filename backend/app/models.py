@@ -360,6 +360,36 @@ class ShareView(BaseModel):
     created_at: str
 
 
+class PublicEpisodeItem(BaseModel):
+    """公开库里的一张卡片。**白名单式构造**，不是把 Episode 删几个字段。
+
+    刻意不含：`id`（公开侧一律用 token 定位，不给内部主键）、`user_id`、`options`、
+    `source_ref`（PDF 上传时那是磁盘绝对路径）、`raw_text`、`error`、`timings`、
+    以及 `analysis`/`script` 这些大字段（列表接口带上它们，响应会到 MB 级）。
+    """
+
+    token: str
+    title: str
+    author: ShareAuthor | None = None
+    created_at: str
+    language: Language = "zh"
+    languages: list[Language] = Field(default_factory=list)
+    duration_sec: float | None = None
+    cover_url: str | None = None
+    # 卡片上「有没有片子 / 有没有声音」这两个格子靠它判断，不给具体地址
+    has_video: bool = False
+    has_audio: bool = False
+
+
+class PublicLibrary(BaseModel):
+    """免登录的公开库列表（契约 §2.8）。"""
+
+    items: list[PublicEpisodeItem]
+    total: int
+    limit: int
+    offset: int
+
+
 class ShareVersion(BaseModel):
     language: Language
     script: Script | None = None

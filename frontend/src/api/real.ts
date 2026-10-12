@@ -20,9 +20,11 @@ import type {
   HealthPayload,
   ListEpisodesParams,
   ListEpisodesResult,
+  ListPublicParams,
   LoginInput,
   OptionsPayload,
   PasswordChangeInput,
+  PublicLibraryResult,
   RegisterInput,
   ShareView,
   UsagePayload,
@@ -162,7 +164,7 @@ export function createEpisodeFromText(input: CreateTextInput): Promise<Episode> 
 }
 
 /**
- * 批量生成（契约 §2.8）。
+ * 批量生成（契约 §2.9）。
  * PDF 走 multipart（`files` 字段**出现多次**），链接 / 文本走 JSON（`urls` / `texts` 数组）。
  */
 export function createEpisodeBatch(
@@ -202,6 +204,19 @@ export function listEpisodes(params: ListEpisodesParams = {}): Promise<ListEpiso
   if (params.q) query.set('q', params.q)
   if (params.sort) query.set('sort', params.sort)
   return request<ListEpisodesResult>(`/episodes?${query.toString()}`)
+}
+
+/**
+ * 公开库（契约 §2.8）。**免登录**，所以它不能带任何「需要登录」的预处理：
+ * 未登录时页面直接调它，拿到的是白名单结构（没有内部 id，只有 share token）。
+ */
+export function listPublicEpisodes(params: ListPublicParams = {}): Promise<PublicLibraryResult> {
+  const query = new URLSearchParams()
+  query.set('limit', String(params.limit ?? 20))
+  query.set('offset', String(params.offset ?? 0))
+  if (params.q) query.set('q', params.q)
+  if (params.sort) query.set('sort', params.sort)
+  return request<PublicLibraryResult>(`/library?${query.toString()}`)
 }
 
 export function getEpisode(id: string): Promise<Episode> {
@@ -471,6 +486,7 @@ const adapter: ApiAdapter = {
   createEpisodeFromText,
   createEpisodeBatch,
   listEpisodes,
+  listPublicEpisodes,
   getEpisode,
   deleteEpisode,
   retryEpisode,

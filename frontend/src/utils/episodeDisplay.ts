@@ -13,7 +13,10 @@ import { languageLabel, sanitizeLanguages } from './language'
 /** 时长：合成完用真实时长，没合成完就退回「申请的是几分钟」 */
 export function durationText(episode: EpisodeSummary): string {
   if (episode.audio_duration_sec) return formatDuration(episode.audio_duration_sec)
-  return `${episode.options.duration_min} 分钟`
+  // 公开库的条目没有 `options`（那属于内部参数，白名单里故意不给）——
+  // 拿不到计划时长就不显示，别编一个数字出来
+  const planned = episode.options?.duration_min
+  return planned ? `${planned} 分钟` : ''
 }
 
 /**
@@ -94,7 +97,10 @@ export function languageLabels(episode: EpisodeSummary): string[] {
 }
 
 export function levelText(episode: EpisodeSummary): string {
-  return LEVEL_LABELS[episode.options.level] ?? episode.options.level
+  // 同上：公开库不给 `options`，难度那一格就留空（返回空串，由 `metaParts` 跳过）
+  const level = episode.options?.level
+  if (!level) return ''
+  return LEVEL_LABELS[level] ?? level
 }
 
 /**
@@ -105,7 +111,8 @@ export function metaParts(episode: EpisodeSummary): string[] {
   const parts = [SOURCE_LABELS[episode.source_type] ?? episode.source_type, levelText(episode)]
   parts.push(durationText(episode))
   if (episode.audio_bytes) parts.push(formatBytes(episode.audio_bytes))
-  return parts
+  // 空串要滤掉：公开库没有难度、也没有计划时长，留着会在元信息里出现「 · · 」
+  return parts.filter((part) => Boolean(part))
 }
 
 /** 已经对外分享（契约 §2.7）：列表上给个角标，免得忘了哪一期是公开的 */

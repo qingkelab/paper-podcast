@@ -728,7 +728,55 @@ range 请求探测 moov box）。无视频时 `404`。
 
 ---
 
-## 2.8 批量生成（V2）
+## 2.8 公开库（V2，免登录）
+
+`/library` 这个页面**不需要登录**：访客看到的是「公开库」，登录后同一个页面换成自己的全部单集。
+理由很直接：这是个展示型产品，「先登录才能看别人的作品」是反过来的 ——
+想让人看见，就得先让人看见。首页的产品介绍页早就是免登录的，播客库没理由卡在门口。
+
+### `GET /api/library` （免登录）
+
+查询参数与 `GET /api/episodes` 的**公开子集**一致：`limit`（默认 20，最大 100）、
+`offset`（默认 0）、`q`（按标题模糊搜索）、`sort`（同一份白名单，未知取值 `400`）。
+**没有 `status`** —— 公开库里只会有已完成的那一种。
+
+```jsonc
+{
+  "items": [
+    {
+      "token": "xrbvihxaynwD46OUDKR2Gw",     // 公开侧一律用 token 定位，不给内部 id
+      "title": "STEPQuant: …",
+      "author": { "display_name": "Guo" },    // 只给展示名
+      "created_at": "2026-10-09T01:46:35+00:00",
+      "language": "zh",
+      "languages": ["zh", "en"],
+      "duration_sec": 250.8,
+      "cover_url": "/api/share/{token}/cover?v=…",
+      "has_video": true,
+      "has_audio": true
+    }
+  ],
+  "total": 3,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+**收录条件只有一条**（`db._PUBLIC_WHERE`，首页展示与这里共用同一份定义）：
+`visibility = 'public'` **且** `share_token IS NOT NULL` **且** `status = 'completed'`。
+也就是说：私有单集、别人没公开的东西、跑失败的半成品，一个都不会出现；取消分享后下一
+次请求就消失。
+
+**返回体是白名单**，不是「Episode 删几个字段」：不含 `id`、`user_id`、`options`、
+`source_ref`（PDF 上传时那是**磁盘绝对路径**）、`raw_text`、`error`、`timings`、
+以及 `analysis` / `script` 这些大字段（列表带上它们，响应会到 MB 级）。
+
+点进去走的是公开分享页 `/share/{token}`（前两节的免登录通道），
+所以列表里不需要、也不给视频与音频的具体地址，只给两个布尔位。
+
+---
+
+## 2.9 批量生成（V2）
 
 一次提交多篇论文，串行入队（worker 本来就是串行消费，批量只是省掉重复操作）。
 

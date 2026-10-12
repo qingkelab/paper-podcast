@@ -35,11 +35,13 @@ import type {
   FigureRotateDirection,
   HealthPayload,
   ListEpisodesParams,
+  ListPublicParams,
   ListEpisodesResult,
   LoginInput,
   OptionsPayload,
   PaperMeta,
   PasswordChangeInput,
+  PublicLibraryResult,
   RegisterInput,
   Script,
   ScriptSegment,
@@ -98,7 +100,7 @@ const SESSION_KEY = 'paper-podcast:mock:session:v1'
 const STAGE_MS = 700
 /** 来源（文件名 / 链接 / 文本）里带上这个标记，可演示失败态与重试流程 */
 const FAIL_DEMO = /fail-demo/i
-/** 批量生成上限（契约 §2.8：20 篇/次） */
+/** 批量生成上限（契约 §2.9：20 篇/次） */
 const MAX_BATCH = 20
 /**
  * 批量里「文本」一篇的最短长度。真实后端要求 ≥200 字（`_batch_from_json`），
@@ -1062,6 +1064,8 @@ function seed(): void {
     sourceRef: string | null
     options: EpisodeOptionsInput
     hoursAgo: number
+    /** 这一条是不是「作者分享出来的」（演示公开库用，见下面） */
+    shared?: boolean
   }> = [
     {
       index: 0,
@@ -1076,6 +1080,9 @@ function seed(): void {
       sourceRef: 'https://arxiv.org/abs/1512.03385',
       options: { duration_min: 10, level: 'advanced', languages: ['zh', 'en'] },
       hoursAgo: 20,
+      // 两条公开：离线演示里**公开库页要有东西可看**，否则这个功能在演示站上等于不存在
+      // （真后端同理 —— 公开库里只有点过分享的那些）
+      shared: true,
     },
     {
       index: 2,
@@ -1083,6 +1090,7 @@ function seed(): void {
       sourceRef: null,
       options: { duration_min: 3, level: 'expert', languages: ['zh'] },
       hoursAgo: 0.4,
+      shared: true,
     },
   ]
 
@@ -1103,6 +1111,10 @@ function seed(): void {
     episode.stage_label = def.label
     episode.progress = def.progress
     episode.updated_at = created
+    if (seedDef.shared) {
+      episode.visibility = 'public'
+      episode.share_token = makeShareToken()
+    }
   })
 }
 
@@ -1730,7 +1742,7 @@ export function shareAnalysisMdUrl(token: string, lang?: EpisodeLanguage): strin
 }
 
 // ---------------------------------------------------------------------------
-// V2：批量生成（契约 §2.8）
+// V2：批量生成（契约 §2.9）
 // ---------------------------------------------------------------------------
 
 /** 链接看起来能不能抓：Mock 不真的联网，用「明显不可达」的规则演示 failed 分支 */
@@ -1779,7 +1791,7 @@ export async function createEpisodeBatch(
         runPipeline(episode)
         created.push(toSummary(episode))
       } catch (cause) {
-        // 单项失败不影响其他项（契约 §2.8）：这一条进 failed 并带上原因，其余照常入队
+        // 单项失败不影响其他项（契约 §2.9）：这一条进 failed 并带上原因，其余照常入队
         failed.push({ ref: name, reason: cause instanceof Error ? cause.message : '无法处理这个文件' })
       }
     })
@@ -2037,6 +2049,45 @@ function toSummary(episode: Episode): EpisodeSummary {
     created_at: episode.created_at,
     updated_at: episode.updated_at,
   }
+}
+
+/**
+ * 公开库（契约 §2.8），**免登录** —— 演示站里也是「不登录就能翻」，
+ * 否则离线演示根本演不出这个功能。
+ *
+ * 只列**公开且已完成**的那些：演示数据里 `visibility === 'public'` 的那几集
+ * （真后端同样只给这些，见 `db._PUBLIC_WHERE`）。
+ */
+export async function listPublicEpisodes(
+  params: ListPublicParams = {},
+): Promise<PublicLibraryResult> {
+  ensureLoaded()
+  await delay(200)
+
+  const limit = Math.min(Math.max(params.limit ?? 20, 1), 100)
+  const offset = Math.max(params.offset ?? 0, 0)
+  const keyword = params.q?.trim().toLowerCase() ?? ''
+
+  let items = episodes.filter(
+    (episode) => episode.visibility === 'public' && episode.status === 'completed' && episode.share_token,
+  )
+  if (keyword) items = items.filter((episode) => episode.title.toLowerCase().includes(keyword))
+  items = items.slice().sort(mockComparator(params.sort))
+
+  const page = items.slice(offset, offset + limit).map((episode) => ({
+    token: episode.share_token as string,
+    title: episode.title,
+    // 公开侧只给展示名，不给 username / id（和真后端同一套规矩）
+    author: { display_name: '演示作者' },
+    created_at: episode.created_at,
+    language: episode.language ?? 'zh',
+    languages: episode.languages?.length ? episode.languages : [episode.language ?? 'zh'],
+    duration_sec: episode.audio_duration_sec ?? null,
+    cover_url: episode.cover_url ?? null,
+    has_video: Boolean(episode.video),
+    has_audio: Boolean(episode.audio_url),
+  }))
+  return { items: page, total: items.length, limit, offset }
 }
 
 export async function listEpisodes(params: ListEpisodesParams = {}): Promise<ListEpisodesResult> {
@@ -2342,6 +2393,7 @@ const adapter: ApiAdapter = {
   createEpisodeFromText,
   createEpisodeBatch,
   listEpisodes,
+  listPublicEpisodes,
   getEpisode,
   deleteEpisode,
   retryEpisode,

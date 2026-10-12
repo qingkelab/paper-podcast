@@ -1,8 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { deleteEpisode, errorMessage, listAlbums, listEpisodes, retryEpisode } from '../api'
-import type { Album, EpisodeSummary } from '../api'
+import {
+  deleteEpisode,
+  errorMessage,
+  listAlbums,
+  listEpisodes,
+  listPublicEpisodes,
+  retryEpisode,
+} from '../api'
+import type { Album, EpisodeSummary, PublicEpisodeItem } from '../api'
 import AccountPrompt from '../components/AccountPrompt.vue'
 import AlbumPickerDialog from '../components/AlbumPickerDialog.vue'
 import EpisodeCard from '../components/EpisodeCard.vue'
@@ -39,6 +46,69 @@ const STATUS_FILTERS: ReadonlyArray<{ value: StatusFilter; label: string }> = [
 ]
 
 const session = useSessionStore()
+
+/**
+ * **访客模式**：没登录也能看播客库（契约 §2.8）。
+ *
+ * 为什么加这条：这个站点本质上是展示用的 —— 想让人看见，就得先让人看见。
+ * 原来「先登录再看别人的作品」是反过来的；首页的产品介绍页早就免登录了，
+ * 播客库却卡在门口，逻辑上说不通。
+ *
+ * 访客走 `/api/library`（只含公开且已完成的），登录后仍然走 `/api/episodes` 看**自己的**
+ * 全部单集（含私有的）。两条路的形状不一样，所以在访客模式下把公开条目
+ * 映射成卡片要用的 `EpisodeSummary`，并给卡片一个 `/share/:token` 的跳转目标 ——
+ * 公开侧没有内部 id，访客也没有 cookie，跳到 `/episode/:id` 只会拿到 401。
+ */
+const isGuest = computed(() => !session.isLoggedIn)
+
+/** 每个条目的跳转目标：访客去公开分享页，作者去自己的单集页 */
+const linkTargets = ref<Record<string, { name: string; params: Record<string, string> }>>({})
+
+function linkToFor(episode: EpisodeSummary) {
+  return linkTargets.value[episode.id]
+}
+
+function guestSummary(item: PublicEpisodeItem): EpisodeSummary {
+  // 逐字段对齐卡片真正用到的那几个；公开侧没有的（source_ref / paper_meta / status 之外
+  // 的状态机字段）一律不给值，别用假数据把卡片填满 —— 那看起来像真有这些信息。
+  return {
+    id: item.token,
+    title: item.title,
+    status: 'completed',
+    source_type: 'url',
+    visibility: 'public',
+    share_token: item.token,
+    created_at: item.created_at,
+    language: item.language,
+    languages: item.languages,
+    audio_duration_sec: item.duration_sec,
+    cover_url: item.cover_url,
+    cover_width: null,
+    cover_height: null,
+    video: item.has_video ? {} : null,
+    // `options` 是内部参数，公开库故意不给 —— 这里给一个空的，
+    // 卡片上「难度」那一格因此留空（`levelText` 会返回空串），不编造数据
+    options: {},
+  } as unknown as EpisodeSummary
+}
+
+async function fetchPublicPage(offset: number, limit: number): Promise<void> {
+  const result = await listPublicEpisodes({
+    offset,
+    limit,
+    q: keyword.value.trim() || undefined,
+    sort: sort.value,
+  })
+  const mapped = result.items.map(guestSummary)
+  if (offset === 0) items.value = mapped
+  else items.value = [...items.value, ...mapped]
+  total.value = result.total
+  const targets: Record<string, { name: string; params: Record<string, string> }> = {}
+  result.items.forEach((item: PublicEpisodeItem) => {
+    targets[item.token] = { name: 'share', params: { token: item.token } }
+  })
+  linkTargets.value = offset === 0 ? targets : { ...linkTargets.value, ...targets }
+}
 
 // 列表接口返回的是 EpisodeSummary（不含 analysis / script / figures / illustration）
 const items = ref<EpisodeSummary[]>([])
@@ -137,11 +207,16 @@ async function fetchPage(offset: number, limit: number, silent = false): Promise
     else loadingMore.value = true
   }
   try {
-    const result = await listEpisodes(params(offset, limit))
-    if (seq !== requestSeq) return
-    if (offset === 0) items.value = result.items
-    else items.value = [...items.value, ...result.items]
-    total.value = result.total
+    if (isGuest.value) {
+      await fetchPublicPage(offset, limit)
+      if (seq !== requestSeq) return
+    } else {
+      const result = await listEpisodes(params(offset, limit))
+      if (seq !== requestSeq) return
+      if (offset === 0) items.value = result.items
+      else items.value = [...items.value, ...result.items]
+      total.value = result.total
+    }
     error.value = null
   } catch (cause) {
     if (seq !== requestSeq) return
@@ -174,12 +249,12 @@ async function manualRefresh(): Promise<void> {
 }
 
 function syncAutoRefresh(): void {
-  if (hasActiveTask.value && refreshTimer === undefined) {
+  if (!isGuest.value && hasActiveTask.value && refreshTimer === undefined) {
     refreshTimer = window.setInterval(() => {
       if (document.hidden) return
       void fetchPage(0, currentLimit(), true)
     }, AUTO_REFRESH_MS)
-  } else if (!hasActiveTask.value && refreshTimer !== undefined) {
+  } else if ((isGuest.value || !hasActiveTask.value) && refreshTimer !== undefined) {
     window.clearInterval(refreshTimer)
     refreshTimer = undefined
   }
@@ -238,8 +313,17 @@ watch([keyword, status, sort], () => {
 watch(sort, (value) => saveLibrarySort(value))
 
 onMounted(() => {
+  void session.ensureInit()
   void fetchPage(0, PAGE_SIZE)
-  void loadAlbums()
+  // 访客没有专辑，也不需要轮询自己的任务
+  if (!isGuest.value) void loadAlbums()
+})
+
+// 登录态可能来得比首次渲染晚（`/auth/me` 要一次往返）：变了就重新取一遍，
+// 否则「刚登录仍看到公开库」会让人以为自己的单集丢了
+watch(isGuest, () => {
+  void fetchPage(0, PAGE_SIZE)
+  if (!isGuest.value) void loadAlbums()
 })
 
 onBeforeUnmount(() => {
@@ -263,8 +347,15 @@ onBeforeUnmount(() => {
           <span v-if="refreshing" class="spinner" aria-hidden="true" />
           {{ refreshing ? '刷新中…' : '刷新' }}
         </button>
-        <RouterLink to="/albums" class="btn btn--ghost">我的专辑</RouterLink>
-        <RouterLink to="/create" class="btn btn--primary">导入新论文</RouterLink>
+        <template v-if="isGuest">
+          <!-- 访客：这两个入口都需要账号，给了也点不通，不如直接说清楚 -->
+          <RouterLink to="/login" class="btn btn--ghost">登录</RouterLink>
+          <RouterLink to="/create" class="btn btn--primary">导入新论文</RouterLink>
+        </template>
+        <template v-else>
+          <RouterLink to="/albums" class="btn btn--ghost">我的专辑</RouterLink>
+          <RouterLink to="/create" class="btn btn--primary">导入新论文</RouterLink>
+        </template>
       </div>
     </header>
 
@@ -283,7 +374,7 @@ onBeforeUnmount(() => {
         />
       </div>
 
-      <div class="chips" role="group" aria-label="按状态筛选">
+      <div v-if="!isGuest" class="chips" role="group" aria-label="按状态筛选">
         <button
           v-for="item in STATUS_FILTERS"
           :key="item.value"
@@ -320,6 +411,11 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </div>
+
+    <p v-if="isGuest" class="section__hint" style="margin: -8px 0 20px">
+      这是<strong>公开库</strong>：只列作者分享出来、并且已经生成完成的单集。
+      登录后可以看到自己的全部单集（包括还没公开的）。
+    </p>
 
     <p v-if="hasActiveTask" class="section__hint" style="margin: -8px 0 20px">
       有任务正在生成，页面每 5 秒会自动刷新一次状态。
@@ -362,6 +458,11 @@ onBeforeUnmount(() => {
         <p style="margin-bottom: 18px">换个关键词，或把状态筛选改回「全部」。</p>
         <button type="button" class="btn btn--ghost" @click="clearFilters">清除筛选</button>
       </template>
+      <template v-else-if="isGuest">
+        <p class="empty__title">还没有公开的播客</p>
+        <p style="margin-bottom: 18px">作者分享出来的成品会出现在这里。</p>
+        <RouterLink to="/" class="btn btn--primary">回首页看看</RouterLink>
+      </template>
       <template v-else>
         <p class="empty__title">播客库还是空的</p>
         <p style="margin-bottom: 18px">导入第一篇论文，几分钟后这里就会出现一条双人播客。</p>
@@ -376,7 +477,10 @@ onBeforeUnmount(() => {
           :key="episode.id"
           :episode="episode"
           :priority="index < 3"
-          :album-title="albumTitleFor(episode)"
+          :album-title="isGuest ? null : albumTitleFor(episode)"
+          :link-to="linkToFor(episode)"
+          :show-album-action="!isGuest"
+          :can-manage="!isGuest"
           @delete="onConfirmDelete"
           @retry="onRetry"
           @album="openAlbumPicker"
@@ -388,7 +492,10 @@ onBeforeUnmount(() => {
           v-for="episode in items"
           :key="episode.id"
           :episode="episode"
-          :album-title="albumTitleFor(episode)"
+          :album-title="isGuest ? null : albumTitleFor(episode)"
+          :link-to="linkToFor(episode)"
+          :show-album-action="!isGuest"
+          :can-manage="!isGuest"
           @delete="onConfirmDelete"
           @retry="onRetry"
           @album="openAlbumPicker"
@@ -411,7 +518,7 @@ onBeforeUnmount(() => {
     </template>
 
     <AlbumPickerDialog
-      :open="pickerTarget !== null"
+      :open="!isGuest && pickerTarget !== null"
       :episode-id="pickerTarget?.id ?? ''"
       :episode-title="pickerTarget?.title ?? ''"
       :album-id="pickerTarget?.album_id ?? null"
@@ -420,7 +527,7 @@ onBeforeUnmount(() => {
     />
 
     <ConfirmDialog
-      :open="confirmTarget !== null"
+      :open="!isGuest && confirmTarget !== null"
       title="删除这条播客？"
       :text="`《${confirmTarget?.title ?? ''}》的脚本、解读、音频与视频都会被一起删掉，且无法恢复。`"
       confirm-text="删除"

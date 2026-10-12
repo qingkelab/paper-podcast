@@ -43,7 +43,7 @@ const SAMPLES = [
   { title: 'LoRA: Low-Rank Adaptation', url: 'https://arxiv.org/abs/2106.09685' },
 ]
 
-/** 契约 §2.8：一次最多 20 篇 */
+/** 契约 §2.9：一次最多 20 篇 */
 const MAX_BATCH = 20
 /** 批量里「文本」一篇的最短长度（真实后端 `_batch_from_json` 的要求） */
 const BATCH_TEXT_MIN = 200
@@ -67,7 +67,7 @@ const picker = ref<HTMLInputElement | null>(null)
  */
 const usage = ref<UsagePayload | null>(null)
 
-/** 批量提交的结果：成功与失败**分开显示**（契约 §2.8「单项失败不影响其他项」） */
+/** 批量提交的结果：成功与失败**分开显示**（契约 §2.9「单项失败不影响其他项」） */
 const batchResult = ref<BatchResult | null>(null)
 /** 单篇成功后的跳转目标（还没跳之前先显示结果，便于批量时逐个点进去看） */
 const lastCreated = ref<Episode | null>(null)
@@ -126,7 +126,7 @@ const recommendedPartner = computed(() => {
 })
 
 // ---------------------------------------------------------------------------
-// V2：一次多篇（契约 §2.8）
+// V2：一次多篇（契约 §2.9）
 // ---------------------------------------------------------------------------
 
 /** 链接：一行一条 */
@@ -272,7 +272,7 @@ function resetResult(): void {
 /**
  * 提交：一篇走原来的单篇接口（行为完全不变），多篇走批量接口。
  *
- * 单篇与批量是**两个接口**（契约 §2.1 / §2.8），批量的返回结构不一样
+ * 单篇与批量是**两个接口**（契约 §2.1 / §2.9），批量的返回结构不一样
  * （`{ created, failed, total }`），所以不能用同一条路径糊过去。
  */
 async function submit(): Promise<void> {
@@ -617,7 +617,7 @@ onMounted(() => {
       </span>
     </div>
 
-    <!-- 批量结果：成功与失败**分开显示**（契约 §2.8） -->
+    <!-- 批量结果：成功与失败**分开显示**（契约 §2.9） -->
     <section v-if="batchResult" class="section" aria-live="polite">
       <div class="section__head">
         <h2 class="section__title">批量提交结果</h2>

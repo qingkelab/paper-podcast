@@ -593,17 +593,51 @@ class Database:
 
     # ---------- 分享 ----------
 
+    # 「谁能被公开看到」只有这一份定义：点过分享、而且已经跑完。
+    # 首页展示、公开库列表都走它 —— 写两遍迟早有一处忘了加条件（比如忘了 status）。
+    _PUBLIC_WHERE = (
+        "visibility = 'public' AND share_token IS NOT NULL AND status = 'completed'"
+    )
+
     def query_public_episodes(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """公开分享出去的单集，最新在前。首页在未登录时用它挑展示内容。"""
         rows = self._query(
-            """
-            SELECT * FROM episodes
-            WHERE visibility = 'public' AND share_token IS NOT NULL AND status = 'completed'
-            ORDER BY created_at DESC, rowid DESC LIMIT ?
-            """,
+            f"SELECT * FROM episodes WHERE {self._PUBLIC_WHERE} "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
             (limit,),
         )
         return [self._row_to_record(r) for r in rows]
+
+    def list_public_episodes(
+        self,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        q: str | None = None,
+        sort: str = DEFAULT_EPISODE_SORT,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """公开库的列表（免登录）。**只含公开且已完成**的那些，返回 (行, 总数)。
+
+        和 `list_episodes` 分开写而不是加一个 `public_only=True` 开关：那个函数是
+        「我的库」，带 user_id / album 这些只对本人有意义的条件；混在一起之后，
+        任何一次「顺手加个条件」都可能把别人的私有单集漏进来。
+        """
+        where = [self._PUBLIC_WHERE]
+        params: list[Any] = []
+        if q:
+            where.append("title LIKE ?")
+            params.append(f"%{q}%")
+        clause = " AND ".join(where)
+        total_row = self._query_one(
+            f"SELECT COUNT(*) AS n FROM episodes WHERE {clause}", tuple(params)
+        )
+        total = int(total_row["n"]) if total_row else 0
+        rows = self._query(
+            f"SELECT * FROM episodes WHERE {clause} "
+            f"ORDER BY {EPISODE_ORDER[sort]} LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        return [self._row_to_record(r) for r in rows], total
 
     def episode_by_share_token(self, token: str) -> dict[str, Any] | None:
         """按分享 token 取单集。**只有 visibility=public 才算** ——

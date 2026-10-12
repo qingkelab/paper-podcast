@@ -335,6 +335,40 @@ export interface ListEpisodesResult {
 }
 
 /**
+ * 公开库（契约 §2.8）的一张卡片。**只含公开且已完成**的单集。
+ *
+ * 为什么单独一个类型、而不是复用 `EpisodeSummary`：公开侧的字段是**白名单**的 ——
+ * 没有内部 id（公开侧一律用 token 定位）、没有 user_id、source_ref（可能是磁盘绝对路径）、
+ * options、raw_text。类型上分开写，前端就不会「顺手」去读一个公开接口根本不会给的字段。
+ */
+export interface PublicEpisodeItem {
+  token: string
+  title: string
+  author: { display_name: string } | null
+  created_at: string
+  language: EpisodeLanguage
+  languages: EpisodeLanguage[]
+  duration_sec: number | null
+  cover_url: string | null
+  has_video: boolean
+  has_audio: boolean
+}
+
+export interface PublicLibraryResult {
+  items: PublicEpisodeItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface ListPublicParams {
+  limit?: number
+  offset?: number
+  q?: string
+  sort?: EpisodeSort
+}
+
+/**
  * 可见性（契约 §1）。
  * `private` 只有作者能看，`public` 任何人拿到 share_token 都能看。
  */
@@ -519,7 +553,7 @@ export interface ShareView {
 }
 
 // ---------------------------------------------------------------------------
-// V2：批量生成（契约 §2.8）
+// V2：批量生成（契约 §2.9）
 // ---------------------------------------------------------------------------
 
 export interface BatchFailure {
@@ -593,7 +627,7 @@ export interface ApiAdapter {
   createEpisodeFromUrl(input: CreateUrlInput): Promise<Episode>
   createEpisodeFromText(input: CreateTextInput): Promise<Episode>
   /**
-   * 批量生成（契约 §2.8）：一次提交多篇，串行入队。
+   * 批量生成（契约 §2.9）：一次提交多篇，串行入队。
    * **单项失败不影响其他项** —— 抓不到的进 `failed` 并给出原因，能用的照常入队。
    * 上限 20 篇/次（超了后端返回 400）。
    */
@@ -601,6 +635,11 @@ export interface ApiAdapter {
     input: BatchFilesInput | BatchUrlsInput | BatchTextsInput,
   ): Promise<BatchResult>
   listEpisodes(params?: ListEpisodesParams): Promise<ListEpisodesResult>
+  /**
+   * 公开库列表（**免登录**）。未登录时播客库页走它，只列公开且已完成的单集。
+   * 登录后仍然看自己的库（`listEpisodes`）—— 自己的私有单集不该因为这一条而消失。
+   */
+  listPublicEpisodes(params?: ListPublicParams): Promise<PublicLibraryResult>
   getEpisode(id: string): Promise<Episode>
   deleteEpisode(id: string): Promise<void>
   retryEpisode(id: string): Promise<Episode>

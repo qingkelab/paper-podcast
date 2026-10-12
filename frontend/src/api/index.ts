@@ -47,13 +47,21 @@ export function createEpisodeFromText(input: Parameters<ApiAdapter['createEpisod
   return adapter.createEpisodeFromText(input)
 }
 
-/** 批量生成（契约 §2.8）：返回 { created, failed, total }，单项失败不影响其他项 */
+/** 批量生成（契约 §2.9）：返回 { created, failed, total }，单项失败不影响其他项 */
 export function createEpisodeBatch(input: Parameters<ApiAdapter['createEpisodeBatch']>[0]) {
   return adapter.createEpisodeBatch(input)
 }
 
 export function listEpisodes(params: Parameters<ApiAdapter['listEpisodes']>[0] = {}) {
   return adapter.listEpisodes(params)
+}
+
+/**
+ * 公开库（契约 §2.9）：**免登录**，只含公开且已完成的单集。
+ * 未登录时播客库页走它；登录后仍然走 `listEpisodes` 看自己的全部单集。
+ */
+export function listPublicEpisodes(params: Parameters<ApiAdapter['listPublicEpisodes']>[0] = {}) {
+  return adapter.listPublicEpisodes(params)
 }
 
 export function getEpisode(id: string) {
@@ -257,11 +265,14 @@ export type {
   LevelOption,
   LevelValue,
   ListEpisodesParams,
+  ListPublicParams,
   ListEpisodesResult,
   LoginInput,
   ModeValue,
   OptionsPayload,
   PaperMeta,
+  PublicEpisodeItem,
+  PublicLibraryResult,
   PasswordChangeInput,
   RegisterInput,
   Script,

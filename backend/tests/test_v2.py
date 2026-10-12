@@ -492,6 +492,104 @@ class TestShare:
                 assert anon.get(f"/api/share/{token}/audio?lang=en").status_code in (200, 206)
 
 
+class TestPublicLibrary:
+    """公开库（契约 §2.9）：**免登录**的一页列表，只含公开且已完成的单集。
+
+    这一批测的是边界而不是「能不能用」：私有单集、别人没公开的、跑失败的半成品
+    一个都不能出现；返回体必须是白名单（不能带内部 id / user_id / source_ref）。
+    """
+
+    @pytest.fixture
+    def owner_client(self, tmp_path):
+        app = make_app(tmp_path)
+        with TestClient(app) as client:
+            register(client, "guo")
+            yield client
+
+    def test_anonymous_sees_shared_episodes(self, owner_client, tmp_path):
+        episode = make_episode(owner_client)
+        token = owner_client.post(f"/api/episodes/{episode['id']}/share").json()["share_token"]
+
+        with as_user(tmp_path) as (anon, _):
+            body = anon.get("/api/library").json()
+            assert body["total"] == 1
+            item = body["items"][0]
+            assert item["title"] == episode["title"]
+            assert item["token"] == token
+            assert item["has_audio"] is True
+            assert item["cover_url"].startswith(f"/api/share/{item['token']}/")
+            # 展示名（不是 username）；注册时的显示名默认取首字母大写
+            assert item["author"]["display_name"].lower() == "guo"
+            # 白名单：公开侧不出现内部结构
+            for leaked in ("id", "user_id", "options", "source_ref", "raw_text", "error", "timings"):
+                assert leaked not in item, f"公开库泄漏了 {leaked}"
+
+    def test_private_episodes_never_show_up(self, owner_client, tmp_path):
+        """私有单集连「有没有」都不该暴露 —— 列表里出现它的标题就是泄漏。"""
+        episode = make_episode(owner_client)  # 默认 private
+        with as_user(tmp_path) as (anon, _):
+            body = anon.get("/api/library").json()
+            assert body["total"] == 0 and body["items"] == []
+            # 搜索也搜不到
+            assert anon.get("/api/library", params={"q": episode["title"][:6]}).json()["total"] == 0
+
+    def test_unshare_removes_it_from_the_library(self, owner_client, tmp_path):
+        episode = make_episode(owner_client)
+        owner_client.post(f"/api/episodes/{episode['id']}/share")
+        with as_user(tmp_path) as (anon, _):
+            assert anon.get("/api/library").json()["total"] == 1
+        owner_client.delete(f"/api/episodes/{episode['id']}/share")
+        with as_user(tmp_path) as (anon, _):
+            assert anon.get("/api/library").json()["total"] == 0
+
+    def test_unfinished_episodes_are_not_listed(self, owner_client, tmp_path):
+        """跑失败的半成品不该挂在公开库里 —— 点进去只有半截东西。"""
+        episode = make_episode(owner_client)
+        owner_client.post(f"/api/episodes/{episode['id']}/share")
+        owner_client.app.state.db.update_episode(episode["id"], status="failed")
+        with as_user(tmp_path) as (anon, _):
+            assert anon.get("/api/library").json()["total"] == 0
+
+    def test_logged_in_user_still_sees_only_public_here(self, tmp_path):
+        """这个接口对谁都只给公开的那些（自己的库要看 `/api/episodes`）。"""
+        with as_user(tmp_path, "guo") as (owner, _):
+            private = make_episode(owner)
+            shared = make_episode(owner)
+            owner.post(f"/api/episodes/{shared['id']}/share")
+            body = owner.get("/api/library").json()
+            assert body["total"] == 1
+            assert body["items"][0]["title"] == shared["title"]
+            assert private["id"] not in {item["token"] for item in body["items"]}
+
+    def test_search_sort_and_paging(self, owner_client, tmp_path):
+        first = make_episode(owner_client)
+        second = make_episode(owner_client)
+        for episode in (first, second):
+            owner_client.post(f"/api/episodes/{episode['id']}/share")
+
+        with as_user(tmp_path) as (anon, _):
+            page = anon.get("/api/library", params={"limit": 1, "offset": 0}).json()
+            assert page["total"] == 2 and len(page["items"]) == 1
+            assert page["limit"] == 1 and page["offset"] == 0
+            second_page = anon.get("/api/library", params={"limit": 1, "offset": 1}).json()
+            assert second_page["items"][0]["token"] != page["items"][0]["token"]
+            # 未知排序是 400（白名单），不是静默退回默认排序
+            assert anon.get("/api/library", params={"sort": "nope"}).status_code == 400
+            assert anon.get("/api/library", params={"sort": "title_asc"}).status_code == 200
+
+    def test_failed_query_does_not_leak_other_users(self, tmp_path):
+        with as_user(tmp_path, "guo") as (owner, _):
+            episode = make_episode(owner)
+            owner.post(f"/api/episodes/{episode['id']}/share")
+        with as_user(tmp_path, "intruder") as (other, _):
+            # 别人的公开单集**是**能看到的（这正是「公开库」的意思），
+            # 但只到白名单字段为止
+            item = other.get("/api/library").json()["items"][0]
+            assert "id" not in item and "user_id" not in item
+            # 自己的库仍然只看得到自己的
+            assert other.get("/api/episodes").json()["total"] == 0
+
+
 # --------------------------------------------------------------------------
 # 首页展示
 # --------------------------------------------------------------------------

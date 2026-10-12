@@ -18,10 +18,13 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from ... import auth as auth_lib
 from ...config import Settings
 from ...db import DEFAULT_EPISODE_SORT, EPISODE_ORDER, RUNNING_STATUS
-from ...models import BatchResult, Episode, EpisodeList
+from ...models import BatchResult, Episode, EpisodeList, PublicLibrary
 from ...services.ingest import IngestError, fetch_url_text, guess_title
 from ...voices import normalize_voice
 from .shared import (
+    _all_versions,
+    _primary_language,
+    _share_asset_urls,
     router,
     _check_generation_quota,
     _current_user_id,
@@ -380,6 +383,87 @@ async def _batch_from_json(request: Request, settings: Settings, limit: int) -> 
 # --------------------------------------------------------------------------
 
 
+VALID_STATUS = {
+    "queued", "parsing", "analyzing", "scripting", "synthesizing", "completed", "failed",
+}
+
+
+def _check_sort(sort: str) -> str:
+    """排序是**封闭白名单**：未知取值 400，不静默退回默认排序。
+
+    「我的库」和「公开库」两条列表共用它 —— 各写一遍的话，迟早有一边允许了
+    一个另一边会报错的排序串。
+    """
+    if sort not in EPISODE_ORDER:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知排序：{sort}（可选：{', '.join(EPISODE_ORDER)}）",
+        )
+    return sort
+
+
+@router.get("/library", response_model=PublicLibrary)
+async def public_library(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    q: str | None = Query(None),
+    sort: str = Query(DEFAULT_EPISODE_SORT),
+):
+    """**公开库**：所有点过分享、并且已经跑完的单集。**免登录**。
+
+    为什么要有它：产品介绍页原来靠 `/api/showcase` 只露一期，访客看完一期就没了；
+    而「先登录才能看别人的作品」对一个作品集式的站点是反过来的 —— 想让人看见，
+    就得先让人看见。这里给的是**一页列表**，点进去走的是公开分享页
+    `/share/{token}`（同一套免登录资源通道）。
+
+    **只含 `visibility='public'` 且 `status='completed'`**：私有单集、别人库里
+    没公开的东西、跑失败的半成品，一个都不会出现在这里（条件的唯一来源是
+    `db._PUBLIC_WHERE`）。返回的是白名单结构 `PublicEpisodeItem` ——
+    不含内部 id、user_id、options、source_ref（那可能是磁盘绝对路径）、raw_text。
+
+    `q=` 搜标题、`sort=` 见 `db.EPISODE_ORDER`，未知取值 400。
+    """
+    sort = _check_sort(sort)
+    records, total = _db(request).list_public_episodes(
+        limit=limit,
+        offset=offset,
+        q=(q or "").strip() or None,
+        sort=sort,
+    )
+    return {
+        "items": [_public_item(request, r) for r in records],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+def _public_item(request: Request, record: dict[str, Any]) -> dict[str, Any]:
+    """一行公开库卡片。作者只给展示名（和分享页同一套规矩）。"""
+    token = str(record.get("share_token") or "")
+    versions = _all_versions(record)
+    primary = _primary_language(record)
+    surface = versions.get(primary) or (next(iter(versions.values())) if versions else {})
+    owner = _db(request).get_user(record["user_id"]) if record.get("user_id") else None
+    # ⚠️ 主语言**不能读 `record["language"]`**：那一列在库里根本不存在，
+    # 主语言是由 `versions` / `options` 推出来的（`_primary_language`）。
+    # 踩过：写成 `record.get("language")` 会让 `versions.get(None)` 恒为空，
+    # 于是每个卡片都显示「没有视频、没有音频」（端点看着是 200，数据全是 false）。
+    return {
+        "token": token,
+        "title": record.get("title") or "",
+        "author": {"display_name": owner["display_name"]} if owner else None,
+        "created_at": record.get("created_at") or "",
+        "language": primary,
+        "languages": list(versions.keys()) or [primary],
+        "duration_sec": surface.get("audio_duration_sec") or record.get("audio_duration_sec"),
+        "cover_url": _share_asset_urls(record, token).get("cover_url"),
+        "has_video": bool(surface.get("video_path") or surface.get("video")),
+        "has_audio": bool(surface.get("audio_path")),
+    }
+
+
 @router.get("/episodes", response_model=EpisodeList)
 async def list_episodes(
     request: Request,
@@ -399,14 +483,9 @@ async def list_episodes(
     不静默退回默认排序 —— 前端写错了排序应当场知道，
     而不是变成「点了按标题排，顺序没变」这种要盯半天才发现的问题。
     """
-    valid_status = {"queued", "parsing", "analyzing", "scripting", "synthesizing", "completed", "failed"}
-    if status and status not in valid_status and status != RUNNING_STATUS:
+    if status and status not in VALID_STATUS and status != RUNNING_STATUS:
         raise HTTPException(status_code=400, detail=f"未知状态：{status}")
-    if sort not in EPISODE_ORDER:
-        raise HTTPException(
-            status_code=400,
-            detail=f"未知排序：{sort}（可选：{', '.join(EPISODE_ORDER)}）",
-        )
+    sort = _check_sort(sort)
 
     user = auth_lib.user_or_401(request)
     wants_album = album_id or album

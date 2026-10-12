@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
+import type { RouteLocationRaw } from 'vue-router'
 import type { EpisodeSummary } from '../api'
 import StatusBadge from './StatusBadge.vue'
 import { formatDateTime, formatRelative } from '../utils/format'
@@ -27,8 +28,16 @@ const props = withDefaults(
     albumTitle?: string | null
     /** 专辑详情页里不显示「加入专辑」（那一集本来就在这张专辑里） */
     showAlbumAction?: boolean
+    /** 自定义跳转目标（公开库用；不给就是默认的单集页/进度页） */
+    linkTo?: RouteLocationRaw
+    /**
+     * 能不能**管理**这一集（改专辑 / 删除 / 重新生成）。
+     * 公开库里访客没有账号，这些动作一个都做不了 —— 给一个点了没反应的按钮
+     * 比不给更糟（用户会以为功能坏了）。
+     */
+    canManage?: boolean
   }>(),
-  { albumTitle: null, showAlbumAction: true },
+  { albumTitle: null, showAlbumAction: true, canManage: true },
 )
 
 const emit = defineEmits<{
@@ -39,10 +48,18 @@ const emit = defineEmits<{
 
 const isDone = computed(() => props.episode.status === 'completed')
 const shared = computed(() => isShared(props.episode))
-const target = computed(() => ({
-  name: isDone.value ? 'episode' : 'task',
-  params: { id: props.episode.id },
-}))
+/**
+ * 点进哪儿。默认：跑完的进单集页 `/episode/:id`，没跑完的进进度页。
+ * **公开库**里传 `linkTo` 指到 `/share/:token` —— 公开侧没有内部 id，
+ * 而且访客没有 cookie，跳到单集页只会看到 401。
+ */
+const target = computed(
+  () =>
+    props.linkTo ??
+    (isDone.value
+      ? { name: 'episode', params: { id: props.episode.id } }
+      : { name: 'task', params: { id: props.episode.id } }),
+)
 
 /**
  * 元信息**压成一行**：来源 · 难度 · 时长 · 体积 · 语言 · 作者/年份/arXiv 号 · 专辑。
@@ -110,7 +127,7 @@ const thumbUrl = computed(() => (thumbFailed.value ? null : props.episode.cover_
           {{ isDone ? '播放' : '进度' }}
         </RouterLink>
         <button
-          v-if="episode.status === 'failed'"
+          v-if="props.canManage && episode.status === 'failed'"
           type="button"
           class="btn btn--sm"
           @click="emit('retry', episode)"
@@ -118,7 +135,7 @@ const thumbUrl = computed(() => (thumbFailed.value ? null : props.episode.cover_
           重试
         </button>
         <button
-          v-if="props.showAlbumAction"
+          v-if="props.canManage && props.showAlbumAction"
           type="button"
           class="btn btn--sm btn--ghost"
           @click="emit('album', episode)"
@@ -126,6 +143,7 @@ const thumbUrl = computed(() => (thumbFailed.value ? null : props.episode.cover_
           {{ albumTitle ? '改专辑' : '加入专辑' }}
         </button>
         <button
+          v-if="props.canManage"
           type="button"
           class="btn btn--sm btn--danger"
           title="删除这一集"

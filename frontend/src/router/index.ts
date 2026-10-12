@@ -8,8 +8,8 @@ import { IS_MOCK } from '../api'
  * 真实后端模式用 history 模式，URL 就是 /library 这样的干净路径。
  *
  * `meta.public`：**免登录**页面。路由守卫与全局 401 处理都看它 ——
- * 首页是产品介绍页（登录前就要能看），`/share/:token` 是公开分享链接（契约要求免登录），
- * 两者都绝不能把人踹到登录页。
+ * 首页是产品介绍页（登录前就要能看）、`/share/:token` 是公开分享链接、
+ * `/library` 是公开库列表（访客看公开的那些），三者都绝不能把人踹到登录页。
  */
 const routes: RouteRecordRaw[] = [
   {
@@ -39,10 +39,13 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '生成进度' },
   },
   {
+    // 播客库**免登录**（契约 §2.9）：访客看到的是公开库（只含已分享、已完成的），
+    // 登录后同一个页面换成自己的全部单集。想让人看见，就得先让人看见 ——
+    // 卡在登录门口的作品集是没人看的。
     path: '/library',
     name: 'library',
     component: () => import('../views/LibraryView.vue'),
-    meta: { title: '播客库' },
+    meta: { title: '播客库', public: true },
   },
   {
     path: '/albums',
