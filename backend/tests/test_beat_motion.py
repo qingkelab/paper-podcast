@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from app.services.design import (
+    ENABLE_BEAT_IMAGES,
     IMAGE_BOX_H,
     IMAGE_BOX_LEFT,
     IMAGE_TOP,
@@ -28,6 +29,12 @@ from app.services.design import (
     SUBTITLE_TOP,
     VIDEO_H,
     VIDEO_W,
+)
+
+
+needs_beat_images = pytest.mark.skipif(
+    not ENABLE_BEAT_IMAGES,
+    reason="逐句换画面默认关闭（用户选「稳」：画面按段换）；打开 design.ENABLE_BEAT_IMAGES 后这些用例仍然有效",
 )
 from app.services.htmlframe import ChromeSession, chrome_available
 from app.services.video_core import Beat, CaptionBand, Scene
@@ -217,6 +224,7 @@ class TestBeatCardGuards:
         layers = render_beat_layers(scene, work_dir=tmp_path / "layers")
         assert layers.cards == [] and layers.chips == []
 
+    @needs_beat_images
     def test_the_second_beat_does_get_its_own_card(self, tmp_path):
         """正例：换图 + 时长够 → 第 1 句有卡，第 0 句没有（它就是本段原本的卡）。"""
         blue = make_png(tmp_path / "blue.png", color=(30, 60, 220))
@@ -277,6 +285,7 @@ class TestBeatCardsAreEncoded:
         )
         return out
 
+    @needs_beat_images
     def test_the_second_beat_shows_its_own_picture(self, tmp_path):
         """一句一图：抽两句中心的帧，第一句是红、第二句是蓝。"""
         blue = make_png(tmp_path / "blue.png", color=(30, 60, 220))
@@ -645,6 +654,7 @@ class TestWholeChainWithBeats:
             video_module.encode_video = real_encode
         return result, tmp_path / f"{name}.mp4", tmp_path / f"work-{name}"
 
+    @needs_beat_images
     def test_two_beats_two_colours_through_the_whole_chain(self, tmp_path):
         """一句一图：抽两句中心的帧，第一句红、第二句蓝；时长/帧数与不给 beats 时一致。"""
         beats = [

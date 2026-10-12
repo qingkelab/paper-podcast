@@ -23,6 +23,7 @@ from ..branding import BRAND_CTA_SUBTITLE, BRAND_CTA_TITLE, logo_path
 from .audio_track import Pause, align_boundaries
 from .design import (
     BEAT_IMAGE_MIN_SEC,
+    ENABLE_BEAT_IMAGES,
     BG_COLOR,
     BRAND_DARK,
     BRAND_DARK_PANEL,
@@ -1154,6 +1155,12 @@ def render_beat_layers(
         beat_start, beat_end = windows[beat_index]
         # 守卫③：这一句太短（按**实际窗口**判）：几个字一闪而过比不切更难看
         if (beat_end - beat_start) < BEAT_IMAGE_MIN_SEC:
+            continue
+
+        if not ENABLE_BEAT_IMAGES:
+            # 画面按**段**换（用户选「稳」）：这一句不单独出一张卡，整段用同一张图。
+            # 字幕带与数字强调仍按句走 —— 「字幕 1~2 行」是产品要求，与画面粒度无关。
+            # 逐句画面那套（含三条守卫）都留着，开关一开就回来。
             continue
 
         card_path = work_dir / f"beat-{index:04d}-{beat_index}.png"
