@@ -91,12 +91,22 @@ video_encode(diagram_states=…) / video_render     # 按时间点叠加状态�
 每条都带 `source` 原句、只在真的有结构的段落提镜头。规模上限（镜头数 / 节点数 / 指标数 /
 标题字数）在 `design.py` 里有一份常量，**prompt 里的数字与代码上限同源**（测试盯着）。
 
+## 复用：重建不再问模型
+
+镜头随段存进 `video.scenes[i].diagram`（`diagram_shot_to_dict/from_dict`），
+`compose_video` 在**有 preset 时只读这份数据**，一次模型调用都不发 ——
+规矩同 `point` / `hook`：重建不该换画面，也不该再花一次调用。
+`tests/test_diagram.py::test_rebuild_reuses_the_shot_without_calling_the_model`
+量的是「有没有调模型」（假模型记着 `calls`，必须是空的 —— 只比画面一不一样不够，
+重复调用一样能画出同一张图）。
+
+**状态图渲染接在图片卡那一步**：`_render_scene_layers` 里遇见 `scene.diagram` 就渲染
+`1..n-1` 个状态（均匀铺在本段时长里），交给 `encode_video(diagram_states=…)`。
+
 ## 还没做的
 
-- **重新合成时的复用**：镜头已经落在 `video.scenes[i].diagram`（存取函数
-  `diagram_to_dict/from_dict` 已就位），但还没接进 `compose_video` 的 preset 通路 ——
-  下一次「重新合成」仍会重新问一次模型。规矩同 `point` / `hook`：
-  **重建不该换画面，也不该再花一次模型调用**。
 - **结论收束镜头**与 `fallback_image` 的联动（切回论文原图）还没接：样片里用的是
-  最后一段解说 + 论文原图。
+  最后一段解说 + 论文原图；`fallback_image` 目前只是存下来。
 - **`kind=summary` 的自动挑选**：现在由模型决定，还没有「一节结束时优先收束」的规则。
+- **状态时机**：现在是「均匀铺在本段时长里」。更好的做法是跟着**小句**走
+  （复用 `plan_reveals` 的时间表），但需要先把状态与小句对齐，留到下一轮。

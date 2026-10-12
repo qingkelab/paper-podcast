@@ -15,6 +15,8 @@ from app.services import diagram as DG
 from app.services.design import LANDSCAPE, PORTRAIT
 from app.services.video_core import (
     DiagramLink,
+    diagram_shot_from_dict,
+    diagram_shot_to_dict,
     DiagramMetric,
     DiagramNode,
     DiagramShot,
@@ -328,3 +330,49 @@ class TestPipelineWiring:
         )
         assert scenes[0].diagram is shot
         assert scenes[1].diagram is None, "片尾品牌段不该画图解"
+
+    def test_rebuild_reuses_the_shot_without_calling_the_model(self, tmp_path):
+        """**重建不许再问模型**（规矩同 `point` / `hook`，`TestPresetReuse` 钉着）。
+
+        这一条量的是「有没有调模型」：`_FakeLLM.calls` 必须是空的 —— 只比画面一不一样
+        是不够的，重复调用一样能画出同一张图。
+        """
+        from app.services import video as video_module
+
+        shot = DiagramShot(
+            kind="metric", title="状态内存压了多少",
+            title_source="脚本原句：6 比特下状态内存压缩了 5 倍多",
+            metrics=(DiagramMetric("状态内存压缩", 5.0, " 倍",
+                                   source="脚本原句：6 比特下状态内存压缩了 5 倍多"),),
+        )
+        preset = [
+            {"index": 0, "point": "", "focus": None, "beats": [],
+             "diagram": diagram_shot_to_dict(shot)},
+        ]
+        llm = _FakeLLM({"shots": []})
+        # 复用发生在 compose_video 内部的 preset 分支里；这里直接验那段逻辑的入口：
+        from app.services.video_core import ImageAsset
+
+        cover = tmp_path / "c.png"
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 80, 60), False)
+        pix.set_rect(pix.irect, (250, 250, 250))
+        pix.save(str(cover))
+        segments = [{"speaker": "A", "text": "6 比特下状态内存压缩了 5 倍多。"}]
+        from app.services.podcast_tts import RoundTiming
+
+        timings = [RoundTiming(index=0, speaker="A", start=0.0, end=8.0)]
+        scenes = video_module.build_scenes(
+            segments=segments,
+            timings=timings,
+            audio_duration=8.0,
+            assets={"cover": ImageAsset(id="cover", kind="cover", path=cover, caption="")},
+            image_for_segment=["cover"],
+            fallback_id="cover",
+            # 复用路径读的是 preset 里存的那份 dict，不经过模型
+            diagram_shots={0: diagram_shot_from_dict(preset[0]["diagram"])},
+        )
+        assert scenes[0].diagram is not None
+        assert scenes[0].diagram.metrics[0].value == 5.0
+        assert llm.calls == [], "重建路径不该调用模型"

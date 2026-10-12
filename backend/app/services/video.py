@@ -68,6 +68,8 @@ from .design import *  # noqa: F401,F403
 # `from app.services.video import encode_video` 就行，一个字都不用改。
 # 新代码请直接用上面对应的模块（类型 → video_core，画面 → video_render，ffmpeg → video_encode）。
 from .video_core import (
+    diagram_shot_from_dict,
+    diagram_shot_to_dict,
     plan_reveals,
     _SENTENCE_END,
     Beat,
@@ -1233,6 +1235,9 @@ class RenderedLayers:
     # 逐句胶囊的**帧序列**（弹簧「弹一下」）。有序列时 `beat_chips` 那一格是 None：
     # 静态图和帧序列不能同时叠（序列播完会被静态图顶掉，看起来像跳了一下）。
     beat_chip_frames: list[list[list[Path]]] = field(default_factory=list)
+    # 图解镜头的状态图：第 i 段的第 k 个状态（相对本段起点的秒数 + 图层）。
+    # 与逐句卡分开：状态数由内容决定（几个节点就几步），与字幕句数无关。
+    diagram_states: list[list[tuple[Path, float]]] = field(default_factory=list)
     beat_focuses: list[list[Path | None]] = field(default_factory=list)
     endcard_count: int = 0
     beat_count: int = 0
@@ -1324,6 +1329,7 @@ def _render_scene_layers(
                 # 品牌卡上的字是大号引导语，不参与「字幕逐句出现」——那会把它切碎。
                 # 它整页都是牌子，没有「图片层」，转场用 to_card（上一整页淡出）代替。
                 _render_endcard_layer(scene, slide_path, layout=layout, session=session)
+                result.diagram_states.append([])
                 result.endcard_count += 1
             else:
                 # 正文：**骨架 + 图片卡** 两层。骨架（图注/强调行/字幕带）全程不动，
@@ -1338,8 +1344,24 @@ def _render_scene_layers(
                 )
                 card_path = work_dir / f"card-{index:04d}.png"
                 if scene.diagram is not None:
-                    # 图解镜头：状态 0 是「标题 + 第一个节点」，后面的状态按句叠上去
+                    # 图解镜头：状态 0 是「标题 + 第一个节点」，后面的状态按时间点叠上去
                     _render_diagram_card(scene, card_path, layout=layout, session=session)
+                    from .diagram import render_diagram_state_html, shot_state_count
+
+                    states: list[tuple[Path, float]] = []
+                    total = shot_state_count(scene.diagram)
+                    for state in range(1, total):
+                        state_path = work_dir / f"diagram-{index:04d}-{state}.png"
+                        render_diagram_state_html(
+                            scene.diagram,
+                            state_path,
+                            layout=layout,
+                            state=state,
+                            session=session,
+                        )
+                        # 与样片同一条规则：状态均匀铺在本段时长里（与字幕句数解耦）
+                        states.append((state_path, scene.duration * state / total))
+                    result.diagram_states.append(states)
                 else:
                     _render_card_layer(scene, card_path, layout=layout, session=session)
                 result.card_paths.append(card_path)
@@ -1814,6 +1836,28 @@ def compose_video(
         if reused_focus:
             logger.info("聚光灯：复用上次的 %d 段", reused_focus)
 
+    # 图解镜头：**重建时复用**（规矩同 point/hook：重建不该换画面，也不该再花一次调用）。
+    # 只有「没有 preset」（= 第一次生成）时才可能去问模型。
+    diagram_shots: dict[int, Any] = {}
+    if preset_scenes:
+        for entry in preset_scenes:
+            index = entry.get("index")
+            shot = diagram_shot_from_dict(entry.get("diagram"))
+            if shot is not None and isinstance(index, int) and 0 <= index < len(segments):
+                diagram_shots[index] = shot
+        if diagram_shots:
+            logger.info("图解镜头：复用上次的 %d 段", len(diagram_shots))
+    elif allow_point_llm and llm is not None:
+        diagram_shots = assign_diagram_shots(
+            segments=segments,
+            timings=timings,
+            evidence=diagram_evidence(analysis, segments, figures),
+            llm=llm,
+            available_images=[
+                (asset_id, str(asset.caption or "")) for asset_id, asset in pool.items()
+            ],
+        )
+
     if (
         allow_point_llm
         and any(not point for point in points)
@@ -1930,6 +1974,7 @@ def compose_video(
         audio_duration=audio_duration,
         assets=pool,
         image_for_segment=image_for_segment,
+        diagram_shots=diagram_shots,
         fallback_id=default_id,
         points=points,
         focuses=focuses,
@@ -1988,6 +2033,7 @@ def compose_video(
         beat_cards=layers.beat_cards,
         beat_chips=layers.beat_chips,
         beat_chip_frames=layers.beat_chip_frames,
+        diagram_states=layers.diagram_states,
         beat_focus_overlays=layers.beat_focuses,
         layout=layout,
     )
@@ -2081,6 +2127,7 @@ def compose_video(
         *(card for row in layers.beat_cards for card in row if card is not None),
         *(chip for row in layers.beat_chips for chip in row if chip is not None),
         *(frame for row in layers.beat_chip_frames for frames in row for frame in frames),
+        *(path for row in layers.diagram_states for _path, _moment in row),
     ]:
         try:
             temp_path.unlink(missing_ok=True)
