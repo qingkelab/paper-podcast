@@ -52,7 +52,8 @@ DIAGRAM_SYSTEM = """你在给一个「论文解读视频」设计**动态图解�
 - `flow`：这一段在讲**步骤或因果链**（先做什么、再做什么、为什么）；
 - `compare`：这一段在对比两个方案/两个配置（谁处理什么、谁好谁差）；
 - `hook`：开场或一节的开头，用一句话抛出问题或结论；
-- `summary`：一节收尾，一句话总结，通常 `fallback_image` 填论文原图 id（我给你的可用图 id 之一）。
+- `summary`：**收尾**用，一句话总结 + `fallback_image` 填论文原图 id（我给你的可用图 id 之一）。
+  我会在候选段落里用「← **收尾段**」标出哪一段该放它；那一段**优先**提 `summary`。
 - **没有合适内容的段落就不要提镜头**，宁缺毋滥：作废的镜头会退回原来的画面，写了也没用。
 
 【输出格式（严格 JSON，不要解释文字）】
@@ -90,6 +91,7 @@ def build_diagram_messages(
     evidence: Sequence[str],
     available_images: Sequence[tuple[str, str]] = (),
     candidates: Iterable[int] | None = None,
+    summary_candidates: Iterable[int] = (),
     max_shots: int = DIAGRAM_MAX_SHOTS,
     language: str = "zh",
     timings: Sequence[Any] = (),
@@ -102,6 +104,7 @@ def build_diagram_messages(
     - `timings`：可选，带上每段的时长，让模型知道哪几段够长、值得画。
     """
     wanted = list(candidates) if candidates is not None else list(range(len(segments)))
+    summary_set = {int(index) for index in summary_candidates}
     lines: list[str] = []
     for index in wanted:
         if index < 0 or index >= len(segments):
@@ -115,7 +118,9 @@ def build_diagram_messages(
             end = getattr(timing, "end", None)
             if start is not None and end is not None:
                 seconds = f"（{float(end) - float(start):.1f} 秒）"
-        lines.append(f"[{index}] {speaker}：{text}{seconds}")
+        # 标出收尾段：位置信息由我们给（模型看不到「这是第几段里的最后一段」）
+        tag = "　← **收尾段**（这一段优先提 `summary`，`fallback_image` 填论文原图 id）" if index in summary_set else ""
+        lines.append(f"[{index}] {speaker}：{text}{seconds}{tag}")
 
     evidence_block = "\n".join(f"- {item}" for item in evidence if str(item).strip())
     images_block = "\n".join(f"- {image_id}：{caption}" for image_id, caption in available_images)

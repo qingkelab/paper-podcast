@@ -415,3 +415,74 @@ class TestStateTiming:
 
     def test_single_state_needs_no_moment(self):
         assert DG.state_moments(self.TEXT, 8.0, 1) == [0.0]
+
+
+class TestSummaryShotsAreChosenByPosition:
+    """`summary`（一句话总结 + 切回论文原图）该落在哪儿是**位置**问题，不是内容问题。
+
+    模型只看到段号和文字，不知道「这是全集的最后一段」——所以位置由我们标出来。
+    规则本身是确定的：紧挨片尾品牌段的那一段正文。
+    """
+
+    SEGMENTS = [
+        {"speaker": "A", "text": "这里是青稞社区，我们只讲自己读过的东西。"},
+        {"speaker": "A", "text": "6 比特下状态内存压缩了 5 倍多，Qwen 从 144 兆降到 28 兆左右。"},
+        {"speaker": "B", "text": "意味着高并发长上下文推理服务里，状态内存不再那个黑洞。"},
+        {"speaker": "B", "text": "这里是青稞社区，感谢收听。", "brand": "outro"},
+    ]
+
+    def test_the_last_body_segment_is_the_summary_position(self):
+        from app.services.video import summary_candidates
+
+        assert summary_candidates(self.SEGMENTS) == [2]
+
+    def test_no_outro_means_no_summary_position(self):
+        from app.services.video import summary_candidates
+
+        assert summary_candidates(self.SEGMENTS[:3]) == []
+
+    def _full_timings(self):
+        """四段各自的时长都要够（收尾段太短会被「一闪而过」那条判据挡掉 —— 那是设计如此）。"""
+        from app.services.podcast_tts import RoundTiming
+
+        return [
+            RoundTiming(index=0, speaker="A", start=0.0, end=3.0),
+            RoundTiming(index=1, speaker="A", start=3.0, end=16.0),
+            RoundTiming(index=2, speaker="B", start=16.0, end=26.0),
+            RoundTiming(index=3, speaker="B", start=26.0, end=29.0),
+        ]
+
+    def test_summary_position_always_enters_the_candidates(self):
+        """收尾段常常没有数字/步骤关键词，靠内容判据筛不进来 —— 它必须被显式加回候选。"""
+        from app.services.video import diagram_candidates
+
+        picked = diagram_candidates(self.SEGMENTS, self._full_timings())
+        assert 2 in picked, picked
+
+    def test_too_short_summary_segment_is_dropped(self):
+        from app.services.podcast_tts import RoundTiming
+        from app.services.video import diagram_candidates
+
+        segments = [
+            {"speaker": "A", "text": "正文。"},
+            {"speaker": "B", "text": "就这样。", "brand": "outro"},
+        ]
+        timings = [
+            RoundTiming(index=0, speaker="A", start=0.0, end=1.2),   # 只有 1.2 秒
+            RoundTiming(index=1, speaker="B", start=1.2, end=4.0),
+        ]
+        assert diagram_candidates(segments, timings) == []
+
+    def test_the_prompt_marks_the_summary_position(self):
+        from app.services.prompts.diagram import build_diagram_messages
+
+        messages = build_diagram_messages(
+            segments=self.SEGMENTS,
+            evidence=["6 比特下状态内存压缩了 5 倍多"],
+            candidates=[1, 2],
+            summary_candidates=[2],
+            timings=self._full_timings(),
+        )
+        body = messages[1]["content"]
+        assert "收尾段" in body
+        assert "[2]" in body and "summary" in body

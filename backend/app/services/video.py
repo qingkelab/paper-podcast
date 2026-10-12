@@ -239,7 +239,42 @@ def diagram_candidates(
             picked.append(index)
         if len(picked) >= max_candidates:
             break
-    return picked
+    # **收尾段始终进候选**：结论镜头该落在哪儿是位置问题，不是「这段话里有没有数字」。
+    # （它长度不够就算了 —— 一两秒的收尾挂一张图反而更差。）
+    for index in summary_candidates(segments):
+        if index in picked:
+            continue
+        if index >= len(timings):
+            continue
+        timing = timings[index]
+        start, end = getattr(timing, "start", None), getattr(timing, "end", None)
+        if start is not None and end is not None and float(end) - float(start) < min_seconds:
+            continue
+        picked.append(index)
+    return sorted(picked)
+
+
+def summary_candidates(segments: list[dict[str, Any]]) -> list[int]:
+    """「收尾段」的段号：**紧挨片尾品牌段的那一段正文**。
+
+    为什么要有它：`summary` 镜头（一句话总结 + 切回论文原图）在整集的**最后**最自然，
+    但模型拿到一堆候选段时并不知道「哪一段是结尾」—— 它只看到编号和文字。
+    这里把位置信息显式喂给它，规则本身是确定的（不依赖模型判断）。
+    """
+    outro_index = next(
+        (
+            index
+            for index, segment in enumerate(segments)
+            if str(segment.get("brand") or "") == "outro"
+        ),
+        None,
+    )
+    if outro_index is None:
+        return []
+    for index in range(outro_index - 1, -1, -1):
+        if str(segments[index].get("brand") or "") not in ("intro", "outro"):
+            return [index]
+    return []
 
 
 def assign_diagram_shots(
@@ -272,6 +307,7 @@ def assign_diagram_shots(
         evidence=evidence,
         available_images=available_images or [],
         candidates=candidates,
+        summary_candidates=summary_candidates(segments),
         max_shots=max_shots,
         language=language,
         timings=timings,
