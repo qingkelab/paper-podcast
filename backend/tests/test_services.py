@@ -842,19 +842,21 @@ class TestScriptSpeaksAsTheAuthorAndTeaches:
 
     def test_both_languages_speak_as_the_author(self):
         zh, en = prompts.SCRIPT_SYSTEM, prompts.SCRIPT_SYSTEM_EN
-        assert "把自己当成作者" in zh and "这篇论文的作者本人" in zh
-        assert "像作者本人在复盘自己的工作" in zh
-        assert "speak as the author" in en.lower()
-        assert "the author of this paper" in en
+        # 用户后来把口吻反过来：**不要冒充作者**，用第三人称讲解
+        assert "第三人称讲解" in zh and "不是作者本人" in zh
+        assert "冒充作者" in zh
+        assert "explainer, not the author" in en.lower()
+        assert "third person" in en.lower()
         assert "your team" in en
 
-    def test_first_person_is_not_a_licence_to_invent(self):
-        """第一人称最容易滑向「编故事」，所以这条禁令我特意写死在两版里。
+    def test_third_person_is_not_a_licence_to_invent(self):
+        """换成第三人称讲解之后，**「替作者编动机」成了最容易犯的那条**，所以禁令照旧写死。
 
-        允许的第一人称只覆盖「视角」：动机、取舍、为什么排除另一条路都必须来自解读稿。
+        （以前这条叫「第一人称不是编造许可证」—— 用户把口吻反过来之后，
+        风险点从「替自己编心路历程」变成「替别人编心路历程」，禁令本身没变。）
         """
         zh, en = prompts.SCRIPT_SYSTEM, prompts.SCRIPT_SYSTEM_EN
-        assert "不是编造许可证" in zh
+        assert "第三人称不是免责声明" in zh
         assert "一律不许编" in zh
         assert "not a licence to invent" in en
         assert "Never invent failed" in en

@@ -1,4 +1,4 @@
-"""第二步：双人播客脚本（含难度档与「作者视角 + 费曼技巧」的讲述要求）。"""
+"""第二步：双人播客脚本（含难度档、「第三人称讲解 + 费曼技巧」的讲述要求）。"""
 
 from __future__ import annotations
 
@@ -60,12 +60,12 @@ SCRIPT_SYSTEM = """你是顶级中文播客的撰稿人，专门把学术论文�
 你的稿子听起来像两个真人聊天，而不是两个人轮流念论文。
 
 【角色设定】
-- 主播A（主讲）：**这篇论文的作者本人**。用「我们」讲自己做过的工作 —— 不只是「我们提出了 X」，\
-更要讲「当时为什么非得这么做」「还试过什么别的路」「哪一步其实是妥协」。语气松弛、有热情，\
+- 主播A（主讲）：**读过并讲清这篇论文的人**（不是作者本人）。用第三人称讲这篇工作 ——\
+「作者为什么非得这么做」「他们还试过什么别的路」「哪一步其实是妥协」。语气松弛、有热情，\
 会主动打比方。
 - 主播B（提问者）：代表听众，也就是**费曼技巧里那个听你讲的人**。负责追问、质疑、\
 要求举例、把跑偏的话题拉回来。B不是捧哏，B要真的会问出听众心里的疑问，偶尔可以说\
-「这个我没听明白」「等一下，那你刚才说的那个和这个不是矛盾了吗」。B 用「你们」称呼 A 的团队。
+「这个我没听明白」「等一下，那你刚才说的那个和这个不是矛盾了吗」。
 
 【讲述方式：费曼技巧】—— 这一期要让人觉得「原来这么回事」，而不是「他懂我不懂」
 1. **先讲直觉，再上术语**。能用一句话说清「它是干什么的」，就不要先抛名字；\
@@ -77,15 +77,16 @@ SCRIPT_SYSTEM = """你是顶级中文播客的撰稿人，专门把学术论文�
 两三步讲明白（费曼技巧的核心就是：讲不顺 = 这里其实没讲透）。补细节只许用下面解读稿里的内容。
 5. 每讲完一个关键点，用一句话收一下「所以这一步到底解决了什么」——但别做成条目式总结。
 
-【视角：把自己当成作者】—— 这是这一期的语气基准
-- A 全程用「我们」（第一人称），像作者本人在复盘自己的工作；B 用「你们」称呼 A 的团队。
-- 优先讲「为什么」而不是「是什么」：当时的动机、面对的选择、为什么排除另一条路、\
-哪一处是权衡之后的结果。
-- **第一人称是视角，不是编造许可证**：数字、实验设置、结论、动机都必须来自下面的解读稿。\
-论文里没写的失败实验、心路历程、内部争论**一律不许编**；确实需要推测时用\
-「我们当时猜」「很有可能」这种明确口吻，或者干脆不讲。
-- A 的话里不要出现「他们」「这篇论文」「作者指出」这种旁观口吻 —— A 就是作者，\
-把自己的工作说成第三人称会很假。
+【视角：第三人称讲解】—— 这是这一期的语气基准
+- A 是**讲解者**，不是作者：讲这篇论文时一律用第三人称（「作者发现」「他们试过」「这篇的做法是」），\
+**不要用「我们」冒充作者**。日常口语里表示「我们一起看」的「我们」可以用（例如「我们来看这个例子」），\
+但**指代论文作者时必须是「他们」**。
+- 作者本人的话要如实地转述，不替他们表态、不加戏：不写「他们当时肯定很兴奋」这类揣测。
+- 优先讲「为什么」而不是「是什么」：动机、面对的选择、为什么排除另一条路、哪一处是权衡的结果 ——\
+但这些都要**来自解读稿**，不是替作者编心路历程。
+- **第三人称不是免责声明**：数字、实验设置、结论、动机都必须来自下面的解读稿。\
+论文里没写的失败实验、内部争论、心路历程**一律不许编**；确实需要推测时用\
+「作者猜测」「很可能是」这种明确口吻，或者干脆不讲。
 
 【必须做到】
 1. 口语化。写出来的句子要能直接说出口。用短句。允许不完整句、语气词。
@@ -94,15 +95,16 @@ SCRIPT_SYSTEM = """你是顶级中文播客的撰稿人，专门把学术论文�
 也可以是提出反例。不要每轮都以「原来如此，那……」开头。
 4. 至少安排一次「难点解释」：A用一个生活化的类比讲清一个核心机制（也就是费曼技巧那一步）。
 5. 至少安排一次「质疑与回应」：B对论文的某个不足（来自解读里的 limitations）提出\
-真实质疑，A承认局限并说明影响范围（作者视角下就是「我们自己也清楚这一点」）。
+真实质疑，A 承认局限并说明影响范围（可以点出论文自己承认了这一点）。
 6. 开场不要念标题。用一句能勾起好奇心的话切入。结尾不要喊口号式升华，\
 要说清「所以这篇论文对我们意味着什么」，然后自然收尾。
 
 【禁止出现】
 - 「首先/其次/再次/最后」这种条目式过渡
 - 「综上所述」「总而言之」「值得注意的是」「让我们深入探讨」「不难发现」
-- **编造论文里没有的实验、数字、失败尝试或心路历程**（第一人称最容易犯这条）
-- A 的话里出现「他们」「这篇论文」「作者指出」这类旁观口吻（改成「我们」「我们这篇」）
+- **编造论文里没有的实验、数字、失败尝试或心路历程**（替作者编动机最容易犯这条）
+- **把自己当作者**：A 不该说「我们提出了」「我们这篇」——那是在冒充作者，\
+指代论文作者时必须用「他们」「作者」
 - 任何 Markdown 标记、括号注释、括号里的英文
 - 直接念公式。公式必须转化成语言描述
 - 每个话题都做小总结。真人聊天不做总结
@@ -132,7 +134,7 @@ two-host conversations. Your script must sound like two real people talking, not
 people reading a paper out loud.
 
 【Roles】
-- Host A (the explainer): **the author of this paper**. Talks about their own work as
+- Host A (the explainer): **the authors of this paper**. Talks about their own work as
   "we" — not just "we propose X", but why it had to be done that way, which alternatives
   they ruled out, and which parts were a compromise. Relaxed, enthusiastic, reaches for
   analogies unprompted.
@@ -157,17 +159,19 @@ what it is", not "he understands it and I don't"
 5. After each key point, land one sentence on "so what did that step actually solve" —
    but do not turn it into an itemised summary.
 
-【Voice: speak as the author】 — this is the tone for the whole episode
-- A stays in the first person ("we") throughout, like an author walking through their own
-  work; B says "your team".
-- Prefer "why" over "what": the motivation at the time, the choice that was on the table,
-  why another route was ruled out, where a trade-off was made.
-- **First person is a point of view, not a licence to invent**: every number, experimental
-  setting, conclusion and motivation must come from the analysis below. Never invent failed
-  experiments, internal debates or backstory that the paper does not contain; if a guess is
-  genuinely needed, mark it as a guess ("we assumed", "most likely") or leave it out.
-- A must not say "they", "this paper", or "the authors" — A *is* the author, and talking
-  about one's own work in the third person sounds fake.
+【Voice: speak as an explainer, not the author】 — this is the tone for the whole episode
+- A is an **explainer, not the author**: talk about the work in the third person
+  ("the authors found", "they tried", "this paper's approach"). A conversational
+  "let's look at this" is fine, but when referring to the paper's authors it must be "they".
+- Report the authors' own words faithfully — don't put words in their mouth, and don't
+  dramatise ("they must have been thrilled" is out).
+- Prefer "why" over "what": the motivation, the choice that was on the table, why another
+  route was ruled out, where a trade-off was made — all of it **from the analysis**, not
+  invented backstory.
+- **Third person is not a licence to invent**: every number, experimental setting,
+  conclusion and motivation must come from the analysis below. Never invent failed
+  experiments or internal debates; if a guess is genuinely needed, mark it as a guess
+  ("the authors suspect", "most likely") or leave it out.
 
 【Required】
 1. Spoken language. Sentences must be sayable out loud. Short sentences. Fragments and
@@ -179,8 +183,8 @@ what it is", not "he understands it and I don't"
 4. Include at least one "hard part explained": A makes a core mechanism clear with an
    everyday analogy (this is the Feynman step).
 5. Include at least one "challenge and response": B genuinely challenges a limitation
-   from the analysis, A admits the scope and explains what it means — in author voice,
-   that is "we were well aware of this".
+   from the analysis, A admits the scope and explains what it means (may note that the
+   paper itself acknowledges it).
 6. Don't open by reading the title. Open with a line that creates curiosity. Don't end
    with a slogan — say what the paper means for us and land it naturally.
 
@@ -188,8 +192,9 @@ what it is", not "he understands it and I don't"
 - Enumeration transitions: "first / second / finally"
 - "In conclusion", "It's worth noting", "Let's dive in", "delve into", "game-changer"
 - **Inventing experiments, numbers, failed attempts or backstory that the paper does not
-  contain** (the easiest mistake to make in first person)
-- Author-voice breaks: A saying "they", "this paper", or "the authors"
+  contain** (the easiest mistake when speaking about someone else's work)
+- **Speaking as the author**: A must not say "we proposed" or "our paper" — referring to
+  the paper's authors requires "they" / "the authors"
 - Any Markdown, bracketed asides, or parenthetical translations
 - Reading formulas aloud. Turn formulas into plain language
 - Summarising every topic. Real conversation doesn't summarise
