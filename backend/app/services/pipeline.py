@@ -39,6 +39,10 @@ STAGES = {
     "analyzing": ("analyzing", 35, "正在深度解读"),
     "scripting": ("scripting", 55, "正在生成播客脚本"),
     "synthesizing": ("synthesizing", 75, "正在合成播客音频"),
+    # 视频是在音频落库之后跑的，原来**在时间线上是隐形的**：进度从 75 直接跳 100，
+    # 那几十秒（实测 55~67 秒）没有任何文案说明。状态沿用 `synthesizing`，
+    # 前端的状态处理不用改，只是进度多一档 88。
+    "composing": ("synthesizing", 88, "正在合成视频"),
     "completed": ("completed", 100, "已完成"),
 }
 
@@ -212,6 +216,9 @@ class Pipeline:
         record = self.db.get_episode(episode_id) or {}
         if illustration_png is None:
             illustration_png = (record.get("illustration") or {}).get("png_path")
+
+        # 让「正在合成视频」在进度条上真的出现（否则用户看到的是 75% 停几十秒后跳 100%）
+        self._set_stage(episode_id, "composing")
 
         try:
             result = await asyncio.to_thread(

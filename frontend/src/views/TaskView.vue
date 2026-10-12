@@ -189,7 +189,7 @@ watch(id, () => {
       <section class="section">
         <div class="section__head">
           <h2 class="section__title">阶段时间线</h2>
-          <span class="section__hint">解析 → 深度解读 → 播客脚本 → 音频合成</span>
+          <span class="section__hint">解析 → 深度解读 → 播客脚本 → 音频合成 → 视频合成</span>
         </div>
         <div class="card card--pad">
           <StageTimeline
