@@ -312,7 +312,15 @@ def assign_diagram_shots(
         language=language,
         timings=timings,
     )
-    raw = llm._chat_json(messages, what="图解镜头草案", retries=1) or {}
+    # ⚠️ 签名要和 `LLMClient._chat_json(messages, *, max_tokens, temperature)` 对齐：
+    # 我第一版按别的调用点写了 `what=`/`retries=`，结果**每次生成都在视频合成这一步炸**
+    # （被 `_compose_video_safely` 兜住 → 用户看到的是「音频有、视频没有」）。
+    # 而且模型调用失败**不该拖垮出片**：图解只是锦上添花，问不到就当没有。
+    try:
+        raw = llm._chat_json(messages, max_tokens=1600, temperature=0.3) or {}
+    except Exception:  # noqa: BLE001  —— 拿不到草案就退回原画面，别让出片失败
+        logger.warning("图解镜头草案生成失败，本集不画图解（其余画面不受影响）", exc_info=True)
+        return {}
     shots = normalize_diagram_shots(
         raw, max_shots=max_shots, valid_images=[item[0] for item in (available_images or [])]
     )

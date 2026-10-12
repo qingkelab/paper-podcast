@@ -202,8 +202,14 @@ class _FakeLLM:
         self.payload = payload
         self.calls: list[tuple] = []
 
-    def _chat_json(self, messages, what="", retries=0):
-        self.calls.append((what, messages))
+    def _chat_json(self, messages, *, max_tokens: int, temperature: float = 0.6):
+        """签名**必须**和 `LLMClient._chat_json` 一致。
+
+        踩过的坑：假模型写成 `what=`/`retries=` 时测试全绿，而线上每次生成都在
+        视频合成这一步 `TypeError` —— 用户看到的是「音频有、视频没有」。
+        假件不照真实签名写，测的就只是它自己。
+        """
+        self.calls.append((max_tokens, messages))
         return self.payload
 
 
