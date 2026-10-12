@@ -53,6 +53,7 @@ from .video_core import DiagramItem, DiagramMetric, DiagramNode, DiagramShot
 __all__ = [
     "DiagramError",
     "shot_state_count",
+    "state_moments",
     "diagram_svg",
     "render_diagram_state",
     "render_diagram_state_html",
@@ -254,6 +255,63 @@ def shot_state_count(shot: DiagramShot) -> int:
     if shot.kind == "compare":
         return max(1, min(len(shot.nodes), 3))
     return 1
+
+
+def state_moments(
+    text: str,
+    duration: float,
+    state_count: int,
+    *,
+    pauses: Sequence[Any] | None = None,
+    start: float = 0.0,
+    tail_hold: float = 1.2,
+) -> list[float]:
+    """状态出现的时刻（相对本段起点，秒）：**跟着讲稿的句子走**，不是均匀铺。
+
+    为什么不用均匀铺：状态是「这句话讲到了这里」。均匀铺会出现「人还在讲第一个节点，
+    图上已经长到第三个」—— 参考片里最要紧的节奏感恰恰是这句话与画面的对应。
+    句子边界用 `beat_windows_aligned`（与字幕带、逐句卡同一组窗口，含真实停顿），
+    所以状态和字幕天然同步。
+
+    两条兜底：
+    - 句子数不够分（比如一句话要长出 3 个节点）→ 退回均匀铺（总比全挤在开头好）；
+    - 最后一个状态至少留 `tail_hold` 秒再结束（刚长出来镜头就切走等于白画）。
+    """
+    count = max(1, int(state_count))
+    moments: list[float] = []
+    if count > 1:
+        from .video_render import beat_windows_aligned  # 同层循环：函数内导入
+
+        sentences = _sentences(text) or [text or ""]
+        windows = beat_windows_aligned(sentences, duration, start=start, pauses=pauses)
+        starts = [max(0.0, win[0] - start) for win in windows]
+        if len(starts) >= count:
+            moments = starts[:count]
+            # 末状态留在最后一句的起点，但不能贴到片尾：至少留 `tail_hold`
+            moments[-1] = min(moments[-1], max(0.0, duration - tail_hold))
+            # 时间必须递增（末状态被 clamp 到前面时，就退回均匀铺）
+            if any(b <= a for a, b in zip(moments, moments[1:])):
+                moments = []
+        if not moments:
+            moments = [duration * index / count for index in range(count)]
+    if not moments:
+        moments = [0.0]
+    return [round(moment, 2) for moment in moments]
+
+
+def _sentences(text: str) -> list[str]:
+    """按句号切（与字幕分句同一套规则：`split_caption_beats` 也只看句子与逗号）。"""
+    parts: list[str] = []
+    current = ""
+    for char in text or "":
+        current += char
+        if char in "。！？!?":
+            if current.strip():
+                parts.append(current.strip())
+            current = ""
+    if current.strip():
+        parts.append(current.strip())
+    return parts
 
 
 def _visible(shot: DiagramShot, state: int) -> tuple[int, int, int]:

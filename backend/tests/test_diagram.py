@@ -376,3 +376,42 @@ class TestPipelineWiring:
         assert scenes[0].diagram is not None
         assert scenes[0].diagram.metrics[0].value == 5.0
         assert llm.calls == [], "重建路径不该调用模型"
+
+
+class TestStateTiming:
+    """状态出现的时刻要**跟着讲稿的句子走**。
+
+    均匀铺会出现「人还在讲第一个节点、图上已经长到第三个」——参考片里最要紧的
+    恰恰是这句话与画面的对应。句子边界用 `beat_windows_aligned`（与字幕带同一组窗口）。
+    """
+
+    TEXT = "6 比特下状态内存压缩了 5 倍多。Qwen 从 144 兆降到 28 兆左右。总服务内存最多降 68.7%。"
+
+    def test_states_follow_the_sentences(self):
+        moments = DG.state_moments(self.TEXT, 12.0, 3)
+        assert moments[0] == 0.0
+        assert all(0.0 <= moment <= 12.0 for moment in moments)
+        assert moments == sorted(moments) and len(set(moments)) == 3
+        # 跟着句子走的话，第一句（约 1/3 时长）之后才轮到第二个状态；
+        # 均匀铺会得到 4.0 / 8.0，跟着句子会不一样
+        assert moments[1] != 4.0 or moments[2] != 8.0
+
+    def test_real_pauses_push_the_later_states_back(self):
+        """有真实停顿时，状态时刻要跟着停顿走（和字幕对齐的是同一个函数）。"""
+        from app.services.audio_track import Pause
+
+        pauses = [Pause(start=1.0, end=6.0)]
+        with_pause = DG.state_moments(self.TEXT, 12.0, 3, pauses=pauses)
+        without = DG.state_moments(self.TEXT, 12.0, 3)
+        assert with_pause != without
+
+    def test_falls_back_to_even_when_sentences_are_too_few(self):
+        # 一句话要长出 3 个状态 → 没法跟着句子走，退回均匀铺
+        assert DG.state_moments("就一句话。", 9.0, 3) == [0.0, 3.0, 6.0]
+
+    def test_last_state_does_not_stick_to_the_end(self):
+        moments = DG.state_moments(self.TEXT, 4.0, 3)
+        assert moments[-1] <= 4.0 - 1.2 + 0.01, moments
+
+    def test_single_state_needs_no_moment(self):
+        assert DG.state_moments(self.TEXT, 8.0, 1) == [0.0]

@@ -1346,10 +1346,22 @@ def _render_scene_layers(
                 if scene.diagram is not None:
                     # 图解镜头：状态 0 是「标题 + 第一个节点」，后面的状态按时间点叠上去
                     _render_diagram_card(scene, card_path, layout=layout, session=session)
-                    from .diagram import render_diagram_state_html, shot_state_count
+                    from .diagram import (
+                        render_diagram_state_html,
+                        shot_state_count,
+                        state_moments,
+                    )
 
                     states: list[tuple[Path, float]] = []
                     total = shot_state_count(scene.diagram)
+                    # 状态**跟着讲稿的句子**出现（句子边界与字幕带同一组窗口，含真实停顿）
+                    moments = state_moments(
+                        scene.text,
+                        scene.duration,
+                        total,
+                        pauses=pauses,
+                        start=scene.start,
+                    )
                     for state in range(1, total):
                         state_path = work_dir / f"diagram-{index:04d}-{state}.png"
                         render_diagram_state_html(
@@ -1359,8 +1371,7 @@ def _render_scene_layers(
                             state=state,
                             session=session,
                         )
-                        # 与样片同一条规则：状态均匀铺在本段时长里（与字幕句数解耦）
-                        states.append((state_path, scene.duration * state / total))
+                        states.append((state_path, moments[state]))
                     result.diagram_states.append(states)
                 else:
                     _render_card_layer(scene, card_path, layout=layout, session=session)
