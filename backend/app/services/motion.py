@@ -151,18 +151,24 @@ def ffmpeg_ease(
     overshoot: float,
     peak_ratio: float = SPRING_PEAK_RATIO,
     decay: float | None = None,
+    variable: str = "t",
 ) -> str:
     """给 ffmpeg 表达式用的 `p(t)`（`t` 是 ffmpeg 的时间变量，单位秒）。
 
     只展开成 `exp/cos/sin` 与常数 —— `overlay` 的 `x`/`y` 支持这些函数，
     所以「滑入用弹簧」不需要逐帧抓图，零渲染成本。
+
+    `variable` 用来换成别的时间变量：某一层「从第 N 秒才开始动」时要写
+    `variable="(t-3.5)"`（ffmpeg 的表达式里没有「相对某时刻」的概念，
+    只能把时间变量整体替进去）。
     """
     k, omega = spring_kernel(
         seconds, overshoot=overshoot, peak_ratio=peak_ratio, decay=decay
     )
+    var = variable or "t"
     return (
-        f"(1-exp(-{k:.6f}*t)*(cos({omega:.6f}*t)"
-        f"+{k / omega:.6f}*sin({omega:.6f}*t)))"
+        f"(1-exp(-{k:.6f}*{var})*(cos({omega:.6f}*{var})"
+        f"+{k / omega:.6f}*sin({omega:.6f}*{var})))"
     )
 
 

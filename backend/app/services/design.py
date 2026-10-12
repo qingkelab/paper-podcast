@@ -167,7 +167,13 @@ DIAGRAM_MAX_METRICS = 3        # 一个指标镜头最多几个数字
 DIAGRAM_MAX_TITLE_CHARS = 16   # 标题上限（与 prompt 里的「不超过 16 字」同源）
 DIAGRAM_MIN_SEGMENT_SEC = 2.5
 # 图解镜头收尾切回论文原图之后，至少留这么久让观众看一眼（太短等于闪一下）
-DIAGRAM_FALLBACK_HOLD = 1.6  # 短于这个时长的段落不提镜头（一闪而过比不画更糟）
+DIAGRAM_FALLBACK_HOLD = 1.6
+# ---- 入场动效：**淡入 + 上升**，不用单一淡入（参考做法里写死的一条）----
+# 纯淡入看起来像「图层被打开」，配上 10~14px 的上升才像「东西被放到位」。
+# 三种入场共用同一组数：字幕/图解的后续状态（续上）、强调行（滑入）。胶囊另有弹起。
+ENTRANCE_RISE_PX = 12          # 上升距离：一行字的高度量级，再大就成了「飞进来」
+ENTRANCE_SEC = 0.34            # 与字幕带淡入 0.35 同量级（它是「续上」不是「开始」）
+ENTRANCE_OVERSHOOT = 0.05      # 到位时轻微回弹，和其余弹簧同一套手感  # 短于这个时长的段落不提镜头（一闪而过比不画更糟）
 POINT_BAR = "#2f6fb5"
 POINT_TEXT = "#17416f"
 POINT_MAX_FONT = 40.0

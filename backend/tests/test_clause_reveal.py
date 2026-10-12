@@ -276,3 +276,35 @@ class TestRevealReachesTheVideo:
         before = band_ink(extract(video, 0.4, tmp_path / "s1.png"))
         after = band_ink(extract(video, 1.6, tmp_path / "s2.png"))
         assert before == after, f"短句不该有变化：{before} → {after}"
+
+
+class TestEntranceIsNotJustAFade(TestRevealReachesTheVideo):
+    """继承编码工具（`_encode` / `extract` / `band_ink` 都在那边）—— 复用的是同一套出片流程。"""
+    """入场一律是**淡入 + 上升**（参考做法里写死的一条：绝不用单一的淡入）。
+
+    纯淡入看起来像「图层被打开」，配上十几像素的上升才像「东西被放到位」。
+    这里量的是**字幕带顶边的位置**：出现后的头两帧应当偏下，落定后回到原位。
+    """
+
+    def _band_top(self, path: Path) -> int:
+        """字幕带（浅蓝底 #f4f7fa）最上面一行的 y。"""
+        import pymupdf
+
+        pix = pymupdf.Pixmap(str(path))
+        n, width, height, data = pix.n, pix.width, pix.height, pix.samples
+        for y in range(SUBTITLE_TOP - 40, height):
+            for x in range(20, width - 20, 4):
+                i = (y * width + x) * n
+                if (data[i] + data[i + 1] + data[i + 2]) // 3 < 250:
+                    return y
+        return height
+
+    def test_the_band_rises_into_place(self, tmp_path):
+        """准备一段两小句的话：第二张带子出现时要**从下往上**落到位。"""
+        text = "它把权重压到 4 比特，精度只掉 0.3%，显存却只要三分之一。"
+        video, plan = self._encode(tmp_path, text, 8.0)
+        assert plan, "这句话应当有显露计划"
+        moment = plan[0][1]
+        early = self._band_top(extract(video, moment + 0.06, tmp_path / "rise1.png"))
+        settled = self._band_top(extract(video, moment + 0.6, tmp_path / "rise2.png"))
+        assert early >= settled, f"字幕带没有上升：早期 {early} / 落定 {settled}"

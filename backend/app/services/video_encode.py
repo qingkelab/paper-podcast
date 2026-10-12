@@ -29,6 +29,9 @@ from .motion import ffmpeg_ease as spring_ease
 from .design import (
     BEAT_CARD_FADE,
     DIAGRAM_FADE_SEC,
+    ENTRANCE_OVERSHOOT,
+    ENTRANCE_RISE_PX,
+    ENTRANCE_SEC,
     BEAT_IMAGE_MIN_SEC,
     CAPTION_FADE_SEC,
     CHIP_POP_DELAY,
@@ -419,8 +422,13 @@ def encode_video(
                     f"[{state_in}:v]format=rgba,fade=t=in:st={at:.3f}:"
                     f"d={DIAGRAM_FADE_SEC}:alpha=1[dg{node}]"
                 )
+                # 同一条规矩：图解的下一个状态也是「淡入 + 上升」
+                rise = spring_ease(
+                    ENTRANCE_SEC, overshoot=ENTRANCE_OVERSHOOT, variable=f"(t-{at:.3f})"
+                )
                 graph.append(
-                    f"[{last}][dg{node}]overlay=x={layout.image_box_left}:y={layout.image_top}:"
+                    f"[{last}][dg{node}]overlay=x={layout.image_box_left}:"
+                    f"y='{layout.image_top}+{ENTRANCE_RISE_PX}*(1-{rise})':"
                     f"enable='gte(t,{at:.3f})'[v{node}]"
                 )
                 last = f"v{node}"
@@ -536,8 +544,15 @@ def encode_video(
                         f"[{reveal_in}:v]format=rgba,fade=t=in:st={at:.3f}:"
                         f"d={CLAUSE_FADE_SEC}:alpha=1[rv{node}]"
                     )
+                    # **淡入 + 上升**（参考做法：绝不用单一的淡入）。
+                    # 上升用弹簧表达式：`variable="(t-{at})"` 把它变成「相对这一刻」，
+                    # 到位时轻微回弹 —— 与强调行滑入同一套手感，零渲染成本。
+                    rise = spring_ease(
+                        ENTRANCE_SEC, overshoot=ENTRANCE_OVERSHOOT, variable=f"(t-{at:.3f})"
+                    )
                     graph.append(
-                        f"[{last}][rv{node}]overlay=x=0:y={layout.subtitle_top}:"
+                        f"[{last}][rv{node}]overlay=x=0:"
+                        f"y='{layout.subtitle_top}+{ENTRANCE_RISE_PX}*(1-{rise})':"
                         f"enable='gte(t,{at:.3f})'[v{node}]"
                     )
                     last = f"v{node}"
