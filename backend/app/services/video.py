@@ -128,7 +128,9 @@ from .prompts.assign import (  # noqa: F401
     ASSIGN_SYSTEM,
     ASSIGN_WHY_MAX_CHARS,
     _assignment_notes,
+    _beat_offsets,
     _beat_notes_by_segment,
+    _flat_sentence_items,
     _normalize_per_beat,
     _normalize_per_segment,
     build_assign_messages,
@@ -186,8 +188,10 @@ def build_scenes(
     focuses: list[dict[str, Any] | None] | None = None,
     whys: list[str] | None = None,
     beats_for_segment: list[list[str]] | None = None,
+    beat_focuses: list[list[dict[str, Any] | None]] | None = None,
     headline: str = "",
     cover_caption: str = "",
+    language: str = "zh",
 ) -> list[Scene]:
     """把脚本、时间戳和逐段配图拼成画面时间轴。
 
@@ -244,6 +248,7 @@ def build_scenes(
                 end=head_end,
                 image=head_asset.path,
                 kind=head_asset.kind,
+                language=language,
                 caption=head_asset.caption,
             )
         )
@@ -253,7 +258,7 @@ def build_scenes(
     # 逐句的选图结果先挂着（`body_beat_picks`），等整条时间轴定型之后再落成
     # `Scene.beats` —— 「封面段」与「这一句太短」这两条守卫要看的是**最终**的
     # headline 与时长（见函数末尾）。
-    body_beat_picks: list[tuple[Scene, list[str]]] = []
+    body_beat_picks: list[tuple[Scene, list[str], list[dict[str, Any] | None]]] = []
     for index, timing in enumerate(ordered):
         segment = segments[index] if index < len(segments) else {}
         asset = asset_for(index)
@@ -262,6 +267,7 @@ def build_scenes(
             end=float(timing.end),
             image=asset.path,
             kind=asset.kind,
+            language=language,
             speaker=str(segment.get("speaker") or getattr(timing, "speaker", "") or "A"),
             text=str(segment.get("text") or ""),
             caption=asset.caption,
@@ -272,7 +278,13 @@ def build_scenes(
         )
         scenes.append(scene)
         if beats_for_segment is not None and index < len(beats_for_segment):
-            body_beat_picks.append((scene, list(beats_for_segment[index])))
+            picks = list(beats_for_segment[index])
+            focus_picks = (
+                list(beat_focuses[index])
+                if beat_focuses is not None and index < len(beat_focuses)
+                else [None] * len(picks)
+            )
+            body_beat_picks.append((scene, picks, focus_picks))
 
     # ---- 封面帧：第一帧必须是论文首页，而且要有大字标题 ----
     #
@@ -320,6 +332,7 @@ def build_scenes(
                 end=audio_duration,
                 image=tail_image,
                 kind=tail_kind,
+                language=language,
                 caption=tail_caption,
                 text="以上就是这篇论文的解读，感谢收听。",
                 brand="outro",  # 收尾一律用品牌卡，不要用普通配图页结尾
@@ -337,13 +350,14 @@ def build_scenes(
     # （见上面「封面帧」那一段），「这一句太短」得按补齐空隙之后的时长估。
     # 没有逐句选图（`beats_for_segment is None`：老数据复用、启发式兜底）时一句都不动，
     # `beats` 保持空列表 = 整段一张图，老视频的行为一点不变。
-    for scene, picks in body_beat_picks:
+    for scene, picks, focus_picks in body_beat_picks:
         scene.beats = build_scene_beats(
             text=scene.text,
             picks=picks,
             duration=scene.duration,
             headline=scene.headline,
             brand=scene.brand,
+            focuses=focus_picks,
         )
 
     return scenes
@@ -524,6 +538,7 @@ def build_scene_beats(
     duration: float,
     headline: str = "",
     brand: str = "",
+    focuses: list[dict[str, Any] | None] | None = None,
 ) -> list[Beat]:
     """把**逐句**选图落成 `Scene.beats`，三条守卫在这里一次性施加。
 
@@ -569,8 +584,130 @@ def build_scene_beats(
             span = windows[index][1] - windows[index][0]
             if changed and span >= BEAT_IMAGE_MIN_SEC:
                 image = picks[index]
-        beats.append(Beat(text=beat_text, image=image))
+        focus = focuses[index] if focuses and index < len(focuses) else None
+        beats.append(Beat(text=beat_text, image=image, focus=focus))
     return beats
+
+
+def _normalize_beat_focuses(
+    raw: Any,
+    *,
+    beat_counts: list[int],
+    image_picks: list[list[str]],
+    panel_catalog: dict[str, FigurePanels],
+) -> list[list[dict[str, Any] | None]]:
+    """Map model-selected panel letters to measured, per-sentence focus boxes."""
+    result = [[None for _ in range(max(int(count), 0))] for count in beat_counts]
+    items = _flat_sentence_items(raw, beat_counts=beat_counts)
+    if not items:
+        return result
+    offsets = _beat_offsets(beat_counts)
+    for sentence, item in items:
+        segment_index = next(
+            (i for i, start in enumerate(offsets)
+             if start <= sentence < start + max(int(beat_counts[i]), 0)),
+            None,
+        )
+        if segment_index is None:
+            continue
+        beat_index = sentence - offsets[segment_index]
+        picks = image_picks[segment_index] if segment_index < len(image_picks) else []
+        image_id = picks[beat_index] if beat_index < len(picks) else ""
+        catalog = panel_catalog.get(image_id)
+        letter = str(item.get("panel") or "").strip().lower()
+        if catalog is not None and letter:
+            result[segment_index][beat_index] = catalog.focus_for(letter)
+    return result
+
+
+def _visual_quality_summary(
+    *,
+    segments: list[dict[str, Any]],
+    timings: list[Any],
+    image_picks: list[str],
+    beat_picks: list[list[str]] | None,
+    beat_focuses: list[list[dict[str, Any] | None]] | None,
+    panel_focuses: list[dict[str, Any] | None],
+    assignment_whys: list[str],
+    assets: dict[str, ImageAsset],
+    fallback_id: str,
+) -> dict[str, Any]:
+    """Summarize visual evidence coverage and surface weak assignments for review."""
+    total_seconds = 0.0
+    role_seconds: dict[str, float] = {}
+    focused_seconds = 0.0
+    fallback_seconds = 0.0
+    review_samples: list[dict[str, Any]] = []
+
+    for index, timing in enumerate(timings):
+        if index >= len(segments):
+            break
+        duration = max(float(timing.end) - float(timing.start), 0.0)
+        if duration <= 0:
+            continue
+        total_seconds += duration
+        picks = beat_picks[index] if beat_picks and index < len(beat_picks) else []
+        texts = split_caption_beats(str(segments[index].get("text") or ""))
+        weights = [len(text) for text in texts]
+        weight_total = sum(weights) or len(picks) or 1
+        if picks and len(picks) == len(weights):
+            rows = list(zip(picks, weights))
+        else:
+            image_id = image_picks[index] if index < len(image_picks) else ""
+            rows = [(image_id, weight_total)]
+
+        local_focuses = beat_focuses[index] if beat_focuses and index < len(beat_focuses) else []
+        has_segment_focus = index < len(panel_focuses) and bool(panel_focuses[index])
+        focus_weight = 0
+        for beat_index, (asset_id, weight) in enumerate(rows):
+            asset = assets.get(asset_id)
+            kind = asset.kind if asset else "unknown"
+            role = {
+                "figure": "paper_figure",
+                "table": "paper_table",
+                "illustration": "generated_explanation",
+                "cover": "paper_cover",
+            }.get(kind, "fallback")
+            seconds = duration * weight / weight_total
+            role_seconds[role] = role_seconds.get(role, 0.0) + seconds
+            if asset_id == fallback_id:
+                fallback_seconds += seconds
+            if beat_index < len(local_focuses) and local_focuses[beat_index]:
+                focus_weight += weight
+            if asset_id == fallback_id or kind == "unknown":
+                review_samples.append({
+                    "start_sec": round(float(timing.start), 2),
+                    "text": str(segments[index].get("text") or "")[:100],
+                    "visual_role": role,
+                    "why": assignment_whys[index] if index < len(assignment_whys) else "",
+                })
+        if any(local_focuses):
+            focused_seconds += duration * focus_weight / weight_total
+        elif has_segment_focus:
+            focused_seconds += duration
+        if index < len(assignment_whys) and not assignment_whys[index]:
+            review_samples.append({
+                "start_sec": round(float(timing.start), 2),
+                "text": str(segments[index].get("text") or "")[:100],
+                "visual_role": "missing_assignment_rationale",
+                "why": "",
+            })
+
+    ratio = lambda value: round(value / total_seconds, 3) if total_seconds else 0.0
+    return {
+        "basis": "duration_weighted_visual_plan",
+        "speaking_seconds": round(total_seconds, 2),
+        "role_seconds": {key: round(value, 2) for key, value in sorted(role_seconds.items())},
+        "role_ratios": {key: ratio(value) for key, value in sorted(role_seconds.items())},
+        "subfigure_focus_ratio": ratio(focused_seconds),
+        "fallback_ratio": ratio(fallback_seconds),
+        "assignment_rationale_ratio": round(
+            sum(bool(str(why).strip()) for why in assignment_whys[:len(segments)])
+            / max(len(segments), 1),
+            3,
+        ),
+        "review_samples": review_samples[:12],
+    }
 
 
 def _beat_lines(text: str) -> int:
@@ -774,6 +911,18 @@ def _render_chrome_layer(
     return path
 
 
+def _render_diagram_card(
+    scene: Scene, path: Path, *, layout: Layout, session: Any, state: int = 0
+) -> Path:
+    """图解镜头的「图片卡」= 图解的一个状态（有 Chrome 走 Chrome，没有就走 SVG）。"""
+    from .diagram import render_diagram_state_html
+
+    assert scene.diagram is not None
+    return render_diagram_state_html(
+        scene.diagram, path, layout=layout, state=state, session=session
+    )
+
+
 def _render_card_layer(scene: Scene, path: Path, *, layout: Layout, session: Any) -> Path:
     """图片卡层：图片 + 贴着它的细边框（普通页）或毛玻璃封面（片头）。"""
     if session is None:
@@ -962,6 +1111,7 @@ class RenderedLayers:
     # 逐句胶囊的**帧序列**（弹簧「弹一下」）。有序列时 `beat_chips` 那一格是 None：
     # 静态图和帧序列不能同时叠（序列播完会被静态图顶掉，看起来像跳了一下）。
     beat_chip_frames: list[list[list[Path]]] = field(default_factory=list)
+    beat_focuses: list[list[Path | None]] = field(default_factory=list)
     endcard_count: int = 0
     beat_count: int = 0
     chip_count: int = 0
@@ -993,7 +1143,7 @@ def _render_scene_layers(
     result = RenderedLayers(
         slides=[], caption_bands=[], band_paths=[], point_rows=[], point_paths=[],
         cards=[], card_paths=[], focus_rows=[], focus_paths=[], focus_frames=[],
-        image_ids=[],
+        image_ids=[], beat_focuses=[],
     )
 
     with render_session(work_dir) as session:
@@ -1020,6 +1170,28 @@ def _render_scene_layers(
             result.beat_cards.append(list(beat_layers.cards))
             result.beat_chips.append(list(beat_layers.chips))
             result.beat_chip_frames.append([list(row) for row in beat_layers.chip_frames])
+            beat_focus_paths: list[Path | None] = []
+            for beat_index, focus in enumerate(beat_layers.focus_specs):
+                if not focus:
+                    beat_focus_paths.append(None)
+                    continue
+                source = beat_layers.focus_sources[beat_index]
+                if source is None:
+                    beat_focus_paths.append(None)
+                    continue
+                source_image, source_kind = source
+                focus_scene = replace(
+                    scene,
+                    image=source_image,
+                    kind=source_kind,
+                )
+                focus_path = work_dir / f"beat-focus-{index:04d}-{beat_index}.png"
+                _render_focus_layer(
+                    focus_scene, focus_path, focus=focus, layout=layout, session=session
+                )
+                beat_focus_paths.append(focus_path)
+                result.focus_paths.append(focus_path)
+            result.beat_focuses.append(beat_focus_paths)
             result.chip_count += sum(1 for chip in beat_layers.chips if chip is not None)
             result.chip_count += sum(
                 1 for row in beat_layers.chip_frames if row
@@ -1043,7 +1215,11 @@ def _render_scene_layers(
                     session=session,
                 )
                 card_path = work_dir / f"card-{index:04d}.png"
-                _render_card_layer(scene, card_path, layout=layout, session=session)
+                if scene.diagram is not None:
+                    # 图解镜头：状态 0 是「标题 + 第一个节点」，后面的状态按句叠上去
+                    _render_diagram_card(scene, card_path, layout=layout, session=session)
+                else:
+                    _render_card_layer(scene, card_path, layout=layout, session=session)
                 result.card_paths.append(card_path)
                 if len(beats) > 1:
                     # 小句时间表和编码侧用的是**同一个** `beat_windows_aligned`
@@ -1117,6 +1293,7 @@ def _render_scene_layers(
             # 它们有自己的动效路线，两套叠在一起反而乱。
             wants_focus = (
                 scene.focus
+                and not any(beat_layers.focus_specs)
                 and scene.brand != "outro"
                 and card_path is not None
                 and scene.kind in ("figure", "table", "cover")
@@ -1205,6 +1382,7 @@ def compose_video(
 
     default_id = default_asset_id(pool)
     figure_ids = [i for i in pool if i not in ("cover", "illustration")]
+    panel_catalog: dict[str, FigurePanels] = {}
 
     # 复用模式：把上次用到的素材（含现场生成的主题图）补回池子里
     if preset_scenes:
@@ -1237,6 +1415,7 @@ def compose_video(
     # **None 表示没有逐句数据**（老数据复用 / 启发式不猜）。这时 `build_scenes` 一句都不切，
     # `Scene.beats` 保持空列表 = 整段一张图（老行为）。
     beat_picks: list[list[str]] | None = None
+    beat_focuses: list[list[dict[str, Any] | None]] | None = None
     # 逐段「为什么配这张图」（模型写的，或从上次合成里复用）。只入库、不渲染。
     assignment_whys: list[str] = [""] * len(segments)
     strategy = "heuristic"
@@ -1271,10 +1450,12 @@ def compose_video(
         # **老数据没有 beats** → 保持 None，`build_scenes` 走整段一张图那条路，一点不变。
         if any(isinstance(sc, dict) and sc.get("beats") for sc in preset_scenes):
             reused_beats: list[list[str]] = []
+            reused_focuses: list[list[dict[str, Any] | None]] = []
             dropped = 0
             for index in range(len(segments)):
                 raw_beats = (stored.get(index) or {}).get("beats")
                 picks: list[str] = []
+                focus_picks: list[dict[str, Any] | None] = []
                 if isinstance(raw_beats, list) and len(raw_beats) == beat_counts[index]:
                     for beat_index, beat in enumerate(raw_beats):
                         if not isinstance(beat, dict):
@@ -1290,10 +1471,13 @@ def compose_video(
                         picks.append(
                             asset_id if asset_id in pool and pool[asset_id].exists else ""
                         )
+                        focus_picks.append(normalize_focus(beat.get("focus")))
                 elif beat_counts[index]:
                     dropped += 1
                 reused_beats.append(picks or [""] * beat_counts[index])
+                reused_focuses.append(focus_picks or [None] * beat_counts[index])
             beat_picks = reused_beats
+            beat_focuses = reused_focuses
             reused_switches = sum(1 for picks in reused_beats for pick in picks if pick)
             logger.info(
                 "逐句画面：复用上次的 %d 处换图（%d 段）", reused_switches, len(reused_beats)
@@ -1302,14 +1486,23 @@ def compose_video(
                 logger.info("其中有 %d 段的逐句分配已经对不上当前稿子，退回整段一张图", dropped)
 
     elif llm is not None and not getattr(llm, "mock", True):
+        panel_catalog = build_panel_catalog(figures, pool)
         assets = [
             {"id": asset.id, "caption": asset.caption}
             for asset in pool.values()
         ]
         total_beats = sum(beat_counts)
+        panel_options = {
+            asset_id: catalog.options() for asset_id, catalog in panel_catalog.items()
+        }
         try:
             data = llm._chat_json(
-                build_assign_messages(segments, assets, beats_per_segment=beat_texts),
+                build_assign_messages(
+                    segments,
+                    assets,
+                    beats_per_segment=beat_texts,
+                    panel_options=panel_options,
+                ),
                 # 单位是**句**（以前是段）：每句一项，每项除了 id 还多一句 why
                 # （中文 20 字 ≈ 25 token），所以预算按**句数**给 110/句 ——
                 # 卡着 60 会让长稿的尾部整段缺项，而缺项的表现是「后半程画面回到中性图」，
@@ -1325,6 +1518,12 @@ def compose_video(
             )
             if candidate_beats:
                 beat_picks = candidate_beats
+                beat_focuses = _normalize_beat_focuses(
+                    data.get("assignments"),
+                    beat_counts=beat_counts,
+                    image_picks=candidate_beats,
+                    panel_catalog=panel_catalog,
+                )
                 # `scene.image` 仍然是这一段**第一句**选到的那张：老逻辑
                 # （video.scenes[i].image）、复用/重建那条链、TestPresetReuse 全都依赖它，
                 # 逐句的差别只落在 `Scene.beats` 上。
@@ -1373,6 +1572,7 @@ def compose_video(
         )
         # 逐句兜底：**沿用本段那一张**，不在本地猜哪句该换图（那是编，见 heuristic_per_beat）。
         beat_picks = heuristic_per_beat(image_for_segment, beat_counts)
+        beat_focuses = [[None] * count for count in beat_counts]
         logger.info("逐句配图使用均匀分布（退化方案，不保证图文相符，逐句沿用本段那张）")
 
     # ---- 现场生成的配图：单位仍然是**段** ----
@@ -1499,7 +1699,8 @@ def compose_video(
         and not getattr(llm, "mock", True)
     ):
         # 这几张图有子图清单可给模型挑（几何已经由像素量好了，见 build_panel_catalog）
-        panel_catalog = build_panel_catalog(figures, pool)
+        if not panel_catalog:
+            panel_catalog = build_panel_catalog(figures, pool)
         panel_options = [
             panel_catalog[asset_id].options() if asset_id in panel_catalog else []
             for asset_id in image_for_segment
@@ -1613,8 +1814,10 @@ def compose_video(
         whys=assignment_whys,
         # 逐句选图 → `Scene.beats`（三条守卫在 build_scene_beats 里施加）
         beats_for_segment=beat_picks,
+        beat_focuses=beat_focuses,
         headline=cover_headline,
         cover_caption=title,
+        language=language,
     )
 
     layout = layout_for(orientation)
@@ -1663,6 +1866,7 @@ def compose_video(
         beat_cards=layers.beat_cards,
         beat_chips=layers.beat_chips,
         beat_chip_frames=layers.beat_chip_frames,
+        beat_focus_overlays=layers.beat_focuses,
         layout=layout,
     )
     result.assignment = strategy
@@ -1684,14 +1888,38 @@ def compose_video(
             # 重新合成时复用（规矩 3：重新合成不许调模型），画面才不会因为重做而全变。
             # 存的是 build_scene_beats 施加过守卫之后的结果（真正的画面安排）。
             "beats": [
-                {"text": beat.text, "image": beat.image}
-                for beat in (
-                    body_scenes[index].beats if index < len(body_scenes) else []
-                )
+                {
+                    "text": beat.text,
+                    "image": beat.image,
+                    **({"focus": beat.focus} if beat.focus is not None else {}),
+                }
+                for beat in (body_scenes[index].beats if index < len(body_scenes) else [])
             ],
         }
         for index in range(min(len(segments), len(image_for_segment)))
     ]
+    visual_summary = _visual_quality_summary(
+        segments=segments,
+        timings=timings,
+        image_picks=image_for_segment,
+        beat_picks=beat_picks,
+        beat_focuses=beat_focuses,
+        panel_focuses=focuses,
+        assignment_whys=assignment_whys,
+        assets=pool,
+        fallback_id=default_id,
+    )
+    result.qa["visual_plan"] = visual_summary
+    logger.info(
+        "画面质量概览：论文图表 %.0f%%，生成示意 %.0f%%，子图聚焦 %.0f%%，配图理由 %.0f%%",
+        100 * sum(
+            visual_summary["role_ratios"].get(role, 0.0)
+            for role in ("paper_figure", "paper_table")
+        ),
+        100 * visual_summary["role_ratios"].get("generated_explanation", 0.0),
+        100 * visual_summary["subfigure_focus_ratio"],
+        100 * visual_summary["assignment_rationale_ratio"],
+    )
     result.assets = {asset_id: str(asset.path) for asset_id, asset in pool.items()}
     result.asset_versions = {
         asset_id: asset_version(asset.path) for asset_id, asset in pool.items()

@@ -146,6 +146,19 @@ POINT_BG = "#eef4fb"
 # 「数字被点出来」全靠数字变蓝撑着。现在 #cfe0f8 差 **24.8**，是「浅蓝高亮」而不是「几乎同色」。
 # 再往深（#c3d8f6 = 33.3）在手机上会显得像一块色卡，所以停在这里。
 NUMBER_BG = "#cfe0f8"
+
+# ---- 动态图解镜头（`services/diagram.py`）----
+# 一套颜色、一套间距，所有镜头共用 —— 参考片里的图解之所以像「一个产品」，
+# 靠的就是这个：换镜头只换内容，不换视觉语言。
+DIAGRAM_TEXT = "#16233a"          # 标题/节点名（正文页同一个深色）
+DIAGRAM_MUTED = "#5b6b82"         # 说明文字
+DIAGRAM_ACCENT = "#17416f"        # 强调色（与字幕数字、要点行同一个蓝）
+DIAGRAM_CARD_FILL = "#f7fafd"     # 节点卡片底（比字幕带更浅，贴在白底上刚好分得开）
+DIAGRAM_CARD_STROKE = "#d8e2ef"   # 卡片描边
+DIAGRAM_GRID = "#eef2f7"          # 条形底（未填充部分）
+# 图解状态之间的一次过渡时长。比字幕带淡入（0.35）短、比胶囊弹起（0.22）长：
+# 它是「同一张图长出新的一角」，慢一点才像在长。
+DIAGRAM_FADE_SEC = 0.3
 POINT_BAR = "#2f6fb5"
 POINT_TEXT = "#17416f"
 POINT_MAX_FONT = 40.0

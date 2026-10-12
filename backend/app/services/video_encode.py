@@ -28,6 +28,7 @@ from .motion import ffmpeg_ease as spring_ease
 # 版式/配色/节奏令牌的**老家**在 design.py（video.py 只是把它们再导出给老调用点）
 from .design import (
     BEAT_CARD_FADE,
+    DIAGRAM_FADE_SEC,
     BEAT_IMAGE_MIN_SEC,
     CAPTION_FADE_SEC,
     CHIP_POP_DELAY,
@@ -143,6 +144,11 @@ def encode_video(
     beat_cards: list[list[Path | None]] | None = None,
     beat_chips: list[list[Path | None]] | None = None,
     beat_chip_frames: list[list[list[Path]]] | None = None,
+    # **动态图解镜头的状态**：第 i 段第 k 个状态（相对本段起点的秒数 + 图层路径）。
+    # 与「逐句图片卡」分开，是因为图解的状态数由内容决定（几个节点就几步），
+    # 与字幕的句数无关 —— 硬套逐句卡会让「4 个节点」被压成「最多 2 句」。
+    diagram_states: list[list[tuple[Path, float]]] | None = None,
+    beat_focus_overlays: list[list[Path | None]] | None = None,
     waveform: bool = True,
     layout: Layout = PORTRAIT,
 ) -> VideoResult:
@@ -207,6 +213,8 @@ def encode_video(
     chip_rows = beat_chips or [[] for _ in scenes]
     # 弹簧版胶囊：**帧序列**（Tier B）。与静态图互斥（同一句只会给其中一种）。
     chip_frame_rows = beat_chip_frames or [[] for _ in scenes]
+    diagram_rows = diagram_states or [[] for _ in scenes]
+    beat_focus_rows = beat_focus_overlays or [[] for _ in scenes]
     plan = transitions or [Transition() for _ in scenes]
 
     # 每段时长量化成整帧，避免 duration 落在帧边界之外被额外舍入
@@ -380,6 +388,42 @@ def encode_video(
                     )
                     last = f"v{node}"
                     showing = signature
+
+            # 每句可有自己的、由论文图注确认的子图聚焦框。按句子的实际窗口显示，
+            # 不依赖换图；无效或缺失的子图映射不会产生图层。
+            beat_focus_row = beat_focus_rows[index] if index < len(beat_focus_rows) else []
+            for beat_index, focus_path in enumerate(beat_focus_row):
+                if focus_path is None or beat_index >= len(windows):
+                    continue
+                beat_start, beat_end = windows[beat_index]
+                focus_in = add_image(focus_path)
+                node += 1
+                graph.append(f"[{focus_in}:v]format=rgba[bf{node}]")
+                graph.append(
+                    f"[{last}][bf{node}]overlay={layout.image_box_left}:{layout.image_top}:"
+                    f"enable='between(t,{beat_start:.3f},{beat_end:.3f})'[v{node}]"
+                )
+                last = f"v{node}"
+
+            # ---- 动态图解镜头的后续状态：节点一个个出现 / 连线一段段画 / 数字递增 ----
+            #
+            # 每一张都是**整幅图片卡**的同一个位置（与图片卡同尺寸），按时间点叠上去。
+            # 用 `enable='gte(t,…)'` + 一次淡入：状态之间只多一件事（多一个节点/一段连线/
+            # 一个数字），所以看起来是「图在长」而不是「画面在切」。
+            state_row = diagram_rows[index] if index < len(diagram_rows) else []
+            for state_index, (state_path, moment) in enumerate(state_row):
+                state_in = add_image(state_path)
+                node += 1
+                at = max(0.0, float(moment))
+                graph.append(
+                    f"[{state_in}:v]format=rgba,fade=t=in:st={at:.3f}:"
+                    f"d={DIAGRAM_FADE_SEC}:alpha=1[dg{node}]"
+                )
+                graph.append(
+                    f"[{last}][dg{node}]overlay=x={layout.image_box_left}:y={layout.image_top}:"
+                    f"enable='gte(t,{at:.3f})'[v{node}]"
+                )
+                last = f"v{node}"
 
             # ---- 图内聚光灯：讲到哪一块就把那一块框出来，其余压暗 ----
             #

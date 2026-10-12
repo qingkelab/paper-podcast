@@ -51,7 +51,15 @@ cd frontend && pnpm test:units
   把注册入口也藏起来的话，用户点「新建专辑」会拿到 401 却无处可去，是条死路。
 - **免登录白名单只有这几个**：`/api/health`（前端要靠它判该不该跳登录页）、
   `/api/options`（音色目录，首页登录前也要能显示）、`/api/auth/{me,login,register,logout}`、
-  `/api/share/*`、`/api/showcase`。往这个名单里加东西前先问一句「这真的可以公开吗」。
+  `/api/share/*`、`/api/showcase`、`/api/library`（**公开库列表**，`/library` 这个页面
+  访客也能看）。往这个名单里加东西前先问一句「这真的可以公开吗」。
+
+  **`/api/library` 只给公开的那一类**：收录条件唯一来源是 `db._PUBLIC_WHERE`
+  （`visibility='public'` 且 `share_token IS NOT NULL` 且 `status='completed'`），
+  返回的是白名单结构 `PublicEpisodeItem` —— **不含内部 id、user_id、options、
+  `source_ref`（那可能是磁盘绝对路径）、raw_text**。它和「我的库」`/api/episodes`
+  是两条路：后者按 `user_id` 过滤、还能按专辑筛，公开库一个都不带 ——
+  混成一个函数之后，任何一次「顺手加个条件」都可能把别人的私有单集漏出去。
 - **密钥只在后端**（`.env`，已被 gitignore）。前端任何地方不得出现
   `DEEPSEEK_API_KEY` / `ARK_API_KEY` / `DOUBAO_*`。
 - **Prompt 改动要跑测试**。`backend/app/services/prompts/` 是本产品的核心资产（见下面「代码地图」），

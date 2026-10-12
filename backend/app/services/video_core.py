@@ -68,6 +68,11 @@ class Scene:
     headline: str = ""
     # "outro" 表示这是片尾品牌段 —— 视频层会把它渲染成品牌卡片而不是普通配图页
     brand: str = ""
+    # **动态图解镜头**（见 `services/diagram.py`）：非空时这一段的「图片卡」
+    # 画的是论文信息组成的图解，而不是论文原图/示意图。空 = 老行为。
+    # 每个状态各渲染一张卡，按 `beats` 的时间窗依次叠上去 —— 编码侧一行都不用改。
+    diagram: "DiagramShot | None" = None
+    language: str = "zh"
 
     @property
     def duration(self) -> float:
@@ -198,6 +203,98 @@ def plan_reveals(
     return kept
 
 
+
+
+# --------------------------------------------------------------------------
+# 动态图解镜头：**用论文里已有的信息画一张会长的图**
+# --------------------------------------------------------------------------
+#
+# 为什么数据结构在「最底层」这一层：它是「画面里有什么」的描述，
+# 与渲染方式无关（SVG 光栅化、Chrome 截图两条路都用同一份数据）。
+# 每一条内容都带 `source`：**查不到依据的条目会被 `diagram.verify_shot` 丢掉** ——
+# 这是「不许编造技术图表」的落点，屏幕上一个查不到来源的数字比少一个图严重得多。
+
+
+@dataclass(frozen=True)
+class DiagramItem:
+    """图解里的一条内容 + 它的**出处**（论文解读的字段名、或脚本原句、或图注）。"""
+
+    text: str
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class DiagramNode:
+    """流程/对比里的一个节点：一个名字 + 一句说明（都带出处）。"""
+
+    id: str
+    label: str
+    detail: str = ""
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class DiagramLink:
+    """节点之间的一条连线：状态 k 只画前 k 条 —— 观众看到的是「一条一条接上去」。"""
+
+    src: str
+    dst: str
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class DiagramMetric:
+    """一个指标：论文里明确给出的数字 + 单位 + 出处。**没有出处的数字不许进这里**。"""
+
+    label: str
+    value: float
+    unit: str = ""
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class DiagramShot:
+    """一个图解镜头。`kind` 决定它长什么样（同一套视觉语言，只换排布）：
+
+    - `hook`：开场钩子，大字 + 关键词强调；
+    - `flow`：方法流程，节点依次出现、连线按顺序画；
+    - `compare`：卡片 + 箭头，讲「谁处理什么」；
+    - `metric`：实验数字，条形 + 数字递增；
+    - `summary`：结论收束（通常再切回论文原图，见 `fallback_image`）。
+    """
+
+    kind: str
+    title: str
+    title_source: str = ""
+    subtitle: str = ""
+    subtitle_source: str = ""
+    nodes: tuple[DiagramNode, ...] = ()
+    links: tuple[DiagramLink, ...] = ()
+    metrics: tuple[DiagramMetric, ...] = ()
+    bullets: tuple[str, ...] = ()
+    bullet_sources: tuple[str, ...] = ()
+    # 这一条镜头讲不完整时**退回哪张图**（论文原图 id / 封面 / 生成图）——
+    # 「找不到依据的内容不渲染，退回现有画面流程」就是靠它。
+    fallback_image: str = ""
+
+    def items(self) -> list[DiagramItem]:
+        """这个镜头里所有「需要在证据里查得到」的内容（供核验遍历）。"""
+        out = [DiagramItem(self.title, self.title_source)]
+        if self.subtitle:
+            out.append(DiagramItem(self.subtitle, self.subtitle_source))
+        out.extend(DiagramItem(node.label, node.source) for node in self.nodes)
+        out.extend(
+            DiagramItem(node.detail, node.source) for node in self.nodes if node.detail
+        )
+        out.extend(
+            DiagramItem(f"{metric.value}{metric.unit}", metric.source)
+            for metric in self.metrics
+        )
+        out.extend(
+            DiagramItem(text, source)
+            for text, source in zip(self.bullets, self.bullet_sources or ("",) * len(self.bullets))
+        )
+        return out
 
 
 @dataclass

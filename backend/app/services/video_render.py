@@ -359,11 +359,26 @@ def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
         data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
         img_x = (card_w - img_w) / 2
         img_y = (card_h - img_h) / 2
+        roles = (
+            {"figure": "Paper figure", "table": "Paper table", "illustration": "Concept diagram"}
+            if scene.language == "en"
+            else {"figure": "论文原图", "table": "论文表格", "illustration": "概念示意"}
+        )
+        role = roles.get(scene.kind, "")
+        badge = ""
+        if role:
+            badge_w = max(112, len(role) * 30 + 32)
+            badge = (
+                f'<rect x="16" y="16" width="{badge_w}" height="48" rx="18" fill="#102a43" opacity="0.88"/>'
+                f'<text x="32" y="48" font-family="{FONT_STACK}" font-size="25" '
+                f'font-weight="600" fill="#ffffff">{html.escape(role)}</text>'
+            )
         return "\n".join(
             [
                 f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
                 f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>',
                 f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" href="{data_uri}"/>',
+                badge,
             ]
         )
 
@@ -1040,6 +1055,8 @@ class BeatLayers:
     # 「弹一下」那种逐帧抓的胶囊层（Tier B）：有帧序列时 `chips` 那一格是 None
     # （静态图和帧序列不能同时叠，否则序列播完会被静态图顶掉）。
     chip_frames: list[list[Path]] = field(default_factory=list)
+    focus_specs: list[dict[str, Any] | None] = field(default_factory=list)
+    focus_sources: list[tuple[Path, str] | None] = field(default_factory=list)
 
 
 def _beat_image_path(value: Any, assets: dict[str, Any] | None) -> Path | None:
@@ -1080,9 +1097,10 @@ def render_beat_layers(
         cards=[None] * len(beats),
         chips=[None] * len(beats),
         chip_frames=[[] for _ in beats],
+        focus_specs=[None] * len(beats),
+        focus_sources=[None] * len(beats),
     )
-    # 只有一句的段落没有「逐句」可言：字幕带那条路也是 `len(beats) > 1` 才拆
-    if len(beats) <= 1:
+    if not beats:
         return layers
 
     texts = [beat.text or "" for beat in beats]
@@ -1093,6 +1111,7 @@ def render_beat_layers(
     # 「第一帧必须是论文首页」是产品要求，所以这里是硬守卫。
     allow_cards = not (scene.headline or "").strip() and scene.brand != "outro"
     current = Path(str(scene.image))
+    current_kind = scene.kind
 
     for beat_index, beat in enumerate(beats):
         # 数字强调层：和「换不换画面」无关，每一句都可以有。
@@ -1115,11 +1134,19 @@ def render_beat_layers(
             )
 
         path = _beat_image_path(beat.image, assets)
+        asset = assets.get(beat.image) if assets and beat.image else None
+        kind = str(getattr(asset, "kind", scene.kind))
+        focus_image = path if path is not None else current
+        focus_kind = kind if path is not None else current_kind
+        if focus_kind in ("figure", "table") and isinstance(beat.focus, dict):
+            layers.focus_specs[beat_index] = beat.focus
+            layers.focus_sources[beat_index] = (focus_image, focus_kind)
         if path is None or not allow_cards:
             continue
         if beat_index == 0:
             # 第 0 句不需要单独一层：它就是这一段原本的那张卡
             current = path
+            current_kind = kind
             continue
         # 守卫②：跟上一句是同一张图 —— 图没变就别动，无意义的溶解只会让人以为卡了一下
         if path == current:
@@ -1133,10 +1160,18 @@ def render_beat_layers(
         # 逐句卡用和本段同一套排版（`render_image_card`），只有图换了 ——
         # 边框、裁切、叠放坐标因此一个字都不用改
         render_image_card(
-            replace(scene, image=path, headline=""), card_path, layout=layout
+            replace(
+                scene,
+                image=path,
+                kind=kind,
+                headline="",
+            ),
+            card_path,
+            layout=layout,
         )
         layers.cards[beat_index] = card_path
         current = path
+        current_kind = kind
 
     return layers
 

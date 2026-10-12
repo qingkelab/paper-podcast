@@ -49,6 +49,7 @@ ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排�
 你会拿到：
 - 脚本**逐句**列表（每行前面是**句号**；行里标着这句属于第几段、第几句，以及主播）
 - 可用图片列表（id 与图注）
+- 部分论文原图附有可确认的子图清单（字母与说明）
 
 请为**每一句**指定一张图。判断依据是这句话在讲什么，以及哪张图正好在讲同一件事。
 
@@ -64,6 +65,8 @@ ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排�
   （例如开场收尾）。**不要为了填满而硬塞一张不相关的原图。**
 - `cover` 是论文首页，适合开场介绍论文时用；正文讨论具体内容时不要用它。
 - 能对上论文原图的句子**优先用原图**（原图最准确）；原图对不上才填 `generate`。
+- 若这句话明确讲到某张原图中的某个子图，填该子图字母；只有清单里存在且语义明确时才填，
+  不确定就留空。不要根据图注以外的信息猜字母。信息图和现场生成图不填子图。
 - 片头那几句（画面上顶着封面标题）与片尾的品牌收尾段**不用换图**：
   全部填这一段第一句用的那张就行（系统在那几帧本来就不切画面）。
 - 图片 id 只能从给出的列表里选，不要编造。
@@ -72,7 +75,7 @@ ASSIGN_SYSTEM = """你在为「论文解读播客」的视频版做图文编排�
   一句话，不超过 20 个字，不要复述图注、不要写「内容相关」这种空话。
 
 只输出 JSON：
-{"assignments": [{"sentence": 0, "image_id": "cover", "why": "开场点出论文主题"},
+{"assignments": [{"sentence": 0, "image_id": "cover", "panel": "", "why": "开场点出论文主题"},
                  {"sentence": 1, "image_id": "f1", "why": "都在讲量化误差分布"}, ...]}
 每一句都要有一项（`sentence` 用脚本行前面的**句号**），`why` 不要遗漏。
 除了这个 JSON 不要输出任何解释。"""
@@ -83,6 +86,7 @@ def build_assign_messages(
     assets: list[dict[str, Any]],
     *,
     beats_per_segment: list[list[str]] | None = None,
+    panel_options: dict[str, list[tuple[str, str]]] | None = None,
 ) -> list[dict[str, str]]:
     """组「逐句选图」这一次调用的两条消息。
 
@@ -125,6 +129,9 @@ def build_assign_messages(
     for asset in assets:
         caption = (asset.get("caption") or asset.get("label") or "").strip()
         asset_lines.append(f"- {asset['id']}: {caption[:160]}")
+        options = (panel_options or {}).get(str(asset["id"]), [])
+        for letter, body in options:
+            asset_lines.append(f"  - 子图 {letter}: {body[:100]}")
 
     user = f"""{header}
 {chr(10).join(script_lines)}
