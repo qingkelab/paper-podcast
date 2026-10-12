@@ -3,7 +3,6 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { errorMessage, getEpisode, isApiError, retryEpisode } from '../api'
 import type { Episode } from '../api'
-import StageTimeline from '../components/StageTimeline.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { formatDuration, formatRelative } from '../utils/format'
 import { SOURCE_LABELS } from '../utils/stages'
@@ -185,19 +184,6 @@ watch(id, () => {
         </button>
         <RouterLink to="/create" class="btn btn--ghost">换一篇论文</RouterLink>
       </div>
-
-      <section class="section">
-        <div class="section__head">
-          <h2 class="section__title">阶段时间线</h2>
-          <span class="section__hint">解析 → 深度解读 → 播客脚本 → 音频合成 → 视频合成</span>
-        </div>
-        <div class="card card--pad">
-          <StageTimeline
-            :status="episode?.status ?? 'queued'"
-            :progress="progress"
-          />
-        </div>
-      </section>
 
       <section v-if="episode?.source_ref" class="section">
         <div class="section__head">
