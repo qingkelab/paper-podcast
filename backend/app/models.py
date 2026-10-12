@@ -123,6 +123,8 @@ class VideoInfo(BaseModel):
     # 两条路径同时在（没装 Chrome 就自动降级），所以「同一篇论文两台机器出的画面
     # 不一样」只能靠它分辨。老视频没有这个记录，返回 null。
     renderer: str | None = None
+    # 视频没出来时的原因（给用户看的一句话）
+    error: str | None = None
 
 
 class Illustration(BaseModel):

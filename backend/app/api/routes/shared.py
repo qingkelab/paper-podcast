@@ -140,6 +140,10 @@ def _version_payload(
             # 出的画面不一样」得靠它才分得清 —— 只躺在库里的话这条线索等于查不到：
             # `VideoInfo.renderer` 一直是个恒为 null 的字段。
             "renderer": str(stored_video.get("renderer") or "") or None,
+            # 视频**没出来**时的原因（见 `pipeline._record_video_failure`）。
+            # 没有这个字段的话，「音频有、视频没有」在页面上完全看不出来 ——
+            # 实测连着三集都被当成「项目坏了」，每次都要人工翻服务器日志。
+            "error": str(stored_video.get("error") or "") or None,
         }
 
     # 横版：与竖版并存的一份（`?orientation=landscape`，1920×1080）

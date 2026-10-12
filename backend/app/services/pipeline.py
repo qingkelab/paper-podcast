@@ -180,6 +180,39 @@ class Pipeline:
             error=message,
         )
 
+    def _record_video_failure(self, episode_id: str, reason: str) -> dict[str, Any]:
+        """视频没出来时，把原因**写进库**，而不是只留在日志里。
+
+        为什么非做不可：这一层「失败只记日志」是**有意的**（视频是增强项，不该影响音频），
+        但它带来一个很贵的副作用 —— 页面照样显示「已完成」，用户看到的是
+        「音频有、视频没有」，而原因只躺在服务器日志里。实测连着三集都因此
+        被当成「项目坏了」，每次都要人工翻日志才定位。
+
+        写进 `video.error` 之后，页面上就能直接说清「这一步失败了、为什么、点哪里重试」。
+        文案要短：这是给用户看的，不是堆栈。
+        """
+        summary = " ".join(str(reason).split())
+        if len(summary) > 120:
+            summary = summary[:117] + "…"
+        record = self.db.get_episode(episode_id) or {}
+        versions = record.get("versions") or {}
+        payload = {"error": summary or "视频合成失败"}
+        if versions:
+            primary = str(record.get("language") or "zh")
+            # 双语集：记在主语言那一版上（顶层的 video 镜像的就是它）
+            version = versions.get(primary) or next(iter(versions.values()))
+            version["video"] = {**(version.get("video") or {}), **payload}
+            versions[primary] = version
+            self.db.update_episode(
+                episode_id, versions=versions, video={**(record.get("video") or {}), **payload}
+            )
+        else:
+            self.db.update_episode(
+                episode_id, video={**(record.get("video") or {}), **payload}
+            )
+        logger.info("视频失败原因已记入库：%s", payload["error"])
+        return {}
+
     async def _compose_video_safely(
         self,
         episode_id: str,
@@ -241,10 +274,10 @@ class Pipeline:
             )
         except VideoError as exc:
             logger.warning("视频合成失败（音频不受影响）：%s", exc)
-            return {}
+            return self._record_video_failure(episode_id, str(exc))
         except Exception as exc:  # noqa: BLE001
             logger.exception("视频合成出现未预期错误（音频不受影响）")
-            return {}
+            return self._record_video_failure(episode_id, f"{type(exc).__name__}: {exc}")
 
         logger.info(
             "视频已生成（%s）：%d 帧 / %.1f 秒 / %.1f MB（配图分配：%s）",

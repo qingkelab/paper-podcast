@@ -388,6 +388,17 @@ function resetVideoState(): void {
 const videoStale = computed(() => video.value?.stale === true)
 
 /**
+ * 视频没出来时后端写下的原因（`video.error`）。
+ *
+ * 注意判断顺序：**有视频时就不提示**（历史错误记录不该在已经出片之后还挂着），
+ * 只在「这一版确实没有视频」时显示 —— 用户要的是「为什么没有、怎么补救」。
+ */
+const videoError = computed(() => {
+  if (video.value?.url) return null
+  return (video.value?.error || '').trim() || null
+})
+
+/**
  * 重新合成是 **1 分钟级** 的操作（真实后端复用画面分配、不调模型，但要逐帧渲染 + 编码），
  * 按钮必须进 loading 态并禁用，否则用户会以为没反应而连点。
  */
@@ -1138,6 +1149,22 @@ onBeforeUnmount(() => {
         还会把真正的主角（视频）挤到首屏之外。
         cover_url 为 null 或加载失败时整块不渲染（不留空白、不留破图）。
       -->
+      <!--
+        视频**没出来**时说明原因 + 给重试入口（`video.error` 由后端在合成失败时写入）。
+        为什么必须有这一条：视频失败是「只记日志、不影响音频」的（有意设计），
+        于是页面照样显示「已完成」——用户看到的是「音频有、视频没有」却不知道
+        为什么、也不知道点哪里。实测连着三集都被当成「项目坏了」。
+      -->
+      <div v-if="videoError" class="alert alert--error" style="margin-bottom: 20px">
+        <span class="alert__icon" aria-hidden="true">!</span>
+        <span class="alert__body">
+          视频没合成出来：{{ videoError }}
+          <template v-if="episode.status === 'completed'">
+            音频不受影响，可以点下面的「重新合成视频」重试。
+          </template>
+        </span>
+      </div>
+
       <figure v-if="!video && coverSrc" class="hero">
         <div class="hero__art" :style="{ aspectRatio: coverRatio }">
           <img class="hero__glow" :src="coverSrc" alt="" aria-hidden="true" decoding="async" />
