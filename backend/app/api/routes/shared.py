@@ -530,12 +530,26 @@ def _share_version_payload(
     video_path = version.get("video_path")
     if video_path and Path(video_path).exists():
         stored = version.get("video") or {}
+        poster_path = str(stored.get("poster") or "")
         video = {
             "url": f"{base}/video{query}&v={_asset_version(video_path)}",
             "duration_sec": stored.get("duration_sec"),
             "scene_count": stored.get("scene_count"),
             "bytes": stored.get("bytes"),
             "stale": False,  # 公开页不显示「可以重新合成」这类只有作者在意的状态
+            # ⚠️ 下面这几个**作者通道一直是给的，公开通道漏了** —— 后果很具体：
+            # 展示页那一块是「首帧海报 + 播放按钮」，没有 poster_url 就只能退回
+            # 论文首页原图（**没有标题、不点播放永远是静止图**），
+            # 看起来就像「展示页没有视频」。两条通道共用同一套拼装是本文件的规矩，
+            # 这里就是那个「一边忘了加新字段」的实例。
+            "poster_url": (
+                f"{base}/video/poster{query}&v={_asset_version(poster_path)}"
+                if poster_path and Path(poster_path).exists()
+                else None
+            ),
+            "orientation": stored.get("orientation") or "portrait",
+            "hook": str(stored.get("hook") or ""),
+            "renderer": str(stored.get("renderer") or "") or None,
         }
 
     illustration = None

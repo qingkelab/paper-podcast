@@ -87,6 +87,31 @@ def _share_episode(request: Request, token: str) -> dict[str, Any]:
     return record
 
 
+@router.get("/share/{token}/video/poster")
+async def share_video_poster(
+    request: Request,
+    token: str,
+    lang: str | None = Query(None),
+    orientation: str = Query("portrait"),
+):
+    """**公开通道的视频首帧**（免登录）。
+
+    作者通道（`/api/episodes/{id}/video/poster`）一直有这条，公开通道漏了 ——
+    后果不是「少一个字段」那么好听：展示页那一块是「首帧海报 + 播放按钮」，
+    拿不到 poster 就只能退回**论文首页原图**（没有标题、不点播放永远是静止图），
+    看起来就像「展示页没有视频」。两条通道必须给同一套字段。
+    """
+    record = _share_episode(request, token)
+    landscape = (orientation or "portrait").lower() in ("landscape", "horizontal", "16:9")
+    # 与其它公开资源路由同一套写法：`_resolve_version` 顺带校验语言是否存在
+    _, version = _resolve_version(request, record, lang)
+    stored = (version.get("video_landscape") or {}) if landscape else (version.get("video") or {})
+    path = stored.get("poster")
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="这一版还没有封面静帧")
+    return FileResponse(Path(path), media_type="image/png")
+
+
 @router.get("/share/{token}", response_model=ShareView)
 async def get_share(request: Request, token: str):
     """公开视图。**免登录**。
