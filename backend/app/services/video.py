@@ -2219,7 +2219,11 @@ def compose_video(
         *(card for row in layers.beat_cards for card in row if card is not None),
         *(chip for row in layers.beat_chips for chip in row if chip is not None),
         *(frame for row in layers.beat_chip_frames for frames in row for frame in frames),
-        *(path for row in layers.diagram_states for _path, _moment in row),
+        # ⚠️ 生成器的元素表达式要用**同一个**变量名：写成 `path`（而循环变量是 `_path`）
+        # 会在这一步 `NameError`。它发生在 `compose_video` 的**最后一步（清理临时文件）**，
+        # 也就是说 MP4 其实已经编好了，却被这个异常连累：视频没写进库、
+        # 页面显示「没有视频」。实测就是这么连着丢掉好几集的视频的。
+        *(item[0] for row in layers.diagram_states for item in row),
     ]:
         try:
             temp_path.unlink(missing_ok=True)
