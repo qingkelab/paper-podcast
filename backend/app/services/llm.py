@@ -368,6 +368,16 @@ class LLMClient:
         temperature: float,
         json_mode: bool = True,
     ) -> str:
+        # **发请求前把孤立代理字符清掉**：这种字符存不进 UTF-8，httpx 会在
+        # `json=payload` 里抛 UnicodeEncodeError（错误信息只有位置、没有上下文，
+        # 极难定位）。入口那层已经清过一次，这里再兜一道 —— 粘贴文本、模型输出回灌
+        # 这些路径不经过 PDF 抽取（见 `ingest.drop_lone_surrogates`）。
+        from .ingest import drop_lone_surrogates
+
+        messages = [
+            {**message, "content": drop_lone_surrogates(str(message.get("content") or ""))}
+            for message in messages
+        ]
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,

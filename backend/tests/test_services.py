@@ -882,3 +882,80 @@ class TestScriptSpeaksAsTheAuthorAndTeaches:
         """专家档也别把术语扔下不管 —— 费曼那条对所有难度档都成立。"""
         assert "一句大白话" in prompts.LEVEL_GUIDE["expert"]
         assert "plain words" in prompts.LEVEL_GUIDE_EN["expert"]
+
+
+class TestLoneSurrogates:
+    """PDF 里数学字体的花体字母（U+1D400 段）是**代理对**，某些抽取路径会把它拆开，
+    留下半个 `\\ud835`。这种字符存不进 UTF-8，httpx 发请求时会抛：
+
+        UnicodeEncodeError: 'utf-8' codec can't encode character '\\ud835'
+        in position 12275: surrogates not allowed
+
+    用户报的就是这条「生成失败：内部错误」——错误信息里只有位置没有上下文，
+    所以入口处（以及发请求前）都要清掉。
+    """
+
+    def test_lone_surrogate_is_dropped(self):
+        from app.services.ingest import drop_lone_surrogates
+
+        lone = "注意力" + chr(0xD835) + "矩阵"
+        cleaned = drop_lone_surrogates(lone)
+        assert cleaned == "注意力矩阵"
+        assert cleaned.encode("utf-8")  # 能编码回 UTF-8 才算修好
+
+    def test_paired_surrogates_are_restored(self):
+        """成对的要**还原**成真正的字符，不是丢掉：花体字母本身是有信息量的。"""
+        from app.services.ingest import drop_lone_surrogates
+
+        # 拆成两个代理码元的写法要按平台字节序走（手写 big-endian 字节在小端机器上会解成别的字）
+        paired = (
+            "x"
+            + "\U0001d400".encode("utf-16", "surrogatepass").decode("utf-16", "surrogatepass")
+            + "y"
+        )
+        cleaned = drop_lone_surrogates(paired)
+        assert cleaned == "x\U0001d400y"
+        assert len(cleaned) == 3
+
+    def test_clean_text_never_returns_surrogates(self):
+        """真正入口是 `clean_text`（PDF 抽取与网页正文都走它）。"""
+        from app.services.ingest import clean_text
+
+        cleaned = clean_text("论文标题 " + chr(0xD835) + " 与正文")
+        cleaned.encode("utf-8")  # 不抛异常就是通过
+        assert chr(0xD835) not in cleaned
+
+    def test_normal_text_is_untouched(self):
+        from app.services.ingest import drop_lone_surrogates
+
+        assert drop_lone_surrogates("普通中文 + English 123") == "普通中文 + English 123"
+
+    def test_llm_messages_are_sanitised_before_sending(self):
+        """发请求前再兜一道：粘贴文本、模型输出回灌这些路径不经过 PDF 抽取。"""
+        from app.services.llm import LLMClient
+        from app.config import Settings
+
+        client = LLMClient(Settings(force_mock=True))
+        captured: dict = {}
+
+        def fake_post(url, **kwargs):  # 拦在 httpx 之前
+            captured.update(kwargs)
+            raise RuntimeError("stop here")
+
+        import app.services.llm as llm_module
+
+        monkey = llm_module.httpx.Client
+        try:
+            llm_module.httpx.Client = lambda *a, **k: type(
+                "C", (), {"__enter__": lambda s: s, "__exit__": lambda *a: False,
+                          "post": staticmethod(fake_post)}
+            )()
+            client._chat([{"role": "user", "content": "带代理" + chr(0xD835)}],
+                         max_tokens=8, temperature=0.2)
+        except Exception:
+            pass
+        finally:
+            llm_module.httpx.Client = monkey
+        sent = captured.get("json") or {}
+        body = str(sent)
+        assert chr(0xD835) not in body

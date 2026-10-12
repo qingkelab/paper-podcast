@@ -58,10 +58,41 @@ class IngestError(Exception):
 # --------------------------------------------------------------------------
 
 
+def drop_lone_surrogates(text: str) -> str:
+    """去掉**孤立代理字符**（U+D800~U+DFFF），成对的还原成真正的字符。
+
+    踩过的坑（用户报的「生成失败：内部错误」）：PDF 里数学字体的花体字母
+    （U+1D400 段的 𝑨、𝜶 之类）是**代理对**，某些抽取/编码路径会把它们拆开，
+    留下半个字符（高位代理 U+D835 之类）。这种字符**存不进 UTF-8**：
+
+        UnicodeEncodeError: 'utf-8' codec can't encode character ...
+        in position 12275: surrogates not allowed
+
+    它炸在 httpx 给模型发请求那一步（`json=payload` 内部 `.encode("utf-8")`），
+    而**错误信息里只有位置没有上下文**，很难看出是哪来的。
+
+    ⚠️ 代码里**不要**把这类字符写成转义字面量：那会让它在编译后的常量里变成
+    真的代理字符，连 `.pyc` 都写不出来（写 `.pyc` 也是 UTF-8 编码，
+    报的正是同一个错）。一律用数字比较。
+
+    清理分两步：先试着按 UTF-16 把成对的还原成正常字符（花体字母能救回来），
+    落单的直接丢掉（半个字符打不出来，留着只会让后续每一步都炸）。
+    """
+    if not text:
+        return text
+    if not any(0xD800 <= ord(char) <= 0xDFFF for char in text):
+        return text
+    try:
+        return text.encode("utf-16", "surrogatepass").decode("utf-16")
+    except UnicodeDecodeError:
+        return text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+
+
 def clean_text(raw: str) -> str:
     """通用文本清洗，对 PDF 抽取结果和网页正文都适用。"""
     if not raw:
         return ""
+    raw = drop_lone_surrogates(raw)
 
     # 1. 统一 unicode，把各类花式空格/连字符拉平
     text = unicodedata.normalize("NFKC", raw)
