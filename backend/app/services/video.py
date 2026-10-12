@@ -1443,7 +1443,13 @@ def _render_scene_layers(
                     # `fallback_image`：镜头讲完之后**切回论文原图**（只有摘要类镜头会给）。
                     # 这是产品要求的一条：图解讲的是「我们用它的数据画的东西」，
                     # 收尾得让观众看一眼**原文那张图**，知道这些数字是从哪来的。
-                    fallback = _diagram_fallback_card(scene, pool, layout=layout, session=session)
+                    # ⚠️ 这一层的素材池参数叫 `assets`（不是 `pool` —— `pool` 是
+                    # `compose_video` 里的局部名）。写成 `pool` 会让**每次真出片**都在
+                    # 这里 `NameError`，而它被 `_compose_video_safely` 兜住 →
+                    # 用户看到的又是「音频有、视频没有」。
+                    fallback = _diagram_fallback_card(
+                        scene, assets or {}, layout=layout, session=session
+                    )
                     if fallback is not None and states:
                         tail = max(0.0, scene.duration - DIAGRAM_FALLBACK_HOLD)
                         states.append((fallback, round(max(states[-1][1] + 0.6, tail), 2)))

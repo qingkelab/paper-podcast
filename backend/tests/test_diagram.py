@@ -492,3 +492,49 @@ class TestSummaryShotsAreChosenByPosition:
         body = messages[1]["content"]
         assert "收尾段" in body
         assert "[2]" in body and "summary" in body
+
+
+class TestFallbackCardRenders:
+    """`fallback_image` 那条路必须真的能渲染出来。
+
+    踩过的坑：`_render_scene_layers` 里把素材池写成了 `pool`（那一层的参数叫 `assets`），
+    于是**每次真出片**都在这一步 `NameError`，被 `_compose_video_safely` 兜住 ——
+    用户看到的是「音频有、视频没有」。所以这里直接调那个函数，别再等真出片才发现。
+    """
+
+    def test_the_fallback_card_is_rendered_from_the_asset_pool(self, tmp_path):
+        import pymupdf
+        from app.services.video import _diagram_fallback_card
+        from app.services.video_core import ImageAsset
+
+        figure = tmp_path / "f1.png"
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 90), False)
+        pix.set_rect(pix.irect, (240, 240, 240))
+        pix.save(str(figure))
+        shot = DiagramShot(
+            kind="summary", title="效率优势明显",
+            nodes=(DiagramNode("a", "时间维度", source="x"),),
+            fallback_image="f1",
+        )
+        scene = Scene(
+            start=0.0, end=6.0, image=tmp_path / "base.png", kind="illustration",
+            text="一句话。", diagram=shot,
+        )
+        out = _diagram_fallback_card(
+            scene,
+            {"f1": ImageAsset(id="f1", kind="figure", path=figure, caption="Figure 1")},
+            layout=PORTRAIT,
+            session=None,   # 没有 Chrome 也应能出图（走 SVG 光栅化）
+        )
+        assert out is not None and out.exists(), "论文原图那张卡没渲染出来"
+        assert pymupdf.Pixmap(str(out)).width == PORTRAIT.image_box_w
+
+    def test_missing_asset_is_a_no_op(self, tmp_path):
+        from app.services.video import _diagram_fallback_card
+
+        shot = DiagramShot(kind="summary", title="x", fallback_image="不存在")
+        scene = Scene(
+            start=0.0, end=6.0, image=tmp_path / "base.png", kind="illustration",
+            text="一句话。", diagram=shot,
+        )
+        assert _diagram_fallback_card(scene, {}, layout=PORTRAIT, session=None) is None
