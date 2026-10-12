@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +67,7 @@ from .design import *  # noqa: F401,F403
 # 这些名字同时是**对外门面**：老调用点（含 tests 里那 60 多个 import）继续写
 # `from app.services.video import encode_video` 就行，一个字都不用改。
 # 新代码请直接用上面对应的模块（类型 → video_core，画面 → video_render，ffmpeg → video_encode）。
+from .design import DIAGRAM_FALLBACK_HOLD
 from .video_core import (
     diagram_shot_from_dict,
     diagram_shot_to_dict,
@@ -1088,6 +1089,29 @@ def _chip_delay_for(text: str, plan: list[tuple[int, float]]) -> float:
     return CHIP_POP_DELAY
 
 
+def _diagram_fallback_card(
+    scene: Scene, pool: dict[str, ImageAsset], *, layout: Layout, session: Any
+) -> Path | None:
+    """图解镜头收尾要切回的**论文原图**那一张卡（没有就返回 None）。
+
+    只有 `DiagramShot.fallback_image` 指到一个**真实存在**的素材时才画：
+    指到不存在的 id 就什么都不做（宁可一直停在图解的最后一个状态，也不要画一张空卡）。
+    """
+    if scene.diagram is None or not scene.diagram.fallback_image:
+        return None
+    asset = pool.get(scene.diagram.fallback_image)
+    if asset is None or not Path(asset.path).exists():
+        logger.info("图解收尾要切回 %s，但那张图不在素材池里，跳过", scene.diagram.fallback_image)
+        return None
+    card_path = Path(scene.image).parent / f"diagram-fallback-{Path(scene.image).stem}.png"
+    render_image_card(
+        replace(scene, image=Path(asset.path), headline="", diagram=None),
+        card_path,
+        layout=layout,
+    )
+    return card_path
+
+
 def _render_band_layer(
     beat: str,
     path: Path,
@@ -1372,6 +1396,13 @@ def _render_scene_layers(
                             session=session,
                         )
                         states.append((state_path, moments[state]))
+                    # `fallback_image`：镜头讲完之后**切回论文原图**（只有摘要类镜头会给）。
+                    # 这是产品要求的一条：图解讲的是「我们用它的数据画的东西」，
+                    # 收尾得让观众看一眼**原文那张图**，知道这些数字是从哪来的。
+                    fallback = _diagram_fallback_card(scene, pool, layout=layout, session=session)
+                    if fallback is not None and states:
+                        tail = max(0.0, scene.duration - DIAGRAM_FALLBACK_HOLD)
+                        states.append((fallback, round(max(states[-1][1] + 0.6, tail), 2)))
                     result.diagram_states.append(states)
                 else:
                     _render_card_layer(scene, card_path, layout=layout, session=session)

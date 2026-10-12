@@ -3003,9 +3003,12 @@ class TestCoverIsDrawnInTheCardLayer:
             pix = pymupdf.Pixmap(str(path))
             w, n, s = pix.width, pix.n, pix.samples
             ink = 0
-            # 标题带：y 90~180，x 40~700（躲开右上角的 logo 底块）
+            # 标题带：y 90~180，x 220~700。两处都要躲开：
+            # ① 右上角是 logo 底块；② **左上角是图片卡的角色角标**
+            # （「论文原图 / 论文表格 / 概念示意」，见 docs/VIDEO_MOTION.md）——
+            # 角标是后来新增的、故意画在那里，所以这块区域不能再按「必须干净」来量。
             for y in range(90, 180, 2):
-                for x in range(40, 700, 2):
+                for x in range(220, 700, 2):
                     i = (y * w + x) * n
                     if (s[i] + s[i + 1] + s[i + 2]) // 3 < 190:
                         ink += 1

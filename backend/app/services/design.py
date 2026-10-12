@@ -165,7 +165,9 @@ DIAGRAM_MAX_SHOTS = 6          # 一整集最多几个图解镜头
 DIAGRAM_MAX_NODES = 4          # 一个流程/对比镜头最多几个节点
 DIAGRAM_MAX_METRICS = 3        # 一个指标镜头最多几个数字
 DIAGRAM_MAX_TITLE_CHARS = 16   # 标题上限（与 prompt 里的「不超过 16 字」同源）
-DIAGRAM_MIN_SEGMENT_SEC = 2.5  # 短于这个时长的段落不提镜头（一闪而过比不画更糟）
+DIAGRAM_MIN_SEGMENT_SEC = 2.5
+# 图解镜头收尾切回论文原图之后，至少留这么久让观众看一眼（太短等于闪一下）
+DIAGRAM_FALLBACK_HOLD = 1.6  # 短于这个时长的段落不提镜头（一闪而过比不画更糟）
 POINT_BAR = "#2f6fb5"
 POINT_TEXT = "#17416f"
 POINT_MAX_FONT = 40.0
