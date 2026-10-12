@@ -176,6 +176,118 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# 动态图解镜头：把讲稿句子与论文证据分配到镜头（见 docs/DIAGRAM_SHOTS.md）
+# --------------------------------------------------------------------------
+
+
+def diagram_evidence(
+    analysis: dict[str, Any] | None,
+    segments: list[dict[str, Any]] | None,
+    figures: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """允许作为依据的全部文本：解读字段 + 脚本原句 + 图注。
+
+    **核验只认这一份**（`diagram.verify_shot`）—— 所以它必须包含脚本原句：
+    模型写草案时最容易犯的错是「把解说里的数字记错一位」，而解说原句就是裁判。
+    """
+    out: list[str] = []
+    for value in (analysis or {}).values():
+        if isinstance(value, list):
+            out.extend(str(item) for item in value if str(item).strip())
+        elif isinstance(value, (str, int, float)):
+            out.append(str(value))
+    out.extend(str(seg.get("text") or "") for seg in segments or [])
+    out.extend(str(fig.get("caption") or "") for fig in figures or [])
+    return [item for item in out if item.strip()]
+
+
+def diagram_candidates(
+    segments: list[dict[str, Any]],
+    timings: list[Any],
+    *,
+    min_seconds: float | None = None,
+    max_candidates: int = 24,
+) -> list[int]:
+    """挑**值得画图解**的候选段：够长、而且话里确实有东西可结构化。
+
+    判据是「提到数字（指标/倍数/内存/准确率…）」或「在讲步骤/对比/结论」——
+    不筛的话模型会在每一段上都硬造一张图（它的默认行为就是「尽量满足要求」）。
+    """
+    from .design import DIAGRAM_MIN_SEGMENT_SEC
+
+    min_seconds = DIAGRAM_MIN_SEGMENT_SEC if min_seconds is None else min_seconds
+    markers = (
+        "%", "倍", "比特", "bit", "内存", "显存", "吞吐", "延迟", "加速", "准确率", "精度",
+        "第一步", "第二步", "先", "再", "然后", "相比", "对比", "结论", "意味着", "所以",
+    )
+    picked: list[int] = []
+    for index, segment in enumerate(segments):
+        text = str(segment.get("text") or "")
+        if len(text) < 12:
+            continue
+        if index < len(timings):
+            timing = timings[index]
+            start = getattr(timing, "start", None)
+            end = getattr(timing, "end", None)
+            if start is not None and end is not None and float(end) - float(start) < min_seconds:
+                continue
+        if any(marker in text for marker in markers):
+            picked.append(index)
+        if len(picked) >= max_candidates:
+            break
+    return picked
+
+
+def assign_diagram_shots(
+    *,
+    segments: list[dict[str, Any]],
+    timings: list[Any],
+    evidence: list[str],
+    llm: Any | None,
+    available_images: list[tuple[str, str]] | None = None,
+    max_shots: int | None = None,
+    language: str = "zh",
+) -> dict[int, Any]:
+    """调模型提草案 → 归一化 → **逐条核验** → 返回 `{段号: DiagramShot}`。
+
+    核验不过的条目会被丢掉；剩下不足两个节点的镜头整条作废（不返回）——
+    这样一来「无依据的内容不渲染，退回现有画面流程」是**默认行为**，不是异常分支。
+    """
+    from .diagram import verify_shot
+    from .design import DIAGRAM_MAX_SHOTS
+    from .prompts.diagram import build_diagram_messages, normalize_diagram_shots
+
+    if llm is None or getattr(llm, "mock", True):
+        return {}
+    candidates = diagram_candidates(segments, timings)
+    if not candidates:
+        return {}
+    max_shots = DIAGRAM_MAX_SHOTS if max_shots is None else max_shots
+    messages = build_diagram_messages(
+        segments=segments,
+        evidence=evidence,
+        available_images=available_images or [],
+        candidates=candidates,
+        max_shots=max_shots,
+        language=language,
+        timings=timings,
+    )
+    raw = llm._chat_json(messages, what="图解镜头草案", retries=1) or {}
+    shots = normalize_diagram_shots(
+        raw, max_shots=max_shots, valid_images=[item[0] for item in (available_images or [])]
+    )
+    out: dict[int, Any] = {}
+    for segment_index, shot in shots:
+        result = verify_shot(shot, evidence=evidence)
+        if result.ok:
+            out[segment_index] = result.shot
+            logger.info("图解镜头：第 %d 段「%s」（%s）", segment_index, shot.title, shot.kind)
+        else:
+            logger.info("图解镜头作废：第 %d 段 %s", segment_index, result.summary())
+    return out
+
+
 def build_scenes(
     *,
     segments: list[dict[str, Any]],
@@ -188,6 +300,9 @@ def build_scenes(
     focuses: list[dict[str, Any] | None] | None = None,
     whys: list[str] | None = None,
     beats_for_segment: list[list[str]] | None = None,
+    # **动态图解镜头**：`{段号: DiagramShot}`（由 `assign_diagram_shots` 产出，
+    # 或从 `preset_scenes[i]["diagram"]` 读回来复用）。缺省/空 = 全部走原来的画面。
+    diagram_shots: dict[int, Any] | None = None,
     beat_focuses: list[list[dict[str, Any] | None]] | None = None,
     headline: str = "",
     cover_caption: str = "",
@@ -275,6 +390,13 @@ def build_scenes(
             focus=(focuses[index] if focuses and index < len(focuses) else None),
             why=(whys[index] if whys and index < len(whys) else ""),
             brand=str(segment.get("brand") or ""),
+            # 图解镜头：有就画图解，没有就是原来的论文图/示意图。
+            # 片尾品牌段不画（那里是牌子）；核验不过的镜头根本不会出现在这里。
+            diagram=(
+                (diagram_shots or {}).get(index)
+                if str(segment.get("brand") or "") != "outro"
+                else None
+            ),
         )
         scenes.append(scene)
         if beats_for_segment is not None and index < len(beats_for_segment):

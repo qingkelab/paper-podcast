@@ -159,6 +159,13 @@ DIAGRAM_GRID = "#eef2f7"          # 条形底（未填充部分）
 # 图解状态之间的一次过渡时长。比字幕带淡入（0.35）短、比胶囊弹起（0.22）长：
 # 它是「同一张图长出新的一角」，慢一点才像在长。
 DIAGRAM_FADE_SEC = 0.3
+# 草案规模：prompt 里写的数字与这里**必须是同一个**（`tests/test_diagram.py` 钉着）——
+# 提示词写 4、代码截到 3 这种东西，表现为「模型老是不听话」，很难查。
+DIAGRAM_MAX_SHOTS = 6          # 一整集最多几个图解镜头
+DIAGRAM_MAX_NODES = 4          # 一个流程/对比镜头最多几个节点
+DIAGRAM_MAX_METRICS = 3        # 一个指标镜头最多几个数字
+DIAGRAM_MAX_TITLE_CHARS = 16   # 标题上限（与 prompt 里的「不超过 16 字」同源）
+DIAGRAM_MIN_SEGMENT_SEC = 2.5  # 短于这个时长的段落不提镜头（一闪而过比不画更糟）
 POINT_BAR = "#2f6fb5"
 POINT_TEXT = "#17416f"
 POINT_MAX_FONT = 40.0

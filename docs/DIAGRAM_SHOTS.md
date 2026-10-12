@@ -65,11 +65,38 @@ Scene(..., diagram: DiagramShot | None)       # 唯一的入口：非空时这�
 | 「每 2–4 秒有新东西」 | 静止空档 **0.0%**（对照：整集现状 21.2%，改造前 59.6%） |
 | 响度 | -15.8 LUFS（同一套归一化） |
 
-## 还没做的（下一步再决定）
+## 接入流水线（模型只提草案，代码决定画面）
 
-- **铺到整集**：现在只有样片走这条链；整集接入需要在 `video.py` 里把讲稿句子与论文证据
-  分配给图解镜头（模型出草案 → `verify_shot` 过滤 → 不够就退回现有画面）。
-- **模型调用**：样片的草案是我手写的（都标了出处）。接模型时要加一条 prompt：
-  「只写论文里出现过的数字与术语，每条都要指出出处」。
-- **结论收束镜头**在本片里用的是最后一段解说 + 论文原图；真正的「切回当前讲解画面」
-  需要与 `fallback_image` 联动，等整集接入时一起做。
+```
+diagram_evidence(analysis, segments, figures)      # 允许作为依据的文本（解读 + 脚本原句 + 图注）
+        ↓
+diagram_candidates(segments, timings)              # 只挑「够长 + 话里有数字/步骤/对比」的段
+        ↓
+prompts/diagram.build_diagram_messages(...)        # 把候选段 + 证据 + 可用图 id 交给模型
+        ↓  llm._chat_json
+prompts/diagram.normalize_diagram_shots(raw)       # 认不出的字段直接丢，不抛异常
+        ↓
+diagram.verify_shot(shot, evidence)                # **逐条核验**：查不到依据的条目丢掉
+        ↓                                          # 节点不够 → 整条作废
+build_scenes(..., diagram_shots={段号: shot})      # 落到 Scene.diagram；片尾品牌段永不画
+        ↓
+video_encode(diagram_states=…) / video_render     # 按时间点叠加状态图（已有）
+```
+
+**「没有依据就不渲染」是默认行为，不是异常分支**：核验不过的镜头根本不会进入 `Scene`，
+那一段照旧画论文原图或示意图。`tests/test_diagram.py::TestPipelineWiring` 钉着这条
+（编造的数字 → 整段作废；没有模型 → 一个镜头都不提；片尾段永不画）。
+
+**Prompt 的三条硬要求**（`prompts/diagram.py`）：只写材料里出现过的数字与术语、
+每条都带 `source` 原句、只在真的有结构的段落提镜头。规模上限（镜头数 / 节点数 / 指标数 /
+标题字数）在 `design.py` 里有一份常量，**prompt 里的数字与代码上限同源**（测试盯着）。
+
+## 还没做的
+
+- **重新合成时的复用**：镜头已经落在 `video.scenes[i].diagram`（存取函数
+  `diagram_to_dict/from_dict` 已就位），但还没接进 `compose_video` 的 preset 通路 ——
+  下一次「重新合成」仍会重新问一次模型。规矩同 `point` / `hook`：
+  **重建不该换画面，也不该再花一次模型调用**。
+- **结论收束镜头**与 `fallback_image` 的联动（切回论文原图）还没接：样片里用的是
+  最后一段解说 + 论文原图。
+- **`kind=summary` 的自动挑选**：现在由模型决定，还没有「一节结束时优先收束」的规则。

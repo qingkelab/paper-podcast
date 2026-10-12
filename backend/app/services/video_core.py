@@ -297,6 +297,79 @@ class DiagramShot:
         return out
 
 
+def diagram_shot_to_dict(shot: "DiagramShot") -> dict:
+    """存进 `video.scenes[i].diagram`（重新合成时复用，规矩同 `point` / `hook`）。"""
+    return {
+        "kind": shot.kind,
+        "title": shot.title,
+        "title_source": shot.title_source,
+        "subtitle": shot.subtitle,
+        "subtitle_source": shot.subtitle_source,
+        "nodes": [
+            {"id": node.id, "label": node.label, "detail": node.detail, "source": node.source}
+            for node in shot.nodes
+        ],
+        "links": [{"src": link.src, "dst": link.dst, "label": link.label} for link in shot.links],
+        "metrics": [
+            {
+                "label": metric.label,
+                "value": metric.value,
+                "unit": metric.unit,
+                "source": metric.source,
+            }
+            for metric in shot.metrics
+        ],
+        "bullets": list(shot.bullets),
+        "bullet_sources": list(shot.bullet_sources),
+        "fallback_image": shot.fallback_image,
+    }
+
+
+def diagram_shot_from_dict(raw: Any) -> "DiagramShot | None":
+    """从库里存的那份读回来。形状对不上就返回 None（老数据没有这一列，天然走这条）。"""
+    if not isinstance(raw, dict) or not str(raw.get("kind") or "").strip():
+        return None
+    return DiagramShot(
+        kind=str(raw.get("kind")),
+        title=str(raw.get("title") or ""),
+        title_source=str(raw.get("title_source") or ""),
+        subtitle=str(raw.get("subtitle") or ""),
+        subtitle_source=str(raw.get("subtitle_source") or ""),
+        nodes=tuple(
+            DiagramNode(
+                id=str(item.get("id") or ""),
+                label=str(item.get("label") or ""),
+                detail=str(item.get("detail") or ""),
+                source=str(item.get("source") or ""),
+            )
+            for item in raw.get("nodes") or []
+            if isinstance(item, dict)
+        ),
+        links=tuple(
+            DiagramLink(
+                src=str(item.get("src") or ""),
+                dst=str(item.get("dst") or ""),
+                label=str(item.get("label") or ""),
+            )
+            for item in raw.get("links") or []
+            if isinstance(item, dict)
+        ),
+        metrics=tuple(
+            DiagramMetric(
+                label=str(item.get("label") or ""),
+                value=float(item.get("value") or 0),
+                unit=str(item.get("unit") or ""),
+                source=str(item.get("source") or ""),
+            )
+            for item in raw.get("metrics") or []
+            if isinstance(item, dict)
+        ),
+        bullets=tuple(str(item) for item in raw.get("bullets") or []),
+        bullet_sources=tuple(str(item) for item in raw.get("bullet_sources") or []),
+        fallback_image=str(raw.get("fallback_image") or ""),
+    )
+
+
 @dataclass
 class CaptionBand:
     """一句字幕：文字（用来按字数分配时长）+ 渲染好的底部字幕带图片。

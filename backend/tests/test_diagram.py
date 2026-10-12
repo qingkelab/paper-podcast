@@ -184,3 +184,147 @@ class TestRendering:
                       text="一句话。", diagram=shot)
         assert scene.diagram is shot
         assert scene.diagram.items(), "每个镜头都要能列出自己需要核验的条目"
+
+
+# --------------------------------------------------------------------------
+# 接入流水线：候选筛选 → 模型草案 → 核验 → 落到 Scene（见 docs/DIAGRAM_SHOTS.md）
+# --------------------------------------------------------------------------
+
+
+class _FakeLLM:
+    """假模型：只回一份固定的草案（真调用不在单测里跑）。"""
+
+    mock = False
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls: list[tuple] = []
+
+    def _chat_json(self, messages, what="", retries=0):
+        self.calls.append((what, messages))
+        return self.payload
+
+
+def _segments():
+    return [
+        {"speaker": "A", "text": "这里是青稞社区，我们只讲自己读过的东西。"},
+        {"speaker": "B", "text": "6 比特下状态内存压缩了 5 倍多，Qwen 从 144 兆降到 28 兆左右。"},
+        {"speaker": "A", "text": "那这近似会不会让结果不可信？"},
+    ]
+
+
+def _timings():
+    from app.services.podcast_tts import RoundTiming
+
+    return [
+        RoundTiming(index=0, speaker="A", start=0.0, end=3.0),
+        RoundTiming(index=1, speaker="B", start=3.0, end=16.0),
+        RoundTiming(index=2, speaker="A", start=16.0, end=18.4),
+    ]
+
+
+class TestPipelineWiring:
+    def test_candidates_skip_short_and_empty_segments(self):
+        from app.services.video import diagram_candidates
+
+        picked = diagram_candidates(_segments(), _timings())
+        assert 1 in picked          # 有数字、够长
+        assert 0 not in picked      # 没有可结构化的东西
+        assert 2 not in picked      # 只有 2.4 秒（阈值 2.5），一闪而过
+
+    def test_evidence_includes_script_and_analysis(self):
+        from app.services.video import diagram_evidence
+
+        evidence = diagram_evidence(
+            {"innovations": ["生命周期感知比特分配"], "conclusion": "6 比特接近 FP32"},
+            _segments(),
+            [{"caption": "Figure 1: Overview."}],
+        )
+        assert any("6 比特下状态内存压缩了 5 倍多" in item for item in evidence)
+        assert any("生命周期感知比特分配" in item for item in evidence)
+        assert any("Figure 1" in item for item in evidence)
+
+    def test_assignment_verifies_and_falls_back(self, monkeypatch):
+        """**核心行为**：编造的数字被丢掉 → 节点不够 → 整段退回原画面（不返回镜头）。"""
+        from app.services import video as video_module
+
+        payload = {
+            "shots": [
+                {   # 有依据 → 保留
+                    "segment": 1, "kind": "metric", "title": "状态内存压了多少",
+                    "title_source": "脚本原句：6 比特下状态内存压缩了 5 倍多",
+                    "metrics": [
+                        {"label": "状态内存压缩", "value": 5, "unit": " 倍",
+                         "source": "脚本原句：6 比特下状态内存压缩了 5 倍多"},
+                    ],
+                },
+                {   # 编的数字 → 整段作废
+                    "segment": 2, "kind": "compare", "title": "编的镜头",
+                    "title_source": "脚本原句：那这近似会不会让结果不可信？",
+                    "nodes": [
+                        {"id": "a", "label": "加速比", "detail": "快了 3.7 倍", "source": "（编的）"},
+                        {"id": "b", "label": "内存", "detail": "降了 8 倍", "source": "（编的）"},
+                    ],
+                },
+            ]
+        }
+        llm = _FakeLLM(payload)
+        shots = video_module.assign_diagram_shots(
+            segments=_segments(),
+            timings=_timings(),
+            evidence=video_module.diagram_evidence(
+                {"conclusion": "6 比特接近 FP32"}, _segments(), []
+            ),
+            llm=llm,
+            available_images=[("f1", "Figure 1")],
+        )
+        assert set(shots) == {1}, shots
+        assert shots[1].kind == "metric"
+        assert llm.calls, "应当调了一次模型"
+
+    def test_no_llm_means_no_shots(self):
+        from app.services.video import assign_diagram_shots
+
+        assert assign_diagram_shots(
+            segments=_segments(), timings=_timings(), evidence=[], llm=None
+        ) == {}
+
+    def test_scene_keeps_the_shot_and_outro_never_does(self, tmp_path):
+        """落到 `Scene.diagram`：正文段带图解，片尾品牌段不带。"""
+        from app.services.video import build_scenes
+
+        segments = [
+            {"speaker": "A", "text": "第一段。"},
+            {"speaker": "B", "text": "这里是青稞社区，感谢收听。", "brand": "outro"},
+        ]
+        from app.services.podcast_tts import RoundTiming
+        from app.services.video_core import ImageAsset
+
+        cover = tmp_path / "cover.png"
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 80, 60), False)
+        pix.set_rect(pix.irect, (250, 250, 250))
+        pix.save(str(cover))
+        assets = {
+            "cover": ImageAsset(id="cover", kind="cover", path=cover, caption=""),
+        }
+        timings = [
+            RoundTiming(index=0, speaker="A", start=0.0, end=6.0),
+            RoundTiming(index=1, speaker="B", start=6.0, end=12.0),
+        ]
+        shot = DiagramShot(kind="flow", title="他们凭什么稳住精度", nodes=(
+            DiagramNode("a", "时间维度", source="x"),
+            DiagramNode("b", "比特分配", source="y"),
+        ))
+        scenes = build_scenes(
+            segments=segments,
+            timings=timings,
+            audio_duration=12.0,
+            assets=assets,
+            image_for_segment=["cover", "cover"],
+            fallback_id="cover",
+            diagram_shots={0: shot, 1: shot},
+        )
+        assert scenes[0].diagram is shot
+        assert scenes[1].diagram is None, "片尾品牌段不该画图解"
