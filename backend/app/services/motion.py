@@ -44,6 +44,8 @@ import math
 from .design import SPRING_PEAK_RATIO
 
 __all__ = [
+    "SPRING_PRESETS",
+    "spring_kwargs",
     "spring_kernel",
     "spring_progress",
     "spring_bump",
@@ -51,6 +53,31 @@ __all__ = [
     "ffmpeg_ease",
     "js_spring",
 ]
+
+
+def spring_kwargs(name: str) -> dict[str, float]:
+    """具名弹簧预设 → `spring_*` 的参数。调用点只说「用哪一种」，不写数值。
+
+    | 名字 | 用在哪 | 参数 |
+    |---|---|---|
+    | `slide` | 强调行横向滑入（936px） | 过冲 2%、峰值在 60% 处 |
+    | `pop` | 逐句数字胶囊「弹一下」（30px） | 过冲 9%、落定 `k=12` |
+    | `entrance` | 字幕/图解的后续状态「淡入 + 上升」 | 过冲 5%、峰值 30% |
+
+    过冲量**分开定**是有实测依据的：屏上距离差两个数量级（936px vs 30px），
+    同一个过冲百分比在小元素上根本看不出来、在大位移上又成了「甩过去」。
+    """
+    try:
+        return dict(SPRING_PRESETS[name])
+    except KeyError as exc:  # pragma: no cover - 拼错名字要当场炸，不要静默用默认值
+        raise KeyError(f"未知弹簧预设：{name}（可选：{', '.join(SPRING_PRESETS)}）") from exc
+
+
+SPRING_PRESETS: dict[str, dict[str, float]] = {
+    "slide": {"overshoot": 0.02, "peak_ratio": 0.6},
+    "pop": {"overshoot": 0.09, "decay": 12.0},
+    "entrance": {"overshoot": 0.05},
+}
 
 
 def spring_kernel(

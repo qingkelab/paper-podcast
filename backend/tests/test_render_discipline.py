@@ -118,3 +118,75 @@ class TestPagesAreTimeDetermined:
         origin = {"x": 0.6, "y": 0.1, "w": 0.3, "h": 0.3, "label": "b"}
         html = focus_overlay_page(scene, PORTRAIT, focus, origin=origin).html
         assert "@keyframes focus-morph" in html
+
+
+# --------------------------------------------------------------------------
+# 缓动与弹簧：**渲染模块里不许出现字面量**，只能用具名令牌/预设
+# --------------------------------------------------------------------------
+#
+# 规矩来自参考做法（claude-remotion-skill 的 `theme.ts` 第一行注释：
+# 「NEVER inline colors/easings in components」）。理由不是洁癖：
+# 同一个缓动值散落在五个文件里，改一处等于没改，而「这条动画怎么突然不顺了」
+# 是最难查的一类问题 —— 数值本身是量出来的，必须只有一份。
+
+#: 允许出现缓动字面量的地方：定义处（design 的令牌、motion 的公式）与测试
+_EASING_HOME = {"design.py", "motion.py"}
+
+_RENDER_MODULES = (
+    "video_render.py",
+    "video_encode.py",
+    "htmlpage.py",
+    "diagram.py",
+    "video.py",
+)
+
+
+def _render_sources() -> list[tuple[str, str]]:
+    root = Path(__file__).resolve().parents[1] / "app" / "services"
+    return [(name, (root / name).read_text(encoding="utf-8")) for name in _RENDER_MODULES]
+
+
+class TestNoInlineEasing:
+    def test_no_bezier_literals_outside_the_token_module(self):
+        import re
+
+        offenders: list[str] = []
+        for name, source in _render_sources():
+            if name in _EASING_HOME:
+                continue
+            for line_number, line in enumerate(source.splitlines(), start=1):
+                if re.search(r"cubic-bezier\s*\(", line):
+                    offenders.append(f"{name}:{line_number} {line.strip()[:60]}")
+        assert not offenders, (
+            "缓动字面量必须来自 `design.EASE_*`：\n" + "\n".join(offenders)
+        )
+
+    def test_no_hand_written_spring_expressions(self):
+        """弹簧表达式只能从 `motion.ffmpeg_ease()` 来（那里是唯一的公式）。
+
+        手写 `exp(-k*t)` 的危险在于：它**看起来**像弹簧，但过冲量、峰值时刻
+        和另外几处对不上 —— 参考做法把这类东西收进 `theme.ts` 就是为了这个。
+        """
+        import re
+
+        offenders: list[str] = []
+        for name, source in _render_sources():
+            if name in _EASING_HOME:
+                continue
+            for line_number, line in enumerate(source.splitlines(), start=1):
+                code = line.split("#", 1)[0]
+                if re.search(r"\bexp\(|(?<![\w.])sin\(|(?<![\w.])cos\(", code):
+                    offenders.append(f"{name}:{line_number} {line.strip()[:60]}")
+        assert not offenders, (
+            "弹簧表达式必须用 `motion.ffmpeg_ease()`：\n" + "\n".join(offenders)
+        )
+
+    def test_presets_are_named_and_used_by_name(self):
+        """具名预设是「调用点不写数值」的前提：没有名字就只能到处抄数字。"""
+        from app.services.motion import SPRING_PRESETS, spring_kwargs
+
+        assert set(SPRING_PRESETS) >= {"slide", "pop", "entrance"}
+        for name in SPRING_PRESETS:
+            assert spring_kwargs(name)["overshoot"] > 0
+        with pytest.raises(KeyError):  # 拼错名字要当场炸，不要静默用默认值
+            spring_kwargs("slidee")

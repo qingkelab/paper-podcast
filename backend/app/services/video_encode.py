@@ -24,6 +24,7 @@ from pathlib import Path
 from .audio_track import Pause
 from . import loudness
 from .motion import ffmpeg_ease as spring_ease
+from .motion import spring_kwargs
 
 # 版式/配色/节奏令牌的**老家**在 design.py（video.py 只是把它们再导出给老调用点）
 from .design import (
@@ -424,7 +425,7 @@ def encode_video(
                 )
                 # 同一条规矩：图解的下一个状态也是「淡入 + 上升」
                 rise = spring_ease(
-                    ENTRANCE_SEC, overshoot=ENTRANCE_OVERSHOOT, variable=f"(t-{at:.3f})"
+                    ENTRANCE_SEC, variable=f"(t-{at:.3f})", **spring_kwargs("entrance")
                 )
                 graph.append(
                     f"[{last}][dg{node}]overlay=x={layout.image_box_left}:"
@@ -491,11 +492,8 @@ def encode_video(
                 row_in = add_image(row)
                 node += 1
                 graph.append(f"[{row_in}:v]format=rgba[pt{node}]")
-                ease = spring_ease(
-                    POINT_SLIDE_SEC,
-                    overshoot=SPRING_SLIDE_OVERSHOOT,
-                    peak_ratio=SPRING_SLIDE_PEAK_RATIO,
-                )
+                # 具名预设：滑入的过冲与峰值位置在 `motion.SPRING_PRESETS["slide"]` 里
+                ease = spring_ease(POINT_SLIDE_SEC, **spring_kwargs("slide"))
                 # 滑入用**弹簧**而不是 `min(1, t/T)`：后者是匀速（实测就是「机器在滑」），
                 # 而 936px 的匀速位移最能看出「没有缓动」。过冲 2%（≈19px）后就地落定。
                 graph.append(
@@ -548,7 +546,7 @@ def encode_video(
                     # 上升用弹簧表达式：`variable="(t-{at})"` 把它变成「相对这一刻」，
                     # 到位时轻微回弹 —— 与强调行滑入同一套手感，零渲染成本。
                     rise = spring_ease(
-                        ENTRANCE_SEC, overshoot=ENTRANCE_OVERSHOOT, variable=f"(t-{at:.3f})"
+                        ENTRANCE_SEC, variable=f"(t-{at:.3f})", **spring_kwargs("entrance")
                     )
                     graph.append(
                         f"[{last}][rv{node}]overlay=x=0:"

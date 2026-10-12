@@ -222,3 +222,23 @@ ffmpeg 表达式里没有「相对某时刻」的概念，把时间变量整体�
 实测（真出片抽帧量字幕带顶边）：带子出现后 0.06 秒时顶边比落定后**低 9~12px**，
 0.6 秒时回到原位。`ENTRANCE_RISE_PX` 取 12 是因为那正好是一行字的高度量级，
 再大就成了「飞进来」。
+
+
+## 缓动与弹簧只许具名，不许内联
+
+借鉴之处同上（参考做法的 `theme.ts` 第一行注释：**NEVER inline colors/easings in components**）。
+理由不是洁癖：同一个缓动值散落在五个文件里，改一处等于没改，而「这条动画怎么突然不顺了」
+是最难查的一类问题 —— 数值本身都是量出来的，必须只有一份。
+
+| 在哪定义 | 里面有什么 |
+|---|---|
+| `design.py` | `EASE_FOCUS_MORPH`（聚光灯位移的曲线）等 CSS 侧具名缓动 |
+| `motion.py` | `SPRING_PRESETS` = `{slide, pop, entrance}` + `spring_kwargs(name)` |
+
+调用点只写名字：`spring_ease(POINT_SLIDE_SEC, **spring_kwargs("slide"))`。
+过冲量**按用途分开定**（滑入 2% / 胶囊 9% / 入场 5%）——屏上距离差两个数量级
+（936px vs 30px），同一个百分比在小元素上看不出来、在大位移上又成了「甩过去」。
+
+`tests/test_render_discipline.py::TestNoInlineEasing` 三条扫源码盯住：
+渲染模块里不许出现 `cubic-bezier(...)` 字面量、不许手写 `exp(-k*t)` 弹簧表达式
+（它**看起来**像弹簧，但过冲与峰值时刻和别处对不上）、具名预设必须齐全且拼错名字当场报错。

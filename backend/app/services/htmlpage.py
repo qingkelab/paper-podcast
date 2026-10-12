@@ -67,6 +67,7 @@ from .design import (
     COVER_SUBTITLE_COLOR,
     COVER_SUBTITLE_FONT,
     COVER_TITLE_COLOR,
+    EASE_FOCUS_MORPH,
     FOCUS_BORDER,
     FOCUS_BORDER_W,
     FOCUS_DIM_ALPHA,
@@ -929,13 +930,16 @@ def focus_overlay_page(
 
 # 「移过去」只用一份样式：关键帧里**只写目标值**，起点自动取元素当下的
 # `left/top/width/height`（它们在行内样式里）——所以不必在 Python 里逐帧插值。
-FOCUS_MORPH_CSS = """
+FOCUS_MORPH_CSS = (
+    """
 .focus-morph {
   animation-name: focus-morph;
   /* 过冲一点点再落定：`.3,.7,.3,1` 是**单调**的（y 都不超过 1），
      所以旧版看起来是「滑过去停住」而不是「被放到位」。这里把第二控制点的 y
      抬到 1.28，峰值约 +2.5%（聚光灯要移动几百像素，再多就成了「甩」）。 */
-  animation-timing-function: cubic-bezier(.34,1.28,.5,1);
+  animation-timing-function: """
+    + EASE_FOCUS_MORPH
+    + """;
   animation-fill-mode: both;
 }
 @keyframes focus-morph {
@@ -948,6 +952,7 @@ FOCUS_MORPH_CSS = """
 @keyframes chip-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes chip-out { from { opacity: 1; } to { opacity: 0; } }
 """
+)
 
 
 FOCUS_CSS = """
