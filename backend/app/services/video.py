@@ -68,6 +68,7 @@ from .design import *  # noqa: F401,F403
 # `from app.services.video import encode_video` 就行，一个字都不用改。
 # 新代码请直接用上面对应的模块（类型 → video_core，画面 → video_render，ffmpeg → video_encode）。
 from .design import DIAGRAM_FALLBACK_HOLD
+from .design import ENABLE_CLAUSE_REVEAL
 from .video_core import (
     diagram_shot_from_dict,
     diagram_shot_to_dict,
@@ -1474,11 +1475,12 @@ def _render_scene_layers(
                             beat_index < len(beat_layers.chip_frames)
                             and bool(beat_layers.chip_frames[beat_index])
                         )
-                        # 小句依次出现（HTML 路径才有：SVG 那条路不做，见 render_caption_band）
+                        # 字幕：**整句一次出现**（1~2 行），不再按小句分块。
+                        # 开关在 `design.ENABLE_CLAUSE_REVEAL`（用户反馈「字幕不要分块」）。
                         beat_start, beat_end = windows[beat_index]
                         plan = (
                             plan_reveals(beat, beat_end - beat_start)
-                            if session is not None
+                            if (session is not None and ENABLE_CLAUSE_REVEAL)
                             else []
                         )
                         _render_band_layer(
