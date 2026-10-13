@@ -157,3 +157,38 @@ class TestBeatWindowsAligned:
     def test_single_beat_is_untouched(self):
         beats = ["只有一句。"]
         assert beat_windows_aligned(beats, 4.0, pauses=[Pause(1.0, 1.5)]) == beat_windows(beats, 4.0)
+
+
+class TestBoundarySnappingActuallyHappens:
+    """**吸附到底有没有生效** —— 这一条是分水岭，别靠猜。
+
+    背景：真实数据上量下来，字幕换句到最近停顿的距离中位数 0.45 秒、最大 1.24 秒，
+    而且 25 个边界里**没有一个**落在停顿中心（距离 0.00）。两种可能：
+    ① `align_boundaries` 没吸（代码问题）；② 我的测量口径有问题（脚本问题）。
+    这条测试构造「停顿就在边界附近」的最简场景，直接回答是哪一个。
+    """
+
+    def test_a_pause_within_tolerance_pulls_the_boundary(self):
+        from app.services.audio_track import Pause, align_boundaries
+
+        pauses = [Pause(start=9.8, end=10.2)]  # 中心 10.0
+        aligned = align_boundaries([10.5], pauses, start=0.0, end=20.0)
+        assert aligned == [10.0], f"边界没有被吸到停顿中心：{aligned}"
+
+    def test_a_far_pause_does_not_move_the_boundary(self):
+        from app.services.audio_track import Pause, align_boundaries
+
+        pauses = [Pause(start=3.0, end=3.4)]  # 中心 3.2，离边界 10.5 很远
+        aligned = align_boundaries([10.5], pauses, start=0.0, end=20.0)
+        assert aligned == [10.5], f"太远的停顿不该硬挪边界：{aligned}"
+
+    def test_spans_argument_does_not_change_behaviour_for_now(self):
+        """`spans` 目前**故意不影响结果**：试过按句长放大窗口，实测没改善（最坏还变差）。"""
+        from app.services.audio_track import Pause, align_boundaries
+
+        pauses = [Pause(start=3.0, end=3.4), Pause(start=9.8, end=10.2)]
+        without = align_boundaries([10.5, 15.0], pauses, start=0.0, end=20.0)
+        with_spans = align_boundaries(
+            [10.5, 15.0], pauses, start=0.0, end=20.0, spans=[10.0, 4.5]
+        )
+        assert without == with_spans
