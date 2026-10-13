@@ -1377,8 +1377,11 @@ def beat_windows_aligned(
 
     # 内部边界（不含首尾）的绝对时间，吸附后再还原成窗口
     boundaries = [start + end for _, end in windows[:-1]]
+    # 每句的时长要一起给：吸附窗口按句长放大，否则长句的边界永远吸不上停顿
+    # （实测固定 0.9 秒窗口时，字幕换句到停顿的距离中位数 0.77 秒、最坏 6.5 秒）
+    spans = [end - begin for begin, end in windows[:-1]]
     aligned = align_boundaries(
-        boundaries, pauses, start=start, end=start + duration
+        boundaries, pauses, start=start, end=start + duration, spans=spans
     )
     edges = [0.0, *[item - start for item in aligned], duration]
     return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]

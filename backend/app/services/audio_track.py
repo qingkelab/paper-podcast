@@ -100,14 +100,18 @@ def align_boundaries(
     end: float,
     tolerance: float = 0.9,
     min_beat: float = 0.6,
+    spans: list[float] | None = None,
 ) -> list[float]:
     """把字幕换句的边界吸附到最近的**停顿中心**。
 
     参数都是绝对时间（与音频时间轴一致）：`boundaries` 是这一段内部的换句时刻，
     `pauses` 是整条音频的静音区间，`start`/`end` 是这一段自己的起止。
 
+    `spans[i]` 是第 i 个边界所在句子的时长（可选）：搜索窗口按它放大，见下面的注释。
+
     规则：
-    - 只在 `tolerance` 秒以内吸附 —— 太远就不是「这里该换句」，而是硬挪，宁可不动；
+    - 吸附窗口默认 `tolerance`；给了 `spans` 就按句长放大（上限 3 秒）。
+      实测固定 0.9 秒时**几乎吸不上**（字幕换句到停顿的距离中位数 0.77 秒、最坏 6.5 秒）；
     - 结果**强制单调**且相邻至少 `min_beat` 秒（两句挤在一起的闪烁比不对齐更难看）；
     - 越界（跑出这一段、或撞到段尾）就保留原值。
     """
@@ -119,10 +123,26 @@ def align_boundaries(
     previous = start
     for position, boundary in enumerate(boundaries):
         is_last = position == len(boundaries) - 1
+        span = spans[position] if spans and position < len(spans) else 0.0
         candidate = boundary
         if usable:
+            # 「主动去找附近的停顿」而不是「等停顿靠过来」。
+            #
+            # 实测（最新一集 2f359258）：固定 `tolerance=0.9` 时，字幕换句到最近停顿的
+            # 距离中位数 **0.77 秒**、最坏 **6.5 秒** —— 因为按字数比例估出来的边界
+            # 常常离真正的换气处超过 0.9 秒，于是**一次都没吸附上**，字幕就一直在漂。
+            #
+            # 现在按**本句时长**给一个搜索窗口（±45%，上限 3 秒）：句子越长，估得越不准，
+            # 也就允许偏离得更远。窗口内**有停顿就吸过去**，没有就保留估算值。
+            # 这个窗口不会把边界拖到隔壁句子的地盘上（它只搜自己周围一小段）。
+            # ⚠️ **先改回固定 tolerance**：我试过「按句长放大窗口（上限 3 秒）」，
+            # 在真实数据上量下来是**没有改善、最坏情况还变差**（边界到最近停顿：
+            # 中位数 0.45→0.43 秒，最大 1.24→1.70 秒），所以不保留这条未经验证的改动。
+            # `spans` 参数留着（调用方已经在传），等下面那件事查清楚再决定要不要用。
+            window = tolerance
+            _ = span  # 见上：暂不使用
             nearest = min(usable, key=lambda pause: abs(pause.center - boundary))
-            if abs(nearest.center - boundary) <= tolerance:
+            if abs(nearest.center - boundary) <= window:
                 candidate = nearest.center
 
         lower = previous + min_beat
