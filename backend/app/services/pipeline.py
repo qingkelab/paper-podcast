@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from ..config import Settings
 from ..db import Database
+from .podcast_tts import probe_duration as probe_duration_stub
 from .. import voices as voice_catalog
 from . import prompts
 from .ingest import (
@@ -212,6 +214,29 @@ class Pipeline:
             )
         logger.info("视频失败原因已记入库：%s", payload["error"])
         return {}
+
+    def _trim_audio_silences(self, audio_path: Path) -> Any:
+        """把过长的静音压掉（原地替换，保证全链路只有一个音频路径）。
+
+        为什么原地替换而不是另存一份：`audio_path` 被库里好几处引用（资源接口、
+        视频合成、时长统计），多一份就得处处判断用哪个 —— 那是 bug 的温床。
+        原音频可以由 TTS 重新生成，压过的那份才是「正片」。
+        """
+        from .audio_track import trim_long_silences
+
+        target = Path(audio_path)
+        temp = target.with_name(target.stem + ".trimmed" + target.suffix)
+        result = trim_long_silences(target, temp)
+        if result is None:
+            return None
+        try:
+            temp.replace(target)
+        except OSError:
+            logger.warning("压缩后的音频替换失败，保留原音频")
+            return None
+        result = replace(result, path=target)
+        logger.info("音频静音已压缩：去掉 %.1f 秒，新时长见下", result.removed_sec)
+        return result
 
     async def _compose_video_safely(
         self,
@@ -751,6 +776,27 @@ class Pipeline:
                     speech_rate=speech_rate,
                 )
                 last_audio_path = result.audio_path
+
+                # **压掉异常长的静音**（实测有一集静音占 60%、最长 78.8 秒：
+                # 设定 3 分钟播成 6.36 分钟，而说话只有 2.6 分钟）。
+                # 关键：压完必须**重映射时间轴**，否则字幕/画面整体错位。
+                trimmed = await asyncio.to_thread(
+                    self._trim_audio_silences, result.audio_path
+                )
+                if trimmed is not None:
+                    result.audio_path = trimmed.path
+                    result.duration_sec = await asyncio.to_thread(
+                        probe_duration_stub, trimmed.path
+                    ) or result.duration_sec
+                    result.timings = [
+                        replace(
+                            timing,
+                            start=trimmed.remap(timing.start),
+                            end=trimmed.remap(timing.end),
+                        )
+                        for timing in result.timings
+                    ]
+                    last_audio_path = result.audio_path
 
                 version.update(
                     {

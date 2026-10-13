@@ -19,11 +19,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # 判定「停顿」的门限：-34dB 是实测出来的 —— 说话区的包络中位数在 -25dB 上下，
 # 句子之间的换气落在 -40dB 以下；取 -34dB 能把换气捡出来，又不会把轻声词切开。
@@ -164,3 +167,104 @@ def align_boundaries(
         aligned.append(candidate)
         previous = candidate
     return aligned
+
+
+# --------------------------------------------------------------------------
+# 长静音压缩：把「超过 max_silence 的静音」压到 keep 秒
+# --------------------------------------------------------------------------
+
+# 实测（最新一集 b95d6832）：音频里 78.8 秒 / 60.3 秒 / 27.2 秒的长静音合计 **227 秒**，
+# 占全片 60% —— 用户设定 3 分钟，成片 6.36 分钟，其中说话只有 154 秒（≈2.6 分钟，
+# 和设定基本吻合）。也就是说**脚本长度是对的，多出来的时间全是静音**。
+# 正常那两集静音只占 12~13%、最长 0.6~0.8 秒，所以这是异常音频。
+DEFAULT_MAX_SILENCE = 1.2   # 超过它的静音算「异常长」
+DEFAULT_KEEP_SILENCE = 0.3  # 压完留这么一点，保留说话的呼吸感
+
+
+@dataclass(frozen=True)
+class TrimResult:
+    """压缩结果：新文件里「哪一段是原来的哪一段」，用来**同步重映射时间轴**。"""
+
+    path: Path
+    removed_sec: float
+    #: 保留下来的时间区间（原音频坐标系），按顺序排列
+    kept: list[tuple[float, float]]
+
+    def remap(self, moment: float) -> float:
+        """把原音频里的时刻映射到压缩后的时刻（timings 必须跟着改，否则图文全错位）。"""
+        offset = 0.0
+        for start, end in self.kept:
+            if moment <= start:
+                return offset
+            if moment <= end:
+                return offset + (moment - start)
+            offset += end - start
+        return offset
+
+
+def trim_long_silences(
+    audio_path: Path,
+    output_path: Path,
+    *,
+    max_silence: float = DEFAULT_MAX_SILENCE,
+    keep: float = DEFAULT_KEEP_SILENCE,
+    timeout: float = 600.0,
+) -> TrimResult | None:
+    """把过长的静音压到 `keep` 秒。**失败一律返回 None**（调用方保留原音频）。
+
+    为什么要有它：一次 TTS 异常会在音频里留下几十秒的空白，成片时长直接翻倍，
+    而内容是好的 —— 这是「3 分钟设定播成 6 分钟」的直接原因（实测静音占 60%）。
+    压掉长静音同时修三件事：时长回到设定、节奏变紧、字幕/画面不用再等空白。
+    """
+    if not shutil.which("ffmpeg") or not Path(audio_path).exists():
+        return None
+    pauses = detect_pauses(audio_path, min_duration=max_silence)
+    if not pauses:
+        return None
+
+    from .podcast_tts import probe_duration
+
+    total = probe_duration(Path(audio_path)) or 0.0
+    if not total:
+        return None
+
+    kept: list[tuple[float, float]] = []
+    cursor = 0.0
+    for pause in pauses:
+        start = max(0.0, pause.start + keep / 2)
+        end = max(start, pause.end - keep / 2)
+        if start > cursor:
+            kept.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < total:
+        kept.append((cursor, total))
+    removed = total - sum(end - start for start, end in kept)
+    if removed < 1.0:
+        return None  # 没什么可压的，别白跑一次转码
+
+    graph: list[str] = []
+    for index, (start, end) in enumerate(kept):
+        graph.append(
+            f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{index}]"
+        )
+    graph.append(
+        "".join(f"[a{i}]" for i in range(len(kept))) + f"concat=n={len(kept)}:v=0:a=1[out]"
+    )
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(audio_path),
+        "-filter_complex", ";".join(graph),
+        "-map", "[out]",
+        str(output_path),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or not Path(output_path).exists():
+        return None
+    logger.info(
+        "长静音压缩：%d 处 → 去掉 %.1f 秒（%.1f → %.1f 秒）",
+        len(pauses), removed, total, total - removed,
+    )
+    return TrimResult(path=Path(output_path), removed_sec=removed, kept=kept)
