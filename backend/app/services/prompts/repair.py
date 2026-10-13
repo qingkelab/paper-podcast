@@ -91,6 +91,7 @@ def build_trim_messages(
     current_chars: int,
     target: int,
     language: str = "zh",
+    attempt: int = 1,
 ) -> list[dict[str, str]]:
     script_text = "\n".join(
         f"主播{'A' if seg.get('speaker') == 'A' else 'B'}：{seg.get('text', '')}"
@@ -98,9 +99,15 @@ def build_trim_messages(
     )
     excess = max(current_chars - target, 0)
     ratio = int(excess / max(current_chars, 1) * 100)
+    retry_note = (
+        "\n**注意：这是第二次精简，上一次没有压到位。** 这次必须真正砍掉 "
+        f"{excess} 字左右 —— 宁可少讲一个次要细节，也要落到 {target} 字上下。"
+        if attempt >= 2
+        else ""
+    )
     user = f"""下面这版播客脚本共 {current_chars} 字，目标长度是 {target} 字左右，\
 需要精简掉约 {excess} 字（相当于砍掉 {ratio}%）。这个缩减量是硬指标，
-请务必达到；如果只减掉几个字，这次精简就是失败的。
+请务必达到；如果只减掉几个字，这次精简就是失败的。{retry_note}
 
 【当前脚本】
 {script_text}

@@ -214,13 +214,28 @@ class LLMClient:
         actual = script.get("word_count", 0)
 
         if actual > target * LENGTH_TRIM_THRESHOLD:
-            return self._trim_script(
-                script,
-                target=target,
-                speech_rate=speech_rate,
-                padding_sec=padding_sec,
-                language=language,
-            )
+            # **最多两次**：第一次常常只压到「预算附近但还超一点」，第二次带上下文再压一次。
+            # 仍然不行就保留原稿（宁可比目标长，也不要因为压缩丢内容）—— 但两条出口都带数字。
+            for attempt in (1, 2):
+                trimmed = self._trim_script(
+                    script,
+                    target=target,
+                    speech_rate=speech_rate,
+                    padding_sec=padding_sec,
+                    language=language,
+                    attempt=attempt,
+                )
+                if trimmed.get("word_count", actual) <= target * LENGTH_TRIM_THRESHOLD:
+                    return trimmed
+                if attempt == 2:
+                    logger.warning(
+                        "两次精简都没压进预算（%d 字，目标 %d，预算上限 %d），沿用原脚本",
+                        trimmed.get("word_count", actual),
+                        target,
+                        int(target * LENGTH_TRIM_THRESHOLD),
+                    )
+                    return trimmed
+            return script
 
         if actual >= target * LENGTH_REPAIR_THRESHOLD:
             return script
@@ -279,6 +294,7 @@ class LLMClient:
         speech_rate: int,
         padding_sec: float = 0.0,
         language: str = "zh",
+        attempt: int = 1,
     ) -> dict[str, Any]:
         """脚本超长时压缩一次。
 
@@ -300,6 +316,7 @@ class LLMClient:
                     current_chars=actual,
                     target=target,
                     language=language,
+                    attempt=attempt,
                 ),
                 max_tokens=8000,
                 temperature=0.4,  # 压缩要稳，不要发挥
@@ -320,23 +337,36 @@ class LLMClient:
             language=language,
         )
 
-        # 精简后反而更长/基本没变，说明模型没按要求做。
-        # 只判「比原来短」是不够的：实测出现过 1175 → 1171 这种「改了等于没改」，
-        # 白花一次调用还拖慢流水线，所以要求至少真的减掉 3%。
-        reduction = (actual - trimmed["word_count"]) / max(actual, 1)
-        if reduction < 0.03:
+        # **接受条件：落进预算就算成功**（≤ 目标 × LENGTH_TRIM_THRESHOLD）。
+        #
+        # 原来要求「至少减 3%」，这是个坏判据：模型一次没压到 1050、只压到 1200 时，
+        # 那个结果**已经在预算内**（1200 ≤ 1050×1.15），却因为「减得不够 3%」被整份丢掉，
+        # 白付一次调用、还留着 1572 字的原稿。实测有两集正是 1572 字 / 目标 1050（150%）。
+        budget = target * LENGTH_TRIM_THRESHOLD
+        if trimmed["word_count"] > budget:
             logger.warning(
-                "精简几乎无效（%d → %d 字，仅减 %.1f%%），沿用原脚本",
+                "精简不够（%d → %d 字，目标 %d，预算上限 %d），稍后重试或沿用原脚本",
                 actual,
                 trimmed["word_count"],
-                reduction * 100,
+                target,
+                int(budget),
             )
             return script
+        reduction = (actual - trimmed["word_count"]) / max(actual, 1)
+        logger.info(
+            "精简接受：%d → %d 字（目标 %d，预算上限 %d，减了 %.1f%%）",
+            actual,
+            trimmed["word_count"],
+            target,
+            int(budget),
+            reduction * 100,
+        )
 
         # 压过头了（低于下限）也不要——宁可长一点
         if trimmed["word_count"] < target * LENGTH_REPAIR_THRESHOLD:
             logger.warning(
-                "精简过度（%d 字，低于目标 %d 字的 %d%%），沿用原脚本",
+                "精简过度（%d → %d 字，低于目标 %d 字的 %d%%），沿用原脚本",
+                actual,
                 trimmed["word_count"],
                 target,
                 int(LENGTH_REPAIR_THRESHOLD * 100),

@@ -961,3 +961,66 @@ class TestLoneSurrogates:
         sent = captured.get("json") or {}
         body = str(sent)
         assert chr(0xD835) not in body
+
+
+class TestTrimAcceptsAnythingWithinBudget:
+    """脚本超长时的兜底：**落进预算就算成功**，并且最多试两次。
+
+    实测有两集写了 1572 字（目标 1050，150%），成片 4.5 分钟而不是 3 分钟。
+    原来的接受条件要求「至少减 3%」，于是「压到 1200 字」这种**已经进预算**的结果
+    会被整份丢掉，白付一次调用、还留着 1572 字 —— 这条测试就是钉这个判据。
+    """
+
+    class _LLM:
+        """假模型：按脚本回固定字数，并记下调用了几次。"""
+
+        def __init__(self, word_counts):
+            self.word_counts = list(word_counts)
+            self.calls = 0
+
+        def _chat_json(self, messages, *, max_tokens, temperature=0.6):
+            self.calls += 1
+            count = self.word_counts[min(self.calls - 1, len(self.word_counts) - 1)]
+            # 造一份「正好这么多字」的稿子（中文一个字算一字）
+            text = "字" * max(1, count // 6)
+            return {"segments": [{"speaker": "A", "text": text} for _ in range(6)]}
+
+    def _script(self, chars: int) -> dict:
+        text = "字" * max(1, chars // 6)
+        return {
+            "segments": [{"speaker": "A", "text": text} for _ in range(6)],
+            "word_count": chars,
+        }
+
+    def test_a_result_within_budget_is_accepted(self):
+        """1200 字虽然没压到 1050，但已在预算内（1050×1.15=1207）→ 接受。"""
+        from app.services.llm import LLMClient
+
+        client = LLMClient.__new__(LLMClient)          # 不走 __init__，只借方法
+        client.settings = None
+        client._chat_json = self._LLM([1200])._chat_json  # type: ignore[method-assign]
+        trimmed = client._trim_script(
+            self._script(1572), target=1050, speech_rate=0, language="zh"
+        )
+        assert trimmed["word_count"] < 1572, trimmed["word_count"]
+        assert trimmed["word_count"] <= 1050 * 1.15 + 1
+
+    def test_a_result_over_budget_is_rejected(self):
+        """压不动（1400 字 > 预算 1207）→ 保留原稿，而不是留下一个「短了一点」的稿子。"""
+        from app.services.llm import LLMClient
+
+        client = LLMClient.__new__(LLMClient)
+        client.settings = None
+        client._chat_json = self._LLM([1400])._chat_json  # type: ignore[method-assign]
+        original = self._script(1572)
+        assert client._trim_script(original, target=1050, speech_rate=0, language="zh") is original
+
+    def test_the_retry_prompt_says_it_is_the_second_try(self):
+        from app.services.prompts.repair import build_trim_messages
+
+        first = build_trim_messages([{"speaker": "A", "text": "x"}], current_chars=1572, target=1050)
+        second = build_trim_messages(
+            [{"speaker": "A", "text": "x"}], current_chars=1572, target=1050, attempt=2
+        )
+        assert "第二次精简" not in first[1]["content"]
+        assert "第二次精简" in second[1]["content"]
