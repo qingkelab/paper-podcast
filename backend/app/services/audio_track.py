@@ -239,8 +239,13 @@ def trim_long_silences(
     if cursor < total:
         kept.append((cursor, total))
     removed = total - sum(end - start for start, end in kept)
-    if removed < 1.0:
-        return None  # 没什么可压的，别白跑一次转码
+    # 只在**确有异常**时才动音频：去掉的静音要占到全片 15% 以上。
+    #
+    # 两道门槛不是保守，是因为这个改动会重写音频、还要重映射时间轴 ——
+    # 为一个「省下 2 秒」的收益承担那个风险不值得（正常集静音占 12~13%，
+    # 而那集异常的占 60%）。顺带也避免测试里的 mock 音频被无谓地重编码。
+    if removed < 1.0 or removed / max(total, 1e-6) < 0.15:
+        return None
 
     graph: list[str] = []
     for index, (start, end) in enumerate(kept):

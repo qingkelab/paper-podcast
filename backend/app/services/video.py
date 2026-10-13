@@ -1595,7 +1595,7 @@ def compose_video(
     title: str = "",
     llm: Any | None = None,
     analysis: dict[str, Any] | None = None,
-    max_topic_images: int = 4,
+    max_topic_images: int = 12,
     preset_scenes: list[dict[str, Any]] | None = None,
     preset_assets: dict[str, str] | None = None,
     preset_hook: str = "",
@@ -1820,7 +1820,7 @@ def compose_video(
     # 会让生成组数随句数放大 —— 每组一次模型调用（实测约 10 秒 / 3000+ token），
     # 成本就失控了。所以先把**同一段内**的 generate 合并到整段：同一段里的句子本来
     # 就在讲同一件事（选图就是按「这句在讲什么」选的），整段共用一张现场生成的图。
-    # 合并之后 `group_generate_runs` / `merge_runs_to_cap` / `MAX_TOPIC_IMAGES`
+    # 合并之后 `group_generate_runs` / `merge_runs_to_cap` / `max_topic_images`(默认 12)
     # 的「单位」仍然是**段**，量级与合并前一致。
     if beat_picks is not None:
         collapsed = collapse_generate_within_segments(beat_picks)
