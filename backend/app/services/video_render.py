@@ -1355,6 +1355,10 @@ def beat_windows(
     return windows
 
 
+# 合并后的字幕至少要显示这么久：短于它的边界直接并进上一句（见下）
+MIN_CAPTION_SPAN = 0.8
+
+
 def beat_windows_aligned(
     beats: list[str],
     duration: float,
@@ -1383,5 +1387,13 @@ def beat_windows_aligned(
     aligned = align_boundaries(
         boundaries, pauses, start=start, end=start + duration, spans=spans
     )
-    edges = [0.0, *[item - start for item in aligned], duration]
+    edges = [0.0]
+    for item in aligned:
+        relative = item - start
+        # 两个边界被吸到同一个停顿上时会重叠 —— 那就把这两句并成一句字幕
+        # （连续两句挤在一瞬间，看起来是闪一下，比合并难看）
+        if relative - edges[-1] < MIN_CAPTION_SPAN:
+            continue
+        edges.append(relative)
+    edges.append(duration)
     return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
