@@ -160,6 +160,88 @@ def _logo_data_uri(width: int) -> tuple[str, int, int] | None:
     return _LOGO_CACHE[width]
 
 
+# 「图外白边可以溢出卡片多少」：溢出的是**已经判定为白/近白**的那些像素，
+# 而页面本身就是白底，所以溢出的部分看不见 —— 真正要防的是某张图底色不是纯白
+# （比如 245 的浅灰页底）时露出一个淡淡的方块。给到卡片尺寸的 1/4 就够：
+# 判白阈值 242 与 255 之间只有 13 级差，肉眼在视频里看不出来。
+CARD_OVERHANG_RATIO = 0.25
+
+
+def _ink_bbox(pix: Any, *, threshold: int = 242) -> tuple[int, int, int, int] | None:
+    """图里**真正有内容**的矩形（x0, y0, x1, y1），整张全白时返回 None。
+
+    为什么需要它：论文原图大多是又宽又扁的，四周还带一大圈白（页边距、图表自身留白）。
+    原来的做法是「按整张图等比缩放到装进 896×742 的卡」——实测内容只占卡片中间一条，
+    **整帧 52% 的行是空白**，画面看着像"这一段没有配图"。
+
+    注意这里**只量、不裁**：量出包围盒之后按它来缩放和定位（见 `image_card_markup`），
+    内容一个字都不会丢，图外的白边会溢出到卡片之外 —— 而页面本来就是白底，
+    那点白边看不出来。比裁像素安全（也避开了 PyMuPDF 没有 Pixmap 裁剪构造这件事）。
+    """
+    try:
+        import pymupdf
+
+        gray = pymupdf.Pixmap(pymupdf.csGRAY, pix)
+        width, height = gray.width, gray.height
+        data = gray.samples
+        left, right, top, bottom = width, -1, height, -1
+        for y in range(height):
+            row = y * width
+            for x in range(width):
+                if data[row + x] < threshold:
+                    if x < left:
+                        left = x
+                    if x > right:
+                        right = x
+                    if y < top:
+                        top = y
+                    if y > bottom:
+                        bottom = y
+        if right < 0 or bottom < 0:
+            return None
+        return left, top, right + 1, bottom + 1
+    except Exception:  # noqa: BLE001  量不出来就用整张图，不影响出片
+        logger.warning("量墨迹包围盒失败，按整张图装填", exc_info=True)
+        return None
+
+
+def _pixmap_to_uri_at_scale(pix: Any, target_w: int, target_h: int) -> tuple[str, int, int]:
+    """把 Pixmap 缩放到**指定尺寸**再转 data URI（图片卡按内容包围盒装填时用）。"""
+    import pymupdf
+
+    try:
+        if (target_w, target_h) != (pix.width, pix.height):
+            pix = pymupdf.Pixmap(pix, max(1, target_w), max(1, target_h))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("配图缩放失败，使用原尺寸（会慢一些）：%s", exc)
+    data = pix.tobytes("png")
+    return (
+        "data:image/png;base64," + base64.b64encode(data).decode("ascii"),
+        pix.width,
+        pix.height,
+    )
+
+
+def _pixmap_to_uri(pix: Any, max_w: int, max_h: int) -> tuple[str, int, int]:
+    """Pixmap → 展示尺寸的 data URI（缩放逻辑与 `_prepare_image` 一致）。"""
+    import pymupdf
+
+    scale = min(max_w / pix.width, max_h / pix.height, 1.0)
+    if scale < 1.0:
+        try:
+            pix = pymupdf.Pixmap(
+                pix, max(int(pix.width * scale), 1), max(int(pix.height * scale), 1)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("配图缩放失败，使用原尺寸（会慢一些）：%s", exc)
+    data = pix.tobytes("png")
+    return (
+        "data:image/png;base64," + base64.b64encode(data).decode("ascii"),
+        pix.width,
+        pix.height,
+    )
+
+
 def _prepare_image(path: Path, max_w: int, max_h: int) -> tuple[str, int, int]:
     """把图缩放到展示尺寸并转成 data URI。
 
@@ -351,15 +433,53 @@ def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
       模糊的半径按卡片尺寸缩放（横版卡片更大，同一个 stdDeviation 看起来会更清楚）。
     """
     card_w, card_h = layout.image_box_w, layout.image_box_h
+    frame: tuple[float, float, float, float] | None = None
     clip_id = "coverclip"
 
     size, lines, sub_lines, block_h, panel_h = cover_title_layout(
         scene.headline, scene.caption, layout
     )
     if not lines:
+        # **按「内容包围盒」装填**（见 `_ink_bbox`）：白边不占地方，图更大、框贴着内容。
+        # 只在这一条路上做：聚光灯那层的框是相对**原图**归一化的，改了会整体错位。
+        import pymupdf
+
         data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
-        img_x = (card_w - img_w) / 2
-        img_y = (card_h - img_h) / 2
+        box = None
+        if scene.diagram is None:
+            try:
+                source = pymupdf.Pixmap(str(scene.image))
+                box = _ink_bbox(source)
+                if box:
+                    bx0, by0, bx1, by1 = box
+                    bw, bh = max(1, bx1 - bx0), max(1, by1 - by0)
+                    # 缩放按**内容**算（可超过 1.0：内容小就放大到填满卡片）。
+                    # 但要给"图外白边溢出卡片"留个上限（OVERHANG px）：判白用的阈值是 242，
+                    # 万一某张图的底不是纯白（比如 245 的浅灰页底），溢出太多就会露出边。
+                    over_w = card_w * CARD_OVERHANG_RATIO
+                    over_h = card_h * CARD_OVERHANG_RATIO
+                    scale = min(
+                        card_w / bw,
+                        card_h / bh,
+                        (card_w + over_w * 2) / source.width,
+                        (card_h + over_h * 2) / source.height,
+                        3.0,
+                    )
+                    img_w = max(1, int(round(source.width * scale)))
+                    img_h = max(1, int(round(source.height * scale)))
+                    data_uri, img_w, img_h = _pixmap_to_uri_at_scale(source, img_w, img_h)
+                    cx = (bx0 + bx1) / 2 * scale
+                    cy = (by0 + by1) / 2 * scale
+                    img_x = card_w / 2 - cx
+                    img_y = card_h / 2 - cy
+                    frame = (img_x + bx0 * scale, img_y + by0 * scale, bw * scale, bh * scale)
+                else:
+                    frame = None
+            except Exception:  # noqa: BLE001
+                box, frame = None, None
+        if not box:
+            img_x = (card_w - img_w) / 2
+            img_y = (card_h - img_h) / 2
         roles = (
             {"figure": "Paper figure", "table": "Paper table", "illustration": "Concept diagram"}
             if scene.language == "en"
@@ -376,8 +496,14 @@ def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
             )
         return "\n".join(
             [
-                f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
-                f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>',
+                (
+                    f'<rect x="{frame[0] - 2:.1f}" y="{frame[1] - 2:.1f}" '
+                    f'width="{frame[2] + 4:.1f}" height="{frame[3] + 4:.1f}" rx="8" '
+                    f'fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
+                    if frame
+                    else f'<rect x="{img_x - 2:.1f}" y="{img_y - 2:.1f}" width="{img_w + 4}" '
+                    f'height="{img_h + 4}" rx="8" fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
+                ),
                 f'<image x="{img_x:.1f}" y="{img_y:.1f}" width="{img_w}" height="{img_h}" href="{data_uri}"/>',
                 badge,
             ]

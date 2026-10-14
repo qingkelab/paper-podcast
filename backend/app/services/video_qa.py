@@ -255,7 +255,13 @@ def qa_video(
     *,
     audio_path: Path | str | None = None,
 ) -> VideoQA:
-    """跑一次完整自查。**绝不抛异常** —— 自查失败不该让出片失败。"""
+    """跑一次完整自查。**绝不抛异常** —— 自查失败不该让出片失败。
+
+    `audio_path` 只用来量**长度**（「视频长度 == 音频长度」那条不变量）。
+    **响度一律量成片本身**：成片里的音轨是过了两遍 `loudnorm` 的，和源音频不是一个数 ——
+    实测 `100dce22` 源音频 −18.1 LUFS、成片 −15.7 LUFS，量源音频就会把
+    「归一化有没有生效」这件事整个报错方向（数字好看，片子没动过一样看不出来）。
+    """
     path = Path(video_path)
     notes: list[str] = []
     if not path.exists():
@@ -265,7 +271,8 @@ def qa_video(
         notes.append("抽不到帧（ffmpeg 不可用或文件损坏），静止空档没测")
     ratios = change_ratios(frames)
     duration = probe_media_duration(path) or (len(frames) / SAMPLE_FPS)
-    loudness = measure_loudness(audio_path or path)
+    # 见 docstring：量成片，不量源音频
+    loudness = measure_loudness(path)
     if loudness is None:
         notes.append("响度测不出来（无音轨或数字静音）")
     audio_duration = None

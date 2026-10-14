@@ -6,7 +6,7 @@
 | 量什么 | 为什么它只能在成片上量 | 实现 |
 |---|---|---|
 | 画面有没有长时间不动 | 需要按时间轴抽样比对，单帧测试看不见 | `video_qa.find_static_gaps` |
-| 响度够不够 | 归一化是在 ffmpeg 里做的，**写对滤镜串 ≠ 生效** | `loudness.measure_loudness` |
+| 响度够不够 | 归一化是在 ffmpeg 里做的，**写对滤镜串 ≠ 生效** | `loudness.measure_loudness`（量**成片**，不是源音频） |
 | 音画长度差 | `-shortest` 的结果只有封装完才知道 | `video_qa.qa_video(audio_path=…)` |
 
 结果存进 `video.qa`（跟着 `VideoResult.to_dict()` 一起进库），日志里同时打一行摘要 +
@@ -55,18 +55,25 @@ cd backend && ../.venv/bin/python -m app.services.video_qa ../data/videos/<id>.m
 用两遍法的 `loudnorm` 做（`normalization_chain` 先量一遍、把 `measured_*` 填进第二遍）。
 放在这一步是因为那是唯一处理音频的地方，不用多一次转码。
 
-**实测现状（真实成片，不是推算）**：
+**实测现状（真实成片，用 `ffmpeg -af ebur128` 逐条量出来的）**：
 
-| 集 | Integrated | True peak | 峰均差 |
-|---|---|---|---|
-| 100dce22 | **-18.1 LUFS** | -1.4 dBFS | 16.6 dB |
-| 666adf5b | -18.4 LUFS | -1.4 dBFS | 16.9 dB |
-| 4e594ee2.en | 更低（RMS -22.9） | -4.1 dBFS | 18.9 dB |
+| 集 | Integrated | True peak |
+|---|---|---|
+| 100dce22 | -15.7 LUFS | -0.8 dBFS |
+| 4e594ee2 / 4e594ee2.en | -15.8 / -15.1 LUFS | -1.1 / -0.6 dBFS |
+| 全库 18 个成片 | -15.1 ~ -15.8（横版 3f4c1923 是 -18.0） | -0.6 ~ -1.5 dBFS |
+
+> 这张表 2026-10 修过一次：**原来那三行的数字（-18.1 / -18.4 / RMS -22.9）量的是源音频，
+> 不是成片**。`qa_video(audio_path=…)` 把 `audio_path` 同时当成了「量长度的参照」和
+> 「量响度的对象」，于是报告里写的 -18.1 而 MP4 实际是 -15.7 —— 差 2.4 LU，
+> 方向还正好相反：数字看着「没抬起来」，其实抬起来了；万一哪天滤镜链静默失效，
+> 报告也照样是这个数。现在 `audio_path` 只用于长度，响度一律量成片
+> （`tests/test_video_qa.py::TestLoudness::test_qa_reports_the_shipped_file_not_the_source`）。
 
 两件事值得记下来：
 
-1. **同一套流水线出来的集，响度能差 4~5 LU** —— 用户连着听两集要来回拧音量，
-   这才是归一化真正要解决的问题。
+1. **同一套流水线出来的集，响度能差 4~5 LU**（源音频；归一化之后收在 0.7 LU 以内）——
+   用户连着听两集要来回拧音量，这才是归一化真正要解决的问题。
 2. **-14 LUFS 在一部分素材上「到不了」**：100dce22 要到 -14 得加 +4.14 dB，
    而它的 true peak 已经在 -1.4 dBFS —— 加完峰值 +2.7 dBFS，必然削波。
    **这是 ffmpeg 自己的结论**：两遍法的 JSON 里 `target_offset: 1.70`、

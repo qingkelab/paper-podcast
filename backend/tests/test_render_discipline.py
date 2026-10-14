@@ -190,3 +190,119 @@ class TestNoInlineEasing:
             assert spring_kwargs(name)["overshoot"] > 0
         with pytest.raises(KeyError):  # 拼错名字要当场炸，不要静默用默认值
             spring_kwargs("slidee")
+
+
+# ---------------------------------------------------------------------------
+# 配图装填：**按内容包围盒**放图，而不是按「整张图（含它自己的白边）」
+# ---------------------------------------------------------------------------
+def _padded_figure(tmp_path: Path, box=(450, 470, 1150, 730)) -> Path:
+    """造一张「图小、白边大」的插图：1600×1200 画布，内容只占中间一小块。
+
+    论文插图大量是这种：导出时带一圈页边距/画布留白。按整张图等比缩放，
+    内容就只占卡片中间一条，整帧一半的行是空白 —— 用户报的「画面合成」问题。
+    """
+    import pymupdf
+
+    path = tmp_path / "padded.png"
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 1600, 1200), False)
+    pix.set_rect(pix.irect, (255, 255, 255))
+    pix.set_rect(pymupdf.IRect(*box), (60, 60, 60))
+    pix.save(str(path))
+    return path
+
+
+def _card_image_rect(html: str) -> tuple[float, float, float, float]:
+    match = re.search(
+        r'<image x="([-\d.]+)" y="([-\d.]+)" width="(\d+)" height="(\d+)"', html
+    )
+    assert match, "图片卡里没有 <image>"
+    x, y, w, h = match.groups()
+    return float(x), float(y), float(w), float(h)
+
+
+class TestFigureIsFittedByItsContent:
+    """「裁掉图片自身白边再装填」的验收：它是**量**出来的，不是感觉出来的。
+
+    实测（896×742 的卡）：论文里的高瘦插图 10.1% 的空白行 → 0.0%；
+    白边极大的插图 73.5% → 63.9%。宽图基本不变（它受**宽度**限制，
+    卡片再高也放不大）——那是另一件事（卡片高度跟着图的比例走），别混。
+    """
+
+    def test_white_margins_do_not_shrink_the_figure(self, tmp_path):
+        from app.services import video_render
+        from app.services.design import layout_for
+        from app.services.video_render import image_card_markup
+
+        layout = layout_for("portrait")
+        scene = _scene(tmp_path, image=_padded_figure(tmp_path), kind="figure")
+        layout_w = layout.image_box_w
+
+        x, _y, w, _h = _card_image_rect(image_card_markup(scene, layout))
+        filled = w / layout_w  # 整张图（含白边）相对卡宽的占比
+
+        real = video_render._ink_bbox
+        video_render._ink_bbox = lambda *a, **k: None  # 老行为：按整张图装填
+        try:
+            _ox, _oy, old_w, _oh = _card_image_rect(image_card_markup(scene, layout))
+        finally:
+            video_render._ink_bbox = real
+
+        assert filled > old_w / layout_w * 1.2, (
+            f"按内容装填应该明显放大（{old_w:.0f} → {w:.0f} px）；"
+            f"如果这条挂了，多半是 `_ink_bbox` 静默失败退回了 `_prepare_image`"
+        )
+
+    def test_content_never_leaves_the_card(self, tmp_path):
+        """溢出卡片的是**图外的白边**，内容一个像素都不能出去。"""
+        from app.services.design import layout_for
+        from app.services.video_render import image_card_markup
+
+        layout = layout_for("portrait")
+        box = (450, 470, 1150, 730)
+        scene = _scene(tmp_path, image=_padded_figure(tmp_path, box), kind="figure")
+        x, y, w, _h = _card_image_rect(image_card_markup(scene, layout))
+        scale = w / 1600
+        left, right = x + box[0] * scale, x + box[2] * scale
+        top, bottom = y + box[1] * scale, y + box[3] * scale
+        assert left >= -1 and top >= -1, f"内容左上角出界：({left:.1f}, {top:.1f})"
+        assert right <= layout.image_box_w + 1, f"内容右边出界：{right:.1f}"
+        assert bottom <= layout.image_box_h + 1, f"内容下边出界：{bottom:.1f}"
+
+    def test_frame_hugs_the_content_not_the_canvas(self, tmp_path):
+        """细边框贴着**内容**走：不然框里还是一大圈白，等于没改。"""
+        from app.services.design import layout_for
+        from app.services.video_render import image_card_markup
+
+        layout = layout_for("portrait")
+        box = (450, 470, 1150, 730)
+        scene = _scene(tmp_path, image=_padded_figure(tmp_path, box), kind="figure")
+        html = image_card_markup(scene, layout)
+        x, y, w, _h = _card_image_rect(html)
+        rects = [tuple(float(v) for v in m) for m in re.findall(
+            r'<rect x="([-\d.]+)" y="([-\d.]+)" width="([\d.]+)" height="([\d.]+)" rx="8" '
+            r'fill="none"',
+            html,
+        )]
+        assert rects, "图片卡里没有细边框"
+        frame_x, frame_y, frame_w, frame_h = rects[0]
+        scale = w / 1600
+        assert abs((frame_x + 2) - (x + box[0] * scale)) < 2, "框没有贴住内容左边"
+        assert abs((frame_y + 2) - (y + box[1] * scale)) < 2, "框没有贴住内容上边"
+        assert abs(frame_w - (box[2] - box[0]) * scale) < 6, "框宽不等于内容宽"
+        assert abs(frame_h - (box[3] - box[1]) * scale) < 6, "框高不等于内容高"
+
+    def test_all_white_figure_does_not_crash(self, tmp_path):
+        """整张全白的图（量不出包围盒）必须退回老路径，而不是抛异常。"""
+        import pymupdf
+
+        from app.services.design import layout_for
+        from app.services.video_render import image_card_markup
+
+        path = tmp_path / "white.png"
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 300, 300), False)
+        pix.set_rect(pix.irect, (255, 255, 255))
+        pix.save(str(path))
+        scene = _scene(tmp_path, image=path, kind="figure")
+        x, y, w, h = _card_image_rect(image_card_markup(scene, layout_for("portrait")))
+        assert w > 0 and h > 0
+        assert x >= 0 and y >= 0

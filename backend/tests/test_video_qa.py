@@ -211,3 +211,34 @@ class TestLoudness:
         assert measured is not None
         text = loudness.describe(measured)
         assert "LUFS" in text and "目标" in text
+
+    def test_qa_reports_the_shipped_file_not_the_source(self, tmp_path):
+        """自查报的响度必须是**成片**的，不是源音频的。
+
+        实测这个坑：`100dce22` 源音频 −18.1 LUFS、成片 −15.7 LUFS（差 2.4 LU）。
+        报源音频的数字，等于「归一化到底进没进 MP4」这件事根本没人看着 ——
+        滤镜链哪天写错了、静默失效，自查数字照样漂亮。
+        """
+        frame = make_png(tmp_path / "f.png", (250, 250, 250))
+        # 源音频故意做得很轻：出片会被 loudnorm 抬上去，两个数必须不一样
+        audio = make_tone(tmp_path / "t.wav", 4.0, amplitude=0.02)
+        source = loudness.measure_loudness(audio)
+        assert source is not None
+        scene = Scene(
+            start=0.0, end=4.0, image=frame, kind="figure", speaker="A", text="一句话。"
+        )
+        video = tmp_path / "out.mp4"
+        encode_video([scene], [frame], audio, video)
+
+        report = video_qa.qa_video(video, audio_path=audio)
+        assert report.loudness is not None
+        shipped = loudness.measure_loudness(video)
+        assert shipped is not None
+        assert report.loudness.integrated_lufs == pytest.approx(
+            shipped.integrated_lufs, abs=0.2
+        )
+        assert report.loudness.integrated_lufs > source.integrated_lufs + 1.0, (
+            f"自查报的还是源音频的响度（{report.loudness.integrated_lufs:.1f} LUFS）"
+        )
+        # 长度仍然对着**音频**量（那是另一条不变量：视频长度 == 音频长度）
+        assert report.audio_duration_sec == pytest.approx(4.0, abs=0.3)
