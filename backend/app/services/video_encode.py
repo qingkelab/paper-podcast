@@ -155,6 +155,10 @@ def encode_video(
     beat_focus_overlays: list[list[Path | None]] | None = None,
     waveform: bool = True,
     layout: Layout = PORTRAIT,
+    # **每一段的版式**（`design.content_layout`）：图注/强调行跟着图的下沿走。
+    # 只有「强调行的 y」会变（图片区与字幕带不动），所以这里只需要它一个数。
+    # 空列表 = 全部用 `layout`（老调用点不受影响）。
+    scene_layouts: list[Layout] | None = None,
 ) -> VideoResult:
     """把幻灯片序列和音频合成 MP4。
 
@@ -288,6 +292,13 @@ def encode_video(
                 position = counter
                 counter += 1
                 return position
+
+            # 这一段的版式：强调行跟着图的下沿走（渲染各层用的是同一个对象）
+            scene_layout = (
+                scene_layouts[index]
+                if scene_layouts and index < len(scene_layouts)
+                else layout
+            )
 
             chrome_in = add_image(slide)
             bar_in = add_image(bar_path)
@@ -498,7 +509,7 @@ def encode_video(
                 # 而 936px 的匀速位移最能看出「没有缓动」。过冲 2%（≈19px）后就地落定。
                 graph.append(
                     f"[{last}][pt{node}]overlay="
-                    f"x='-(W)+W*{ease}':y={layout.point_top}[v{node}]"
+                    f"x='-(W)+W*{ease}':y={scene_layout.point_top}[v{node}]"
                 )
                 last = f"v{node}"
 

@@ -220,6 +220,7 @@ def _layout_vars(layout: Layout) -> str:
         "image-w": layout.image_box_w,
         "image-h": layout.image_box_h,
         "caption-top": layout.caption_top,
+        "caption-size": f"{layout.caption_max_font}px",
         "caption-left": layout.subtitle_left,
         "caption-w": layout.subtitle_width,
         "subtitle-top": layout.subtitle_top,
@@ -310,7 +311,7 @@ html, body {
 .caption {
   position: absolute; top: var(--caption-top); left: var(--caption-left);
   width: var(--caption-w);
-  font-size: 18px; line-height: 23px; color: %(caption_color)s;
+  font-size: var(--caption-size, 18px); line-height: 1.28; color: %(caption_color)s;
   max-height: 46px; overflow: hidden;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
 }
@@ -566,7 +567,8 @@ def scene_page(
         # 封面页的原题已经压在玻璃面板里了，再在下面重复一遍就是两行一样的字
         # （老路径有这个重复，见 AGENTS.md 的「标题与封面」一节）
         blocks.append(
-            f'<div class="caption" {_fit_attrs(max_font=18, min_font=14, lines=2)}>'
+            f'<div class="caption" '
+            f"{_fit_attrs(max_font=layout.caption_max_font, min_font=14, lines=2)}>"
             f"{html_lib.escape(caption)}</div>"
         )
 

@@ -240,12 +240,14 @@ class TestFigureIsFittedByItsContent:
         x, _y, w, _h = _card_image_rect(image_card_markup(scene, layout))
         filled = w / layout_w  # 整张图（含白边）相对卡宽的占比
 
-        real = video_render._ink_bbox
-        video_render._ink_bbox = lambda *a, **k: None  # 老行为：按整张图装填
+        # 老行为 = 按整张图装填。**要打在缓存那一层**：`_ink_bbox_cached` 缓存过之后，
+        # 改 `_ink_bbox` 是不会生效的（第一版就是这么写出「改前=改后」的假结论的）。
+        real = video_render._ink_bbox_cached
+        video_render._ink_bbox_cached = lambda *a, **k: None
         try:
             _ox, _oy, old_w, _oh = _card_image_rect(image_card_markup(scene, layout))
         finally:
-            video_render._ink_bbox = real
+            video_render._ink_bbox_cached = real
 
         assert filled > old_w / layout_w * 1.2, (
             f"按内容装填应该明显放大（{old_w:.0f} → {w:.0f} px）；"

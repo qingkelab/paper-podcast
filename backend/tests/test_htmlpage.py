@@ -726,9 +726,13 @@ class TestFocusMorphReachesTheVideo:
             pix = pymupdf.Pixmap(str(frame))
             n, width, height = pix.n, pix.width, pix.height
             data = pix.samples
+            # 只扫**图片区**那一段：强调行滑入之后它的左侧色条是同一个蓝
+            # （`POINT_BAR` == `FOCUS_BORDER`），扫到它就会把「最早出现的蓝」量成 x=40。
+            # 强调行跟着图的下沿走了之后它会进到 0.1~0.7 这一段里，于是误判
+            # 「聚光灯没移动 176 → 40」。
             xs = [
                 x
-                for y in range(int(height * 0.1), int(height * 0.7), 2)
+                for y in range(int(height * 0.12), int(height * 0.52), 2)
                 for x in range(0, width, 2)
                 if all(abs(data[(y * width + x) * n + k] - want[k]) < 30 for k in range(3))
             ]

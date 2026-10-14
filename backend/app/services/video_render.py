@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import html
+from functools import lru_cache
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -32,6 +33,7 @@ from .design import (
     BRAND_TEXT,
     CAPTION_BAND_MAX_FONT,
     CAPTION_COLOR,
+    caption_line_height,
     CAPTION_FADE_SEC,
     CHIP_POP_BUMP_DELAY,
     CHIP_POP_FPS,
@@ -165,6 +167,19 @@ def _logo_data_uri(width: int) -> tuple[str, int, int] | None:
 # （比如 245 的浅灰页底）时露出一个淡淡的方块。给到卡片尺寸的 1/4 就够：
 # 判白阈值 242 与 255 之间只有 13 级差，肉眼在视频里看不出来。
 CARD_OVERHANG_RATIO = 0.25
+
+
+@lru_cache(maxsize=64)
+def _ink_bbox_cached(path: str, threshold: int = 242) -> tuple[int, int, int, int] | None:
+    """按**文件**缓存的墨迹包围盒：同一张图在一次出片里要量两次（渲染 + 排文字），
+    而逐像素扫一遍 962×440 要 0.4 秒、1600×1200 要 1.5 秒（纯 Python 循环）。"""
+    try:
+        import pymupdf
+
+        return _ink_bbox(pymupdf.Pixmap(path), threshold=threshold)
+    except Exception:  # noqa: BLE001
+        logger.warning("量墨迹包围盒失败（%s），按整张图装填", path, exc_info=True)
+        return None
 
 
 def _ink_bbox(pix: Any, *, threshold: int = 242) -> tuple[int, int, int, int] | None:
@@ -417,6 +432,98 @@ def render_chrome(
     )
 
 
+@dataclass(frozen=True)
+class FittedFigure:
+    """一张配图在卡片里**装填之后**的结果（渲染与排版共用同一份，不各算一遍）。"""
+
+    data_uri: str
+    img_w: int
+    img_h: int
+    x: float
+    y: float
+    frame: tuple[float, float, float, float] | None  # 内容包围盒在卡内的位置（无则 None）
+    ink_h: int      # **内容**在卡内的高度：排图注时要的「图片下沿」就按它算
+    ink_w: int
+
+
+def fitted_figure_height(scene: Scene, layout: Any = None) -> int | None:
+    """这一段的图在卡片里实际能占多高；算不出来（封面/图解/读图失败）返回 None。
+
+    「文字层跟着图走」（`design.content_layout`）要的就是这个数 ——
+    它必须是**真正画出来的那一张卡**用的数，所以两边都走 `_fit_figure`。
+    """
+    if scene.diagram is not None or scene.brand == "outro" or (scene.headline or "").strip():
+        return None
+    try:
+        return _fit_figure(scene, layout or PORTRAIT).ink_h
+    except Exception:  # noqa: BLE001
+        logger.warning("量图片装填高度失败（%s），文字层按老位置摆", scene.image, exc_info=True)
+        return None
+
+
+def _fit_figure(scene: Scene, layout: Any) -> FittedFigure:
+    """把配图按**内容包围盒**装进卡片，返回 data URI 与落点。
+
+    两种模式：
+    - **普通配图**（论文原图/表格/概念示意）：量出「有墨」的矩形，按它算缩放与落点，
+      图外的白边溢出到卡片之外（页面本来就是白底，看不见）。不裁像素：裁错会丢内容，
+      溢出最多是不好看。溢出上限 `CARD_OVERHANG_RATIO`，防某张图底色不是纯白时露出方块。
+    - **图解/封面**（`scene.diagram` / `scene.headline`）：走原来的等比装填，一个字都不改。
+
+    `ink_w/ink_h` 是**内容**在卡内占的尺寸 —— 图注就是贴着它的下沿摆的。
+    """
+    card_w, card_h = layout.image_box_w, layout.image_box_h
+    data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
+    frame: tuple[float, float, float, float] | None = None
+    if scene.diagram is None and not (scene.headline or "").strip():
+        box = _ink_bbox_cached(str(scene.image))
+        if box:
+            bx0, by0, bx1, by1 = box
+            bw, bh = max(1, bx1 - bx0), max(1, by1 - by0)
+            try:
+                import pymupdf
+
+                source = pymupdf.Pixmap(str(scene.image))
+                over_w = card_w * CARD_OVERHANG_RATIO
+                over_h = card_h * CARD_OVERHANG_RATIO
+                scale = min(
+                    card_w / bw,
+                    card_h / bh,
+                    (card_w + over_w * 2) / source.width,
+                    (card_h + over_h * 2) / source.height,
+                    3.0,
+                )
+                img_w = max(1, int(round(source.width * scale)))
+                img_h = max(1, int(round(source.height * scale)))
+                data_uri, img_w, img_h = _pixmap_to_uri_at_scale(source, img_w, img_h)
+                img_x = card_w / 2 - (bx0 + bx1) / 2 * scale
+                img_y = card_h / 2 - (by0 + by1) / 2 * scale
+                frame = (img_x + bx0 * scale, img_y + by0 * scale, bw * scale, bh * scale)
+                return FittedFigure(
+                    data_uri=data_uri,
+                    img_w=img_w,
+                    img_h=img_h,
+                    x=img_x,
+                    y=img_y,
+                    frame=frame,
+                    ink_h=max(1, int(round(bh * scale))),
+                    ink_w=max(1, int(round(bw * scale))),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("按内容装填失败（%s），退回等比装填", scene.image, exc_info=True)
+                data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
+    return FittedFigure(
+        data_uri=data_uri,
+        img_w=img_w,
+        img_h=img_h,
+        x=(card_w - img_w) / 2,
+        y=(card_h - img_h) / 2,
+        frame=frame,
+        ink_h=img_h,
+        ink_w=img_w,
+    )
+
+
 def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
     """图片卡那一层的 SVG 内容，**坐标以图片区左上角为原点**。
 
@@ -440,46 +547,10 @@ def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
         scene.headline, scene.caption, layout
     )
     if not lines:
-        # **按「内容包围盒」装填**（见 `_ink_bbox`）：白边不占地方，图更大、框贴着内容。
-        # 只在这一条路上做：聚光灯那层的框是相对**原图**归一化的，改了会整体错位。
-        import pymupdf
-
-        data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
-        box = None
-        if scene.diagram is None:
-            try:
-                source = pymupdf.Pixmap(str(scene.image))
-                box = _ink_bbox(source)
-                if box:
-                    bx0, by0, bx1, by1 = box
-                    bw, bh = max(1, bx1 - bx0), max(1, by1 - by0)
-                    # 缩放按**内容**算（可超过 1.0：内容小就放大到填满卡片）。
-                    # 但要给"图外白边溢出卡片"留个上限（OVERHANG px）：判白用的阈值是 242，
-                    # 万一某张图的底不是纯白（比如 245 的浅灰页底），溢出太多就会露出边。
-                    over_w = card_w * CARD_OVERHANG_RATIO
-                    over_h = card_h * CARD_OVERHANG_RATIO
-                    scale = min(
-                        card_w / bw,
-                        card_h / bh,
-                        (card_w + over_w * 2) / source.width,
-                        (card_h + over_h * 2) / source.height,
-                        3.0,
-                    )
-                    img_w = max(1, int(round(source.width * scale)))
-                    img_h = max(1, int(round(source.height * scale)))
-                    data_uri, img_w, img_h = _pixmap_to_uri_at_scale(source, img_w, img_h)
-                    cx = (bx0 + bx1) / 2 * scale
-                    cy = (by0 + by1) / 2 * scale
-                    img_x = card_w / 2 - cx
-                    img_y = card_h / 2 - cy
-                    frame = (img_x + bx0 * scale, img_y + by0 * scale, bw * scale, bh * scale)
-                else:
-                    frame = None
-            except Exception:  # noqa: BLE001
-                box, frame = None, None
-        if not box:
-            img_x = (card_w - img_w) / 2
-            img_y = (card_h - img_h) / 2
+        # 图片层：按「内容包围盒」装填 —— 计算在 `_fit_figure` 里，和排文字用的是同一份
+        fit = _fit_figure(scene, layout)
+        data_uri, img_w, img_h = fit.data_uri, fit.img_w, fit.img_h
+        img_x, img_y, frame = fit.x, fit.y, fit.frame
         roles = (
             {"figure": "Paper figure", "table": "Paper table", "illustration": "Concept diagram"}
             if scene.language == "en"
@@ -497,7 +568,9 @@ def image_card_markup(scene: Scene, layout: Layout = PORTRAIT) -> str:
         return "\n".join(
             [
                 (
-                    f'<rect x="{frame[0] - 2:.1f}" y="{frame[1] - 2:.1f}" '
+                    # 框要**留在画布内**：图可以溢出卡片（溢出的是它的白边），但框一旦被画到
+                    # 画布外就会被裁掉一条边 —— 那就不是「贴着内容的细框」，是缺边的框。
+                    f'<rect x="{max(2.0, frame[0] - 2):.1f}" y="{max(2.0, frame[1] - 2):.1f}" '
                     f'width="{frame[2] + 4:.1f}" height="{frame[3] + 4:.1f}" rx="8" '
                     f'fill="none" stroke="{FRAME_STROKE}" stroke-width="1.5"/>'
                     if frame
@@ -642,11 +715,15 @@ def _render_slide_layers(
 
     # 图注
     if scene.caption:
-        caption_lines = _wrap(scene.caption, layout.subtitle_width / 18)[:2]
+        # 字号跟着 layout 走：宽图让出来的竖空间会把图注放大一档（见 `design.content_layout`）
+        caption_size = layout.caption_max_font
+        caption_lines = _wrap(scene.caption, layout.subtitle_width / caption_size)[:2]
+        caption_lh = caption_line_height(caption_size)
         for offset, line in enumerate(caption_lines):
+            baseline = layout.caption_top + round(caption_size * 1.22) + offset * caption_lh
             parts.append(
-                f'<text x="{layout.subtitle_left}" y="{layout.caption_top + 22 + offset * 23}" '
-                f'font-family="{FONT_STACK}" font-size="18" fill="{CAPTION_COLOR}">'
+                f'<text x="{layout.subtitle_left}" y="{baseline}" '
+                f'font-family="{FONT_STACK}" font-size="{caption_size}" fill="{CAPTION_COLOR}">'
                 f"{html.escape(line)}</text>"
             )
 

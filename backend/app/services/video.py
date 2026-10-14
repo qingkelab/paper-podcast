@@ -67,6 +67,7 @@ from .design import *  # noqa: F401,F403
 # 这些名字同时是**对外门面**：老调用点（含 tests 里那 60 多个 import）继续写
 # `from app.services.video import encode_video` 就行，一个字都不用改。
 # 新代码请直接用上面对应的模块（类型 → video_core，画面 → video_render，ffmpeg → video_encode）。
+from .design import content_layout
 from .design import DIAGRAM_FALLBACK_HOLD
 from .design import ENABLE_CLAUSE_REVEAL
 from .video_core import (
@@ -95,6 +96,7 @@ from .video_render import (  # noqa: F401
     _prepare_image,
     _rasterize_custom,
     _render_slide_layers,
+    fitted_figure_height,
     _wrap,
     beat_windows,
     beat_windows_aligned,
@@ -1308,10 +1310,33 @@ class RenderedLayers:
     # 与逐句卡分开：状态数由内容决定（几个节点就几步），与字幕句数无关。
     diagram_states: list[list[tuple[Path, float]]] = field(default_factory=list)
     beat_focuses: list[list[Path | None]] = field(default_factory=list)
+    # 每一段的**版式**：图注/强调行跟着图的下沿走（`design.content_layout`）。
+    # 渲染各层用它、编码叠层也用它 —— 「跟着图走」只有一个来源。
+    # 空列表 = 全部用传入的基准版式（老调用点不受影响）。
+    layouts: list[Any] = field(default_factory=list)
     endcard_count: int = 0
     beat_count: int = 0
     chip_count: int = 0
     backend: str = "svg"
+
+
+def _scene_layout(scene: Scene, layout: Layout) -> Layout:
+    """这一段的版式：**图注与强调行跟着图的下沿走**（`design.content_layout`）。
+
+    图片卡本身不动 —— 动的只有它下面的两行字。这样：
+    - 高瘦的图（铺满卡片）**逐字段不变**，老片子重合成一模一样；
+    - 宽图（只占卡片中间一条）图注从「卡片底边下 6px」挪到「图下沿下 `FIGURE_CAPTION_GAP`」，
+      不再出现「图在上面、说明在一百多像素之外」；
+    - 图注跟着放大一档（18 → 22px）：反正那块竖空间也没别的用处，字大一点更好读。
+
+    返回的版式会同时交给**渲染各层**和**编码叠层**，两边必须是同一个数。
+    """
+    return content_layout(
+        layout,
+        fitted_figure_height(scene, layout),
+        has_caption=bool((scene.caption or "").strip()),
+        has_point=bool((scene.point or "").strip()),
+    )
 
 
 def _render_scene_layers(
@@ -1346,6 +1371,9 @@ def _render_scene_layers(
         if session is not None:
             result.backend = "html"
         for index, scene in enumerate(scenes):
+            # 这一段的版式：图注/强调行跟着**图的下沿**走（宽图让出来的竖空间不用钉在卡片底边）
+            lay = _scene_layout(scene, layout)
+            result.layouts.append(lay)
             slide_path = work_dir / f"slide-{index:04d}.png"
             beats = split_caption_beats(scene.text)
             bands: list[CaptionBand] = []
@@ -1358,7 +1386,7 @@ def _render_scene_layers(
                     scene,
                     index=index,
                     work_dir=work_dir,
-                    layout=layout,
+                    layout=lay,
                     assets=assets,
                     pauses=pauses,
                     session=session,
@@ -1383,7 +1411,7 @@ def _render_scene_layers(
                 )
                 focus_path = work_dir / f"beat-focus-{index:04d}-{beat_index}.png"
                 _render_focus_layer(
-                    focus_scene, focus_path, focus=focus, layout=layout, session=session
+                    focus_scene, focus_path, focus=focus, layout=lay, session=session
                 )
                 beat_focus_paths.append(focus_path)
                 result.focus_paths.append(focus_path)
@@ -1397,7 +1425,7 @@ def _render_scene_layers(
                 # 片尾用品牌卡（深色 + logo + 关注引导），正文用普通白底页。
                 # 品牌卡上的字是大号引导语，不参与「字幕逐句出现」——那会把它切碎。
                 # 它整页都是牌子，没有「图片层」，转场用 to_card（上一整页淡出）代替。
-                _render_endcard_layer(scene, slide_path, layout=layout, session=session)
+                _render_endcard_layer(scene, slide_path, layout=lay, session=session)
                 result.diagram_states.append([])
                 result.endcard_count += 1
             else:
@@ -1408,13 +1436,13 @@ def _render_scene_layers(
                     slide_path,
                     include_subtitle=len(beats) <= 1,
                     include_point=False,
-                    layout=layout,
+                    layout=lay,
                     session=session,
                 )
                 card_path = work_dir / f"card-{index:04d}.png"
                 if scene.diagram is not None:
                     # 图解镜头：状态 0 是「标题 + 第一个节点」，后面的状态按时间点叠上去
-                    _render_diagram_card(scene, card_path, layout=layout, session=session)
+                    _render_diagram_card(scene, card_path, layout=lay, session=session)
                     from .diagram import (
                         render_diagram_state_html,
                         shot_state_count,
@@ -1436,7 +1464,7 @@ def _render_scene_layers(
                         render_diagram_state_html(
                             scene.diagram,
                             state_path,
-                            layout=layout,
+                            layout=lay,
                             state=state,
                             session=session,
                         )
@@ -1449,14 +1477,14 @@ def _render_scene_layers(
                     # 这里 `NameError`，而它被 `_compose_video_safely` 兜住 →
                     # 用户看到的又是「音频有、视频没有」。
                     fallback = _diagram_fallback_card(
-                        scene, assets or {}, layout=layout, session=session
+                        scene, assets or {}, layout=lay, session=session
                     )
                     if fallback is not None and states:
                         tail = max(0.0, scene.duration - DIAGRAM_FALLBACK_HOLD)
                         states.append((fallback, round(max(states[-1][1] + 0.6, tail), 2)))
                     result.diagram_states.append(states)
                 else:
-                    _render_card_layer(scene, card_path, layout=layout, session=session)
+                    _render_card_layer(scene, card_path, layout=lay, session=session)
                 result.card_paths.append(card_path)
                 if len(beats) > 1:
                     # 小句时间表和编码侧用的是**同一个** `beat_windows_aligned`
@@ -1486,7 +1514,7 @@ def _render_scene_layers(
                         _render_band_layer(
                             beat,
                             band_path,
-                            layout=layout,
+                            layout=lay,
                             session=session,
                             chip=not has_chip,
                             # 有显露计划时，第 0 张只显示第 0 个小句
@@ -1500,7 +1528,7 @@ def _render_scene_layers(
                             _render_band_layer(
                                 beat,
                                 reveal_path,
-                                layout=layout,
+                                layout=lay,
                                 session=session,
                                 chip=not has_chip,
                                 hidden_from=hidden_from,
@@ -1547,7 +1575,7 @@ def _render_scene_layers(
                         scene.focus,
                         origin,
                         index=index,
-                        layout=layout,
+                        layout=lay,
                         work_dir=work_dir,
                         session=session,
                     )
@@ -1561,7 +1589,7 @@ def _render_scene_layers(
                         scene,
                         focus_path,
                         focus=scene.focus,
-                        layout=layout,
+                        layout=lay,
                         session=session,
                     )
                     result.focus_rows.append(focus_path)
@@ -1572,7 +1600,7 @@ def _render_scene_layers(
 
             if scene.point and scene.brand != "outro":
                 point_path = work_dir / f"point-{index:04d}.png"
-                _render_point_layer(scene.point, point_path, layout=layout, session=session)
+                _render_point_layer(scene.point, point_path, layout=lay, session=session)
                 result.point_rows.append(point_path)
                 result.point_paths.append(point_path)
             else:
@@ -2130,6 +2158,8 @@ def compose_video(
         diagram_states=layers.diagram_states,
         beat_focus_overlays=layers.beat_focuses,
         layout=layout,
+        # 每段自己的版式：图注/强调行跟着图的下沿走（渲染用的是同一份，见 `_scene_layout`）
+        scene_layouts=layers.layouts,
     )
     result.assignment = strategy
     result.renderer = layers.backend

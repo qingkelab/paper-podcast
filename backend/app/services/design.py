@@ -69,13 +69,18 @@ class Layout:
     waveform_width: int
     # 图片区之外、字幕带之上那块空间的高矮（强调行要摆进去，横竖版差很多）
     landscape: bool = False
+    # 图注最多多大（跟着图走的时候，宽图让出来的竖空间可以给它一点，见 `content_layout`）
+    caption_max_font: int = 18
 PORTRAIT = Layout(
     width=936,
     height=1210,
     title_baseline=46,
     image_top=74,
-    image_box_left=20,
-    image_box_w=896,
+    # 卡宽从 896 放到 920（左右各留 8px）：论文里的图大多是**宽**的，宽度就是它的上限 ——
+    # 实测 962×440 的图装进 896 宽的卡只能画到 400px 高，卡片里还剩 342px 是空。
+    # 把画幅宽度用满（936 的画幅、920 的卡）是唯一能让宽图变大的杠杆，多这 24px 就多 2.7%。
+    image_box_left=12,
+    image_box_w=912,
     image_box_h=742,
     caption_top=822,
     subtitle_top=968,
@@ -98,8 +103,8 @@ LANDSCAPE = Layout(
     height=1080,
     title_baseline=60,
     image_top=92,
-    image_box_left=64,
-    image_box_w=1792,
+    image_box_left=56,
+    image_box_w=1808,
     image_box_h=560,
     caption_top=660,
     subtitle_top=828,
@@ -117,6 +122,94 @@ LANDSCAPE = Layout(
     waveform_width=1792,
     landscape=True,
 )
+# ---------------------------------------------------------------------------
+# 文字层跟着图走：图注紧贴图片下沿，而不是钉死在卡片的底边上
+# ---------------------------------------------------------------------------
+#
+# **为什么非得跟着图走**：图片区是固定的 896×742，而论文插图大多是宽的 ——
+# 一张 962×440 的图装进去只占中间 410px 高，图片实际下沿在 y≈658，
+# 而图注钉在 y=822。于是「图注」离它描述的那张图 **164px**，中间一大片白 ——
+# 观众看到的是「图在上面、说明在下面很远的地方」，而不是一张带说明的图。
+# 高瘦的图（铺满卡片）看不出这个问题，所以只在宽图上暴露。
+#
+# 做法：图片卡**原地不动**，只把图注（和强调行）往上挪到图的下沿 +
+# `FIGURE_CAPTION_GAP`。文字紧贴图片之后，卡片里让出来的那块空间变成
+# 一整块干净的留白（在文字下方），而不是「图与说明之间」的一道缝。
+FIGURE_CAPTION_GAP = 26      # 图片下沿 → 图注顶部的间距
+FIGURE_POINT_GAP = 22        # 图注底部 → 强调行顶部的间距
+FIGURE_POINT_MIN_TOP = 0     # 强调行不允许被顶到画布外面
+CAPTION_LINE_RATIO = 1.28    # 图注行高 = 字号 × 这个（18px 档就是 23px，和老的硬编码一致）
+
+
+def caption_line_height(size: int) -> int:
+    """图注行高。字号跟着版式变（18 → 22），行高也得跟着走 —— 不然 22px 的字挤在 23px 行里。"""
+    return int(round(size * CAPTION_LINE_RATIO))
+
+
+CAPTION_LINE_H = caption_line_height(18)   # 老名字，18px 那一档
+CAPTION_MAX_LINES = 2        # 图注最多两行（和 `_render_slide_layers` 的取值一致）
+CAPTION_FONT_STEP = 4        # 有富余时图注可以放大的档位
+
+
+def content_layout(
+    layout: Layout,
+    figure_h: int | None,
+    *,
+    has_caption: bool,
+    has_point: bool,
+) -> Layout:
+    """把图注/强调行挪到「图片下沿之下」，其余不动。`figure_h=None` 时原样返回。
+
+    `figure_h` 是**装填之后**图片在卡片里实际占的高度（`video_render.fitted_figure_height`
+    量的，和真正画出来的那一张卡用的是同一段计算）。返回一个新的 `Layout`，
+    各层渲染与编码都按它摆位 —— 所以「跟着图走」这件事只有一个来源。
+
+    不变量（有测试盯着）：
+    - 图注/强调行**只会往上挪**，绝不会挡住图片、也不会跑到 `subtitle_top` 以下；
+    - 卡片铺满时（`figure_h >= image_box_h`）返回值与入参**逐字段相同** ——
+      老片子重合成必须一模一样；
+    - 挪出来的多余空间只给图注放大，最多 `CAPTION_FONT_STEP` 一档。
+    """
+    if figure_h is None:
+        return layout
+    figure_h = max(1, min(int(figure_h), layout.image_box_h))
+    slack = layout.image_box_h - figure_h
+    if slack <= 0:
+        # 图铺满卡片：图注本来就在它下面，一个字都不用动
+        return layout
+
+    # ⚠️ 图片在卡片里是**居中**的（`video_render._fit_figure` 把内容包围盒居中到卡上），
+    # 所以内容下沿不是 `image_top + figure_h`，而是 `image_top + (卡高 + 内容高) / 2`。
+    # 第一版就是按前者算的：宽图的图注被摆到了 y=500，**直接压在图上**（实测渲染出来
+    # 图注墨迹落在 500~559，而图占 245~645）。量一次像素就当场暴露。
+    figure_bottom = layout.image_top + (layout.image_box_h + figure_h) // 2
+    caption_top = figure_bottom + FIGURE_CAPTION_GAP
+    if caption_top >= layout.caption_top:
+        return layout  # 挪不动（图很高）——保持原样，绝不往下推
+    caption_font = layout.caption_max_font
+    if has_caption and slack >= FIGURE_CAPTION_GAP + CAPTION_LINE_H * 2:
+        caption_font = layout.caption_max_font + CAPTION_FONT_STEP
+    caption_h = CAPTION_LINE_H if not has_caption else caption_line_height(caption_font)
+
+    point_top = caption_top + caption_h + FIGURE_POINT_GAP
+    if not has_point:
+        point_top = layout.point_top
+    elif point_top + layout.point_height > layout.subtitle_top - 8:
+        # 放不下就退回原位（宁可留在老位置，也不要压到字幕带上）
+        point_top = layout.point_top
+        caption_top = min(caption_top, point_top - FIGURE_POINT_GAP - caption_h)
+    point_top = max(FIGURE_POINT_MIN_TOP, point_top)
+
+    from dataclasses import replace
+
+    return replace(
+        layout,
+        caption_top=caption_top,
+        point_top=point_top,
+        caption_max_font=caption_font,
+    )
+
+
 def layout_for(orientation: str | None) -> Layout:
     """按朝向取版式；认不出的取值一律当竖版（老数据的默认）。"""
     return LANDSCAPE if (orientation or "").lower() in ("landscape", "horizontal", "16:9") else PORTRAIT
