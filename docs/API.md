@@ -107,15 +107,27 @@
   "versions": {                  // 按语言索引；没有的版本不出现
     "zh": {
       "language": "zh",
-      "script": { "segments": [...], "word_count": 1146, "est_duration_sec": 190 },
+      // length_repair：字数兜底的台账（哪一版多少字、是否接受）。模型写超预算时
+      // 第二遍会**带着上一版的真实结果**去压（见 `prompts/repair.py`），这份记录
+      // 就是「那一次到底怎么压的」。没有发生过兜底时不出现这个键。
+      "script": { "segments": [...], "word_count": 1146, "est_duration_sec": 190,
+                  "length_repair": { "attempts": [
+                    { "attempt": 1, "before": 1572, "after": 1400, "target": 1050,
+                      "budget": 1207, "accepted": false },
+                    { "attempt": 2, "before": 1400, "after": 1150, "target": 1050,
+                      "budget": 1207, "accepted": true } ] } },
       "analysis": { /* 同 §1 的 Analysis，该语言版本 */ },
       "paper_meta": { /* 同 §1；标题作者本身多为英文，两版通常一致 */ },
       "illustration": { /* 同 §1；png_url / svg_url 都带该语言的 ?lang= */ },
       "audio_url": "/api/episodes/xxx/audio?v=1712345678-2304806",
       "audio_duration_sec": 191.69,
       "audio_bytes": 2304806,
+      // video.diagram_report：图解镜头的台账（提了几条、核验删了什么、带原因再问一次
+      // 救回几条）。没有图解镜头时是 null。
       "video": { "url": "/api/episodes/xxx/video?v=...", "duration_sec": 191.69,
-                 "scene_count": 21, "bytes": 4700000, "stale": false }
+                 "scene_count": 21, "bytes": 4700000, "stale": false,
+                 "diagram_report": { "drafts": 6, "kept": [7, 11, 13], "partial": [],
+                                     "rejected": [], "repair": { "called": false } } }
     },
     "en": {
       "language": "en",

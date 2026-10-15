@@ -214,26 +214,77 @@ class LLMClient:
         actual = script.get("word_count", 0)
 
         if actual > target * LENGTH_TRIM_THRESHOLD:
-            # **最多两次**：第一次常常只压到「预算附近但还超一点」，第二次带上下文再压一次。
-            # 仍然不行就保留原稿（宁可比目标长，也不要因为压缩丢内容）—— 但两条出口都带数字。
+            # **最多两次**，而且第二次要**带着第一次的真实结果**去（不是重来一遍）。
+            #
+            # 改之前是这样：两次都拿**原稿**去压，第二次只多一句「这次必须砍到 X 字」。
+            # 模型看不到上一次砍到多少、哪几段几乎没动，于是经常把同样那几段再砍一遍 ——
+            # 实测两集就是 1572 字（目标 1050，150%）原地打转。
+            # 现在：① 上一版**更短就用它当下一次的原稿**（不把已砍掉的部分还回去）；
+            # ② 把「上一版多少字、还多多少、每段砍了多少」一起喂进去。
+            current = script
+            previous: dict[str, Any] | None = None
+            attempts: list[dict[str, Any]] = []
             for attempt in (1, 2):
+                detail: dict[str, Any] = {}
                 trimmed = self._trim_script(
-                    script,
+                    current,
                     target=target,
                     speech_rate=speech_rate,
                     padding_sec=padding_sec,
                     language=language,
                     attempt=attempt,
+                    previous=previous,
+                    detail=detail,
                 )
-                if trimmed.get("word_count", actual) <= target * LENGTH_TRIM_THRESHOLD:
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "before": detail.get("before"),
+                        "after": detail.get("after"),
+                        "target": target,
+                        "budget": int(target * LENGTH_TRIM_THRESHOLD),
+                        "accepted": bool(detail.get("accepted")),
+                    }
+                )
+                if detail.get("accepted"):
+                    trimmed["length_repair"] = {"attempts": attempts}
                     return trimmed
+                candidate = detail.get("candidate")
+                if candidate is not None:
+                    # 这一版虽然还超预算，但确实更短了 → 拿它当下一次的原稿
+                    current = candidate
+                    previous = {
+                        "chars": detail.get("after"),
+                        "base_chars": detail.get("before"),
+                        "base_segments": current.get("segments", []),
+                    }
                 if attempt == 2:
+                    best = detail.get("after")
+                    if candidate is not None and best is not None and best < actual:
+                        logger.warning(
+                            "两次精简都没压进预算（%d → %d 字，目标 %d，预算上限 %d），"
+                            "沿用**更短的那一版**（比原稿短 %d 字）",
+                            actual,
+                            best,
+                            target,
+                            int(target * LENGTH_TRIM_THRESHOLD),
+                            actual - best,
+                        )
+                        candidate["length_repair"] = {
+                            "attempts": attempts,
+                            "still_over_budget": True,
+                        }
+                        return candidate
                     logger.warning(
                         "两次精简都没压进预算（%d 字，目标 %d，预算上限 %d），沿用原脚本",
                         trimmed.get("word_count", actual),
                         target,
                         int(target * LENGTH_TRIM_THRESHOLD),
                     )
+                    trimmed["length_repair"] = {
+                        "attempts": attempts,
+                        "still_over_budget": True,
+                    }
                     return trimmed
             return script
 
@@ -295,11 +346,19 @@ class LLMClient:
         padding_sec: float = 0.0,
         language: str = "zh",
         attempt: int = 1,
+        previous: dict[str, Any] | None = None,
+        detail: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """脚本超长时压缩一次。
 
-        与扩写对称：只做一次、失败就保留原稿。超长比偏短危害小，
+        与扩写对称：只做一次、失败就保留原稿（返回值）。超长比偏短危害小，
         所以宁可保留原稿（听众多听一会儿）也不要因为压缩丢掉关键信息。
+
+        `previous` 是**上一次精简的真实结果**（`chars` / `base_chars` / `base_segments`），
+        会作为修复线索进 prompt —— 见 `prompts.repair.trim_feedback_lines`。
+        `detail` 是出参：把这一轮的 before/after/是否采纳、以及**被拒的那一版稿子**
+        （`candidate`）交回调用方 —— 「压不到预算」不等于「白压」，下一轮就从那一版继续，
+        而不是把已经砍掉的部分还回去重来。
         """
         actual = script.get("word_count", 0)
         logger.info(
@@ -317,17 +376,24 @@ class LLMClient:
                     target=target,
                     language=language,
                     attempt=attempt,
+                    previous=previous,
                 ),
                 max_tokens=8000,
                 temperature=0.4,  # 压缩要稳，不要发挥
             )
         except LLMError as exc:
             logger.warning("精简失败，沿用原脚本：%s", exc)
+            if detail is not None:
+                detail.update({"attempt": attempt, "before": actual, "error": str(exc)[:120], "accepted": False})
             return script
 
         trimmed_segments = _normalize_segments(data.get("segments"))
         if len(trimmed_segments) < 4:
             logger.warning("精简结果无效（%d 段），沿用原脚本", len(trimmed_segments))
+            if detail is not None:
+                detail.update(
+                    {"attempt": attempt, "before": actual, "error": f"精简结果只有 {len(trimmed_segments)} 段", "accepted": False}
+                )
             return script
 
         trimmed = build_script_payload(
@@ -342,6 +408,17 @@ class LLMClient:
         # 原来要求「至少减 3%」，这是个坏判据：模型一次没压到 1050、只压到 1200 时，
         # 那个结果**已经在预算内**（1200 ≤ 1050×1.15），却因为「减得不够 3%」被整份丢掉，
         # 白付一次调用、还留着 1572 字的原稿。实测有两集正是 1572 字 / 目标 1050（150%）。
+        if detail is not None:
+            detail.update(
+                {
+                    "attempt": attempt,
+                    "before": actual,
+                    "after": trimmed["word_count"],
+                    "target": target,
+                    "budget": int(target * LENGTH_TRIM_THRESHOLD),
+                }
+            )
+
         budget = target * LENGTH_TRIM_THRESHOLD
         if trimmed["word_count"] > budget:
             logger.warning(
@@ -351,8 +428,14 @@ class LLMClient:
                 target,
                 int(budget),
             )
+            if detail is not None:
+                # 被拒**但确实更短**的那一版：下一轮从它继续压，别把砍掉的还回去
+                detail["candidate"] = trimmed
+                detail["accepted"] = False
             return script
         reduction = (actual - trimmed["word_count"]) / max(actual, 1)
+        if detail is not None:
+            detail["accepted"] = True
         logger.info(
             "精简接受：%d → %d 字（目标 %d，预算上限 %d，减了 %.1f%%）",
             actual,
@@ -371,6 +454,8 @@ class LLMClient:
                 target,
                 int(LENGTH_REPAIR_THRESHOLD * 100),
             )
+            if detail is not None:
+                detail["accepted"] = False        # 压过头了，不能当下一轮的底稿
             return script
 
         logger.info("精简完成：%d → %d 字（目标 %d 字）", actual, trimmed["word_count"], target)

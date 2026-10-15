@@ -483,6 +483,10 @@ class VideoResult:
     # 这三件事只有成片里才看得出来（分层测试能证明「会动」，证明不了「有 10 秒没动」），
     # 所以合成完顺手量一次存下来 —— 光打日志的话，回头看某集「当时是什么水平」就查不到了。
     qa: dict = field(default_factory=dict)
+    # **图解镜头的台账**：提议了几条、核验把哪几条/哪几项删了（带原因）、
+    # 「带原因再问一次」救回来几条。存它的理由和 `why` 一样 —— 只写日志等于没人看得见，
+    # 而「这一集为什么没有图解」正是事后最常要回答的问题。
+    diagram_report: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -498,4 +502,5 @@ class VideoResult:
             "renderer": self.renderer,
             "title_pending": self.title_pending,
             "qa": self.qa,
+            "diagram_report": self.diagram_report or None,
         }

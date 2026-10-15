@@ -1024,3 +1024,113 @@ class TestTrimAcceptsAnythingWithinBudget:
         )
         assert "第二次精简" not in first[1]["content"]
         assert "第二次精简" in second[1]["content"]
+
+
+class TestRetryCarriesTheRealFailure:
+    """第二次精简要**带着第一次的真实结果**去，而不是把原稿再压一遍。
+
+    实测的那两集是 1572 字 / 目标 1050（150%）：两次都拿原稿去压、第二次只多一句
+    「这次必须砍到 1050」，模型看不到上一次砍到多少、哪几段几乎没动，
+    于是原地打转。参考做法（Fibona agent）里最硬的一条就是**修复的输入是真实错误**，
+    不是「再试一次」——这一组测试盯的就是这件事。
+    """
+
+    class _LLM:
+        def __init__(self, word_counts):
+            self.word_counts = list(word_counts)
+            self.calls: list[list[dict]] = []
+
+        def _chat_json(self, messages, *, max_tokens, temperature=0.6):
+            self.calls.append(messages)
+            count = self.word_counts[min(len(self.calls) - 1, len(self.word_counts) - 1)]
+            text = "字" * max(1, count // 6)
+            return {"segments": [{"speaker": "A", "text": text} for _ in range(6)]}
+
+    def _client(self, word_counts):
+        from app.services.llm import LLMClient
+
+        client = LLMClient.__new__(LLMClient)
+        client.settings = None
+        llm = self._LLM(word_counts)
+        client._chat_json = llm._chat_json  # type: ignore[method-assign]
+        return client, llm
+
+    def _script(self, chars: int) -> dict:
+        text = "字" * max(1, chars // 6)
+        return {"segments": [{"speaker": "A", "text": text} for _ in range(6)], "word_count": chars}
+
+    def test_second_attempt_gets_the_first_result_as_its_base(self):
+        """第二次的原稿必须是**第一次压出来的那一版**，不是 1572 字那份原稿。"""
+        target = 1050
+        client, llm = self._client([1400, 1100])       # 第一次压到 1400（超预算），第二次压到 1100
+        script = self._script(1572)
+        trimmed = client._trim_script(
+            script, target=target, speech_rate=0, language="zh", attempt=1
+        )
+        assert trimmed is script, "第一次超预算时返回值仍是原稿（老行为不变）"
+
+        detail: dict = {}
+        client._trim_script(
+            self._script(1400), target=target, speech_rate=0, language="zh",
+            attempt=2, previous={"chars": 1400, "base_chars": 1572}, detail=detail,
+        )
+        prompt = llm.calls[-1][1]["content"]
+        assert "【上一版的结果】" in prompt, prompt[-400:]
+        assert "1572" in prompt and "1400" in prompt, "修复提示里要有真实的两个数字"
+
+    def test_the_retry_prompt_lists_what_the_last_pass_actually_cut(self):
+        """带上去的必须是**具体到段**的线索：哪几段砍得最少（那才是要动的地方）。"""
+        from app.services.prompts.repair import build_trim_messages
+
+        base = [{"speaker": "A", "text": "字" * 60}, {"speaker": "B", "text": "字" * 40}]
+        current = [{"speaker": "A", "text": "字" * 58}, {"speaker": "B", "text": "字" * 20}]
+        prompt = build_trim_messages(
+            current, current_chars=78, target=60, attempt=2,
+            previous={"chars": 78, "base_chars": 100, "base_segments": base},
+        )[1]["content"]
+        assert "第 1 段" in prompt and "砍了 2 字" in prompt
+        assert prompt.index("第 1 段") < prompt.index("第 2 段"), "砍得最少的要排在前面"
+
+    def test_no_previous_means_the_prompt_is_unchanged(self):
+        """没给 `previous` 时（第一次精简）不能多出那一块 —— 老调用点一字不变。"""
+        from app.services.prompts.repair import build_trim_messages
+
+        first = build_trim_messages(
+            [{"speaker": "A", "text": "x"}], current_chars=1572, target=1050
+        )[1]["content"]
+        assert "【上一版的结果】" not in first
+
+    def test_the_trim_loop_keeps_the_shorter_version_when_both_attempts_miss(self):
+        """两次都没压进预算，但第二版明显更短 → **留更短的那一版**，不是退回原稿。
+
+        原来两条出口都返回原稿：「压不到 1050」就把 1572 → 1250 的成果一起丢掉，
+        只因为 1250 > 预算 1207。可它已经比原稿短 322 字、离目标 19%。
+        """
+        from app.services import prompts
+        from app.services.llm import LLMClient
+
+        target = prompts.target_chars(3, 350)      # 和被测代码同一个口径
+        original = int(target * 1.5)
+        client, _ = self._client([int(target * 1.32), int(target * 1.18)])
+        result = client._repair_length_if_needed(
+            self._script(original), analysis={}, duration_min=3, level="intro", speech_rate=350,
+        )
+        assert result["word_count"] < original, result["word_count"]
+        assert result.get("length_repair", {}).get("still_over_budget") is True
+        assert len(result["length_repair"]["attempts"]) == 2
+
+    def test_the_ledger_is_recorded_even_when_it_succeeds(self):
+        """成功也要留下台账（几次、每版多少字）—— 只写日志等于没人看得见。"""
+        from app.services import prompts
+        from app.services.llm import LLMClient
+
+        target = prompts.target_chars(3, 350)
+        client, _ = self._client([int(target * 1.32), int(target * 0.95)])
+        result = client._repair_length_if_needed(
+            self._script(int(target * 1.5)), analysis={}, duration_min=3,
+            level="intro", speech_rate=350,
+        )
+        ledger = result.get("length_repair")
+        assert ledger and ledger["attempts"], ledger
+        assert ledger["attempts"][0]["accepted"] is False
+        assert ledger["attempts"][-1]["accepted"] is True

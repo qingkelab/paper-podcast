@@ -3560,6 +3560,21 @@ class TestCoverTitlePendingRebuild:
                               bytes_written=1, assignment="reused").to_dict()
         assert payload["title_pending"] is False
 
+    def test_diagram_report_reaches_the_payload(self, tmp_path):
+        """图解台账要进 `video_json`（`diagram_report`）：只打日志的话，
+        「这一集为什么一个图解都没有」事后查不到 —— 空台账写成 None，不占地方。
+        """
+        from app.services.video import VideoResult
+
+        blank = VideoResult(video_path=tmp_path / "x.mp4", duration_sec=1.0, scene_count=1,
+                            bytes_written=1, assignment="reused").to_dict()
+        assert blank["diagram_report"] is None
+
+        filled = VideoResult(video_path=tmp_path / "x.mp4", duration_sec=1.0, scene_count=1,
+                             bytes_written=1, assignment="reused")
+        filled.diagram_report = {"drafts": 6, "kept": [1, 2], "partial": [], "rejected": []}
+        assert filled.to_dict()["diagram_report"]["kept"] == [1, 2]
+
 
 # --------------------------------------------------------------------------
 # 逐句配图：配图粒度从「段」降到「句」（设计见 docs/BEAT_MOTION.md）

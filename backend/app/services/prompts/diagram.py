@@ -32,6 +32,7 @@ __all__ = [
     "DIAGRAM_SYSTEM",
     "DIAGRAM_KINDS",
     "build_diagram_messages",
+    "build_diagram_repair_note",
     "normalize_diagram_shots",
 ]
 
@@ -85,6 +86,34 @@ DIAGRAM_SYSTEM = """你在给一个「论文解读视频」设计**动态图解�
 """
 
 
+def build_diagram_repair_note(repair: dict) -> str:
+    """把「上一次哪些条目没通过核验、为什么」写成给模型的修复线索。
+
+    参考做法（Fibona agent）里最硬的一条规矩：**修复的输入是真实的错误，不是「再试一次」**。
+    我们这边的错误是机器给的、逐条带原文的 —— `verify_shot` 会写下
+    「节点「Gemini-3-Pro 标注」查不到依据」这种句子，正好可以直接喂回去。
+
+    没有它的代价是具体的：核验不过的镜头原来**整条被丢掉**（退回论文原图），
+    而模型根本不知道自己写的哪个数字不在材料里 —— 下一次提还是同样的写法。
+    """
+    shots = list(repair.get("shots") or [])
+    if not shots:
+        return ""
+    lines = ["", "【上一次的草案里，下面这些条目没有通过机器核验】**这一次只需要重提这几条**："]
+    for item in shots:
+        reasons = "；".join(str(reason) for reason in (item.get("dropped") or [])) or "整条镜头未通过"
+        title = str(item.get("title") or "")[:24]
+        lines.append(
+            f"- 第 {item.get('segment')} 段「{title}」（{item.get('kind') or 'flow'}）：{reasons}"
+        )
+    lines.append(
+        "这些条目要么改成**材料里原样出现过的**说法（数字、术语一个字都不要自己改），"
+        "要么直接删掉那一条 —— 不要凑整、不要推算、不要换一个相近的数字。"
+        "已经通过核验的镜头不要重写，段落编号必须和上面一致。"
+    )
+    return "\n".join(lines)
+
+
 def build_diagram_messages(
     *,
     segments: Sequence[dict[str, Any]],
@@ -95,6 +124,7 @@ def build_diagram_messages(
     max_shots: int = DIAGRAM_MAX_SHOTS,
     language: str = "zh",
     timings: Sequence[Any] = (),
+    repair: dict | None = None,
 ) -> list[dict[str, str]]:
     """构造草案请求。
 
@@ -132,6 +162,7 @@ def build_diagram_messages(
         + "\n\n【可用图 id（`fallback_image` 只能填这里的）】\n"
         + (images_block or "（没有）")
         + f"\n\n请挑最值得画的段落，最多 {max_shots} 个镜头，按严格 JSON 输出。"
+        + (build_diagram_repair_note(repair) if repair else "")
     )
     return [
         {"role": "system", "content": DIAGRAM_SYSTEM % {"max_shots": max_shots}},

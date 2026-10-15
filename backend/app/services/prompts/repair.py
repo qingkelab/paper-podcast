@@ -9,6 +9,7 @@ __all__ = [
     "build_expand_messages",
     "TRIM_SYSTEM",
     "build_trim_messages",
+    "trim_feedback_lines",
 ]
 
 
@@ -85,6 +86,57 @@ TRIM_SYSTEM = """你是播客剪辑师，正在把一版偏长的稿子压到目
 每段 30-120 字，禁止 Markdown。"""
 
 
+def _unit(text: str, language: str) -> int:
+    """字数单位：中文数符，英文数词（和 `build_script_payload` 同一套口径）。"""
+    return len(text.split()) if language == "en" else len(text)
+
+
+def trim_feedback_lines(
+    current: list[dict],
+    *,
+    base: list[dict] | None = None,
+    language: str = "zh",
+    limit: int = 6,
+) -> list[str]:
+    """「上一版每段砍了多少」/「这一版最长的是这几段」——**具体到段**的精简线索。
+
+    为什么要有这个：第二次精简原来只是加一句「这次必须砍掉 X 字」。模型看的是**原稿**，
+    它不知道上一次哪几段没动，于是往往把同样那几段再砍一遍（或者整篇重写一遍、
+    字数还是差不多）。带上去的数据分两种：
+
+    - 上一版和原稿段数一致 → 逐段差值，**砍得最少的排前面**（那才是要动的地方）；
+    - 段数变了（模型重排过）→ 退一步给出这一版**最长的几段**，也是同一件事的近似。
+
+    两边都是确定性的（不靠模型判断），所以可以断言。
+    """
+    if not current:
+        return []
+    counts = [_unit(str(seg.get("text") or ""), language) for seg in current]
+    if base and len(base) == len(current):
+        deltas = [
+            _unit(str(base[index].get("text") or ""), language) - counts[index]
+            for index in range(len(current))
+        ]
+        order = sorted(range(len(current)), key=lambda index: (deltas[index], -counts[index]))
+        head = "【上一版每一段砍了多少】（砍得最少的在前面 —— 这些才是这次要动的地方）"
+        rows = [
+            f"第 {index + 1} 段（{current[index].get('speaker') or 'A'}）："
+            f"{_unit(str(base[index].get('text') or ''), language)} → {counts[index]} 字"
+            f"（砍了 {deltas[index]} 字）"
+            for index in order[:limit]
+        ]
+        return [head, *rows]
+
+    order = sorted(range(len(current)), key=lambda index: -counts[index])
+    head = "【这一版最长的几段】（篇幅就是砍的空间，优先从这里下手）"
+    rows = [
+        f"第 {index + 1} 段（{current[index].get('speaker') or 'A'}）：{counts[index]} 字，"
+        f"开头是「{str(current[index].get('text') or '')[:16]}…」"
+        for index in order[:limit]
+    ]
+    return [head, *rows]
+
+
 def build_trim_messages(
     segments: list[dict],
     *,
@@ -92,6 +144,7 @@ def build_trim_messages(
     target: int,
     language: str = "zh",
     attempt: int = 1,
+    previous: dict | None = None,
 ) -> list[dict[str, str]]:
     script_text = "\n".join(
         f"主播{'A' if seg.get('speaker') == 'A' else 'B'}：{seg.get('text', '')}"
@@ -105,9 +158,26 @@ def build_trim_messages(
         if attempt >= 2
         else ""
     )
+    # **修复要带真实的错误**，不是只说一句「再来一次」：上一版砍到多少、还差多少、
+    # 哪几段几乎没动 —— 这些数字才算「上一次为什么没成功」。
+    feedback = ""
+    if previous:
+        lines = trim_feedback_lines(
+            segments, base=previous.get("base_segments"), language=language
+        )
+        was = previous.get("chars")
+        base_chars = previous.get("base_chars")
+        still_over = max(current_chars - int(target * 1.15), 0)
+        head = (
+            f"\n【上一版的结果】上一版已经是 {was} 字"
+            + (f"（原稿 {base_chars} 字）" if base_chars else "")
+            + f"，仍比预算上限（{int(target * 1.15)} 字）多 {still_over} 字 —— "
+            "**那一次的精简判定为失败**。这次请把差额补齐。"
+        )
+        feedback = "\n" + head + ("\n" + "\n".join(lines) if lines else "")
     user = f"""下面这版播客脚本共 {current_chars} 字，目标长度是 {target} 字左右，\
 需要精简掉约 {excess} 字（相当于砍掉 {ratio}%）。这个缩减量是硬指标，
-请务必达到；如果只减掉几个字，这次精简就是失败的。{retry_note}
+请务必达到；如果只减掉几个字，这次精简就是失败的。{retry_note}{feedback}
 
 【当前脚本】
 {script_text}

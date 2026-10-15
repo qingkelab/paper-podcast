@@ -538,3 +538,108 @@ class TestFallbackCardRenders:
             text="一句话。", diagram=shot,
         )
         assert _diagram_fallback_card(scene, {}, layout=PORTRAIT, session=None) is None
+
+
+class _RepairingLLM:
+    """第一次回一份**核验不过**的草案，第二次回一份能过的 —— 用来量「带原因再问一次」。"""
+
+    mock = False
+
+    def __init__(self, first, second):
+        self.first, self.second = first, second
+        self.calls: list[list[dict]] = []
+
+    def _chat_json(self, messages, *, max_tokens: int, temperature: float = 0.6):
+        self.calls.append(messages)
+        return self.first if len(self.calls) == 1 else self.second
+
+
+class TestRejectedDraftsAreRepairedWithTheRealReason:
+    """核验不过的镜头要**带着机器的具体原因再问一次**，而不是整条丢掉。
+
+    参考做法（Fibona agent）里最硬的一条：修复的输入是真实错误。
+    我们这边的错误本来就有原文 —— 「指标「999兆」查不到依据」这种句子直接喂回去，
+    模型才知道自己哪个数字不在材料里（原来它只知道「没过」）。
+    """
+
+    @staticmethod
+    def _evidence():
+        return ["6 比特下状态内存压缩了 5 倍多，Qwen 从 144 兆降到 28 兆左右。"]
+
+    @staticmethod
+    def _good_metric():
+        # 标题与指标名都是**纯中文**，所以要凑够 2 个二字片段命中：
+        # 「状态内存压缩」→ 状态 / 内存 / 压缩 三个都在这句话里（见 `diagram._supported`）
+        return {
+            "segment": 1, "kind": "metric", "title": "状态内存压缩", "source": "第 1 段",
+            "metrics": [{"value": "144", "unit": "兆", "label": "状态内存", "source": "第 1 段"}],
+        }
+
+    @staticmethod
+    def _bad_metric():
+        return {
+            "segment": 1, "kind": "metric", "title": "状态内存压缩", "source": "第 1 段",
+            "metrics": [{"value": "999", "unit": "兆", "label": "状态内存", "source": "第 1 段"}],
+        }
+
+    @staticmethod
+    def _bad_flow(segment=0):
+        return {
+            "segment": segment, "kind": "flow", "title": "凭空的两步流程", "source": "第 0 段",
+            "nodes": [
+                {"id": "a", "label": "编造的节点", "source": "第 0 段"},
+                {"id": "b", "label": "另一个编造", "source": "第 0 段"},
+            ],
+        }
+
+    def _run(self, first, second, evidence=None):
+        from app.services.video import assign_diagram_shots
+
+        llm = _RepairingLLM(first, second)
+        report: dict = {}
+        shots = assign_diagram_shots(
+            segments=_segments(), timings=_timings(),
+            evidence=evidence if evidence is not None else self._evidence(),
+            llm=llm, report=report,
+        )
+        return shots, report, llm
+
+    def test_a_rejected_shot_is_retried_with_the_reason_in_the_prompt(self):
+        shots, report, llm = self._run(
+            {"shots": [self._bad_metric()]}, {"shots": [self._good_metric()]}
+        )
+        assert len(llm.calls) == 2, "第一次不过就该再问一次"
+        prompt = llm.calls[1][1]["content"]
+        assert "999" in prompt, "修复提示里要有被拒的原话"
+        assert "查不到依据" in prompt, "要有机器给的具体原因"
+        assert report["repair"]["called"] is True
+        assert report["repair"]["fixed"] == [1]
+        assert 1 in shots, "救回来的镜头要真的用上"
+
+    def test_the_repair_prompt_does_not_rewrite_what_already_passed(self):
+        first = {"shots": [self._good_metric(), self._bad_flow()]}
+        shots, report, llm = self._run(first, {"shots": []})
+        assert report["repair"]["attempted"] == [0], "只重提被作废的那一条"
+        assert "已经通过核验的镜头不要重写" in llm.calls[1][1]["content"]
+        assert 1 in shots, "通过的那条不受修复影响"
+
+    def test_no_rejected_shot_means_no_second_call(self):
+        shots, report, llm = self._run({"shots": [self._good_metric()]}, {"shots": []})
+        assert len(llm.calls) == 1, "没有作废的镜头就不该多花一次调用"
+        assert report["repair"]["called"] is False
+        assert report["kept"] == [1]
+
+    def test_a_shot_that_loses_one_item_is_kept_and_recorded(self):
+        """只删掉一项、镜头还能立住的：照用，但**台账里要留下删了什么、为什么**。"""
+        partial = {
+            "segment": 1, "kind": "flow", "title": "状态内存压缩", "source": "第 1 段",
+            "nodes": [
+                {"id": "a", "label": "状态内存压缩", "source": "第 1 段"},
+                {"id": "b", "label": "Qwen 模型", "source": "第 1 段"},
+                {"id": "c", "label": "编造的第三块", "source": "第 1 段"},
+            ],
+        }
+        shots, report, _ = self._run({"shots": [partial]}, {"shots": []})
+        assert 1 in shots
+        assert report["partial"], report
+        assert "编造的第三块" in str(report["partial"]), report["partial"]

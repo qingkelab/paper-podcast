@@ -280,6 +280,41 @@ def summary_candidates(segments: list[dict[str, Any]]) -> list[int]:
     return []
 
 
+def _verify_diagram_drafts(
+    shots: list[tuple[int, Any]], *, evidence: list[str]
+) -> tuple[dict[int, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """逐条核验草案：返回（通过的镜头、**部分被删**的、整条作废的）。
+
+    三种结果都要分开 —— 它们后面要做的事不一样：通过的照用；部分被删的按删完的结果用
+    （**核验就是安全网，删掉是对的**），但要记进报告让人看得见；整条作废的才值得**再问一次**。
+    """
+    from .diagram import verify_shot
+
+    kept: dict[int, Any] = {}
+    partial: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for segment_index, shot in shots:
+        result = verify_shot(shot, evidence=evidence)
+        if result.ok:
+            kept[segment_index] = result.shot
+            if result.dropped:
+                partial.append(
+                    {"segment": segment_index, "title": shot.title, "dropped": list(result.dropped)}
+                )
+            logger.info("图解镜头：第 %d 段「%s」（%s）", segment_index, shot.title, shot.kind)
+        else:
+            rejected.append(
+                {
+                    "segment": segment_index,
+                    "title": shot.title,
+                    "kind": shot.kind,
+                    "dropped": list(result.dropped),
+                }
+            )
+            logger.info("图解镜头作废：第 %d 段 %s", segment_index, result.summary())
+    return kept, partial, rejected
+
+
 def assign_diagram_shots(
     *,
     segments: list[dict[str, Any]],
@@ -289,52 +324,106 @@ def assign_diagram_shots(
     available_images: list[tuple[str, str]] | None = None,
     max_shots: int | None = None,
     language: str = "zh",
+    report: dict[str, Any] | None = None,
 ) -> dict[int, Any]:
-    """调模型提草案 → 归一化 → **逐条核验** → 返回 `{段号: DiagramShot}`。
+    """调模型提草案 → 归一化 → **逐条核验** →（核验不过的）**带原因再问一次** → 返回镜头表。
 
     核验不过的条目会被丢掉；剩下不足两个节点的镜头整条作废（不返回）——
     这样一来「无依据的内容不渲染，退回现有画面流程」是**默认行为**，不是异常分支。
+
+    **第二轮修复**（`report["repair"]`）：整条作废的镜头会带**机器给出的具体原因**
+    再问一次模型（「节点「Gemini-3-Pro 标注」查不到依据」这种原文），只重提那几条、
+    不复述已经通过的。参考做法里最硬的一条就是「修复的输入是真实错误」——
+    原来只知道「这条没过」，模型下一次还是同样的写法。
+
+    `report` 是出参（会被填上）：几次草案、通过几条、**哪几条被删了/被删掉了什么**、
+    修复又救回来几条。存进 `video.diagram_report` —— 只打日志的话，
+    「这一集为什么没有图解」事后查不到。
     """
-    from .diagram import verify_shot
     from .design import DIAGRAM_MAX_SHOTS
     from .prompts.diagram import build_diagram_messages, normalize_diagram_shots
 
+    def record(**fields: Any) -> None:
+        if report is not None:
+            report.update(fields)
+
     if llm is None or getattr(llm, "mock", True):
+        record(skipped="没有可用的模型")
         return {}
     candidates = diagram_candidates(segments, timings)
     if not candidates:
+        record(skipped="没有够长的候选段")
         return {}
     max_shots = DIAGRAM_MAX_SHOTS if max_shots is None else max_shots
-    messages = build_diagram_messages(
-        segments=segments,
-        evidence=evidence,
-        available_images=available_images or [],
-        candidates=candidates,
-        summary_candidates=summary_candidates(segments),
-        max_shots=max_shots,
-        language=language,
-        timings=timings,
+    summary = summary_candidates(segments)
+    valid_images = [item[0] for item in (available_images or [])]
+
+    def draft(repair: dict | None) -> list[tuple[int, Any]]:
+        messages = build_diagram_messages(
+            segments=segments,
+            evidence=evidence,
+            available_images=available_images or [],
+            candidates=candidates,
+            summary_candidates=summary,
+            max_shots=max_shots,
+            language=language,
+            timings=timings,
+            repair=repair,
+        )
+        # ⚠️ 签名要和 `LLMClient._chat_json(messages, *, max_tokens, temperature)` 对齐：
+        # 我第一版按别的调用点写了 `what=`/`retries=`，结果**每次生成都在视频合成这一步炸**
+        # （被 `_compose_video_safely` 兜住 → 用户看到的是「音频有、视频没有」）。
+        # 而且模型调用失败**不该拖垮出片**：图解只是锦上添花，问不到就当没有。
+        try:
+            raw = llm._chat_json(messages, max_tokens=1600, temperature=0.3) or {}
+        except Exception:  # noqa: BLE001  —— 拿不到草案就退回原画面，别让出片失败
+            logger.warning("图解镜头草案生成失败，本集不画图解（其余画面不受影响）", exc_info=True)
+            return []
+        return normalize_diagram_shots(raw, max_shots=max_shots, valid_images=valid_images)
+
+    shots = draft(None)
+    out, partial, rejected = _verify_diagram_drafts(shots, evidence=evidence)
+    repair_record: dict[str, Any] = {"called": False}
+    if rejected:
+        # 只问一次、只问被作废的那几条（已经通过的镜头一个字都不重写）
+        repair_record["called"] = True
+        fixed: list[int] = []
+        still: list[dict[str, Any]] = []
+        repaired = draft({"shots": rejected})
+        candidates_repair = [
+            (index, shot) for index, shot in repaired if index in {item["segment"] for item in rejected}
+        ]
+        repaired_kept, repaired_partial, repaired_rejected = _verify_diagram_drafts(
+            candidates_repair, evidence=evidence
+        )
+        out.update(repaired_kept)
+        partial.extend(repaired_partial)
+        fixed.extend(sorted(repaired_kept))
+        still.extend(repaired_rejected)
+        repair_record.update(
+            {
+                "attempted": [item["segment"] for item in rejected],
+                "fixed": fixed,
+                "still_rejected": [{"segment": item["segment"], "dropped": item["dropped"]} for item in still],
+            }
+        )
+        logger.info(
+            "图解镜头修复：问了 %d 条，救回 %d 条（%s）",
+            len(rejected),
+            len(fixed),
+            "、".join(f"第 {i} 段" for i in fixed) or "无",
+        )
+    record(
+        drafts=len(shots),
+        kept=sorted(out),
+        partial=partial,
+        rejected=[
+            {"segment": item["segment"], "title": item["title"], "dropped": item["dropped"]}
+            for item in rejected
+            if item["segment"] not in out
+        ],
+        repair=repair_record,
     )
-    # ⚠️ 签名要和 `LLMClient._chat_json(messages, *, max_tokens, temperature)` 对齐：
-    # 我第一版按别的调用点写了 `what=`/`retries=`，结果**每次生成都在视频合成这一步炸**
-    # （被 `_compose_video_safely` 兜住 → 用户看到的是「音频有、视频没有」）。
-    # 而且模型调用失败**不该拖垮出片**：图解只是锦上添花，问不到就当没有。
-    try:
-        raw = llm._chat_json(messages, max_tokens=1600, temperature=0.3) or {}
-    except Exception:  # noqa: BLE001  —— 拿不到草案就退回原画面，别让出片失败
-        logger.warning("图解镜头草案生成失败，本集不画图解（其余画面不受影响）", exc_info=True)
-        return {}
-    shots = normalize_diagram_shots(
-        raw, max_shots=max_shots, valid_images=[item[0] for item in (available_images or [])]
-    )
-    out: dict[int, Any] = {}
-    for segment_index, shot in shots:
-        result = verify_shot(shot, evidence=evidence)
-        if result.ok:
-            out[segment_index] = result.shot
-            logger.info("图解镜头：第 %d 段「%s」（%s）", segment_index, shot.title, shot.kind)
-        else:
-            logger.info("图解镜头作废：第 %d 段 %s", segment_index, result.summary())
     return out
 
 
@@ -1961,6 +2050,8 @@ def compose_video(
     # 图解镜头：**重建时复用**（规矩同 point/hook：重建不该换画面，也不该再花一次调用）。
     # 只有「没有 preset」（= 第一次生成）时才可能去问模型。
     diagram_shots: dict[int, Any] = {}
+    # 「这一集为什么有/没有图解」的台账：存进 `video.diagram_report`（只打日志是查不到的）
+    diagram_report: dict[str, Any] = {}
     if preset_scenes:
         for entry in preset_scenes:
             index = entry.get("index")
@@ -1978,6 +2069,7 @@ def compose_video(
             available_images=[
                 (asset_id, str(asset.caption or "")) for asset_id, asset in pool.items()
             ],
+            report=diagram_report,
         )
 
     if (
@@ -2202,6 +2294,10 @@ def compose_video(
         fallback_id=default_id,
     )
     result.qa["visual_plan"] = visual_summary
+    # 「图解镜头这一集的台账」：提了几条、哪几条被核验删了些什么、修复救回几条。
+    # 只打日志的话，「这一集为什么一个图解都没有」事后查不到（`diagram_report` 进 video_json）。
+    if diagram_report:
+        result.diagram_report = diagram_report
     logger.info(
         "画面质量概览：论文图表 %.0f%%，生成示意 %.0f%%，子图聚焦 %.0f%%，配图理由 %.0f%%",
         100 * sum(

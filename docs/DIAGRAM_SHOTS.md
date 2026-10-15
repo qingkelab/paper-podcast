@@ -134,3 +134,44 @@ video_encode(diagram_states=…) / video_render     # 按时间点叠加状态�
   并写明收尾段优先提 summary。
 - 测试：`TestSummaryShotsAreChosenByPosition` 五条（位置判定、没有片尾就没有、
   收尾段始终进候选、太短的收尾段仍然丢掉、prompt 里确实标了）。
+
+## 核验不过的镜头：带着**机器的具体原因**再问一次
+
+原来核验不过就只有一个动作 —— 整条镜头作废、退回论文原图，**写日志**。
+问题是模型根本不知道自己写的哪个数字不在材料里，下一次提还是同样的写法；
+而人回头看「这一集怎么一个图解都没有」时，日志早就滚没了。
+
+现在分两种处理（`video._verify_diagram_drafts` + `assign_diagram_shots`）：
+
+| 核验结果 | 处理 |
+|---|---|
+| 有条目被删、镜头还立得住 | **照用**（删就是对的安全动作），但记进台账：删了哪一项、为什么 |
+| 整条作废 | **带原因再问一次**（只一次、只重提被作废的那几条） |
+
+修复提示长这样（`prompts/diagram.build_diagram_repair_note`，逐字来自 `verify_shot`）：
+
+```
+【上一次的草案里，下面这些条目没有通过机器核验】**这一次只需要重提这几条**：
+- 第 12 段「三类评分项」（flow）：指标「999兆」查不到依据；节点「…」查不到依据
+这些条目要么改成**材料里原样出现过的**说法（数字、术语一个字都不要自己改），
+要么直接删掉那一条 —— 不要凑整、不要推算、不要换一个相近的数字。
+已经通过核验的镜头不要重写，段落编号必须和上面一致。
+```
+
+这条来自参考做法（[Fibona agent](https://github.com/FibonaAI/fibona-agent)）里最硬的一条规矩：
+**修复的输入是真实的错误，不是「再试一次」**（它的宿主在 cell 抛异常时，
+会把失败的代码和错误一起交给模型重写）。我们的错误本来就是机器逐条生成的，
+比它的还干净 —— 直接喂回去就行。
+
+台账存进 `video.diagram_report`（`video_json` 里，空的时候是 `null`）：
+
+```json
+{"drafts": 6, "kept": [7, 11, 13],
+ "partial": [{"segment": 11, "title": "三类评分项", "dropped": ["节点「…」查不到依据"]}],
+ "rejected": [{"segment": 19, "title": "…", "dropped": ["标题无依据 → 整条镜头放弃"]}],
+ "repair": {"called": true, "attempted": [19], "fixed": [19], "still_rejected": []}}
+```
+
+测试：`tests/test_diagram.py::TestRejectedDraftsAreRepairedWithTheRealReason` 四条
+（被拒的要带原话与原因重问、已通过的不重写、没有作废就不多花一次调用、
+只删一项时照用并记账）。
