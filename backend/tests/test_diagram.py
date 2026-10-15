@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from app.services import diagram as DG
+from app.services.llm_parse import LLMError
 from app.services.design import LANDSCAPE, PORTRAIT
 from app.services.video_core import (
     DiagramLink,
@@ -821,3 +822,63 @@ class TestTheShotSurvivesARebuild:
         from app.services.video_core import diagram_shot_from_dict
 
         assert diagram_shot_from_dict(entry["diagram"]).kind == "metric"
+
+
+class TestATruncatedDraftIsRetriedWithTheReason:
+    """草案被截断（输出不是合法 JSON）时要**带着这个真实错误**再问一次。
+
+    实测踩过：一集 41 段、模型一口气提 6 个带节点/连线/指标的镜头，`max_tokens=1600`
+    把 JSON 从中间截断 → `parse_json_response` 报「不是合法 JSON」→ 兜底 `except`
+    直接返回 `{}` → **整集一个图解都没有**，而日志里只有一条 warning。
+    """
+
+    class _TruncatingLLM:
+        mock = False
+
+        def __init__(self, good):
+            self.good = good
+            self.calls: list[list[dict]] = []
+
+        def _chat_json(self, messages, *, max_tokens: int, temperature: float = 0.6):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                raise LLMError("模型输出不是合法 JSON：{ \"shots\": [ { \"segment\": 3,")
+            return self.good
+
+    def test_the_second_call_says_the_output_was_truncated(self):
+        from app.services.llm_parse import LLMError  # noqa: F401  (本测试要用它构造错误)
+        from app.services.video import assign_diagram_shots
+
+        good = {
+            "shots": [
+                {
+                    "segment": 1, "kind": "metric", "title": "状态内存压缩",
+                    "title_source": "脚本原句：状态内存压缩了 5 倍多",
+                    "metrics": [{"label": "状态内存压缩", "value": 5, "unit": " 倍",
+                                 "source": "脚本原句：状态内存压缩了 5 倍多"}],
+                }
+            ]
+        }
+        llm = self._TruncatingLLM(good)
+        shots = assign_diagram_shots(
+            segments=_segments(), timings=_timings(),
+            evidence=["状态内存压缩了 5 倍多。"], llm=llm,
+        )
+        assert len(llm.calls) == 2, "截断后应当再问一次"
+        assert "被截断" in llm.calls[1][1]["content"]
+        assert "只提最重要的 3 个镜头" in llm.calls[1][1]["content"]
+        assert 1 in shots, "第二次拿到的草案要用上"
+
+    def test_it_gives_up_after_the_retry(self):
+        """第二次还是不行就退回原画面 —— 不许无限重试。"""
+        from app.services.video import assign_diagram_shots
+
+        llm = self._TruncatingLLM({"shots": []})
+        llm._chat_json = lambda messages, *, max_tokens, temperature=0.6: (_ for _ in ()).throw(
+            LLMError("还是坏的")
+        )
+        report: dict = {}
+        assert assign_diagram_shots(
+            segments=_segments(), timings=_timings(), evidence=["状态内存压缩了 5 倍多。"],
+            llm=llm, report=report,
+        ) == {}

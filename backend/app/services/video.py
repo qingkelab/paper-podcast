@@ -358,7 +358,12 @@ def assign_diagram_shots(
     summary = summary_candidates(segments)
     valid_images = [item[0] for item in (available_images or [])]
 
-    def draft(repair: dict | None) -> list[tuple[int, Any]]:
+    # 一次草案最多要几个 token：`1600` 实测会**被截断**（6 个镜头、每个带节点/连线/指标，
+    # 输出跑到一半 JSON 就断了 → `parse_json_response` 报「不是合法 JSON」→ 整集没有图解）。
+    # 这里给宽一点，并且截断/解析失败时**带着真实错误再问一次**（见下面 `draft(..., truncated=True)`）。
+    draft_tokens = 3000
+
+    def draft(repair: dict | None, *, truncated: bool = False) -> list[tuple[int, Any]]:
         messages = build_diagram_messages(
             segments=segments,
             evidence=evidence,
@@ -374,9 +379,24 @@ def assign_diagram_shots(
         # 我第一版按别的调用点写了 `what=`/`retries=`，结果**每次生成都在视频合成这一步炸**
         # （被 `_compose_video_safely` 兜住 → 用户看到的是「音频有、视频没有」）。
         # 而且模型调用失败**不该拖垮出片**：图解只是锦上添花，问不到就当没有。
+        if truncated:
+            # **修复的输入是真实错误**：告诉它上次输出被截断了，这次少提几个、提短的
+            messages = [
+                messages[0],
+                {
+                    "role": "user",
+                    "content": messages[1]["content"]
+                    + "\n\n【上一次的输出被截断了（不是合法 JSON，没法解析）】"
+                    "这次请**只提最重要的 3 个镜头**，每个镜头的节点/指标/要点各不超过 3 条，"
+                    "标题不超过 12 个字，务必输出**完整合法**的 JSON。",
+                },
+            ]
         try:
-            raw = llm._chat_json(messages, max_tokens=1600, temperature=0.3) or {}
+            raw = llm._chat_json(messages, max_tokens=draft_tokens, temperature=0.3) or {}
         except Exception:  # noqa: BLE001  —— 拿不到草案就退回原画面，别让出片失败
+            if not truncated:
+                logger.warning("图解镜头草案生成失败，带原因再问一次（其余画面不受影响）")
+                return draft(repair, truncated=True)
             logger.warning("图解镜头草案生成失败，本集不画图解（其余画面不受影响）", exc_info=True)
             return []
         return normalize_diagram_shots(raw, max_shots=max_shots, valid_images=valid_images)
