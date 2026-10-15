@@ -135,6 +135,40 @@ video_encode(diagram_states=…) / video_render     # 按时间点叠加状态�
 - 测试：`TestSummaryShotsAreChosenByPosition` 五条（位置判定、没有片尾就没有、
   收尾段始终进候选、太短的收尾段仍然丢掉、prompt 里确实标了）。
 
+## 两条「静默错位」：行数必须与段数 1:1，镜头必须写回 `video.scenes`
+
+**先说症状**（用户原话：「生成的视频，第二个画面有问题，而且又会跳回到封面」）：
+成片里**第 2 段**（本该是封面那几帧）突然被一张图解盖住，下一段又回到封面，
+看起来像「画面自己跳了一下又跳回来」。
+
+根因在渲染循环的这一处不对称：
+
+```python
+if scene.brand == "outro":      result.diagram_states.append([])     # 片尾 → 占一行
+elif scene.diagram is not None: result.diagram_states.append(states) # 有图解 → 占一行
+else:                           _render_card_layer(...)             # 没有图解 → **没占行**
+```
+
+编码侧是按**段号**取的（`diagram_rows[index]`），少一行就**整体错位**：
+这一集本来属于第 11 段的图解，被叠到了**第 1 段**上。图解的后续状态是
+「按句子的时间点淡入 + 上升」（`enable='gte(t,at)'`，`at` 是**段内相对时刻**），
+所以它在第 1 段的第 3.2 秒才冒出来 —— 正好是用户看到的那个「第二个画面有问题」。
+
+两处都修了：
+
+1. **渲染侧**：没有图解的段也 `append([])`，行数与段数永远 1:1；
+2. **编码侧**：`len(diagram_rows) != len(scenes)` 时**不叠图解并报警**（
+   `video_encode.encode_video`）—— 错位这种事不该静默发生。
+
+**第二条错位是数据层的**：写 `result.scenes` 的那段**没有把图解写进去**
+（`build_scenes` 会读 `preset_scenes[i]["diagram"]`，却没人写）。后果是每次
+「重新合成」都**静默丢掉图解** —— 少的不是几张图，而是「重新合成不该换画面」这条保证。
+现在写进 `video.scenes[i].diagram`，重建时原样复用。
+
+三条测试（`TestDiagramRowsStayAlignedWithScenes` / `TestTheShotSurvivesARebuild`）：
+没有图解的段也要占一行、片尾也要占一行、行数对不上时编码侧拒绝按段号取、
+以及**合成一次之后 `video.scenes[i].diagram` 必须能读回同一个镜头**。
+
 ## 核验不过的镜头：带着**机器的具体原因**再问一次
 
 原来核验不过就只有一个动作 —— 整条镜头作废、退回论文原图，**写日志**。

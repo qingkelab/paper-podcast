@@ -222,6 +222,16 @@ def encode_video(
     # 弹簧版胶囊：**帧序列**（Tier B）。与静态图互斥（同一句只会给其中一种）。
     chip_frame_rows = beat_chip_frames or [[] for _ in scenes]
     diagram_rows = diagram_states or [[] for _ in scenes]
+    # ⚠️ **行数与段数必须 1:1**：下面按**段号**取 `diagram_rows[index]`。少一行就整体错位，
+    # 而错位的表现是「图解叠到了别的段上」（实测：第 11 段的图解出现在第 1 段，
+    # 用户看到的是「第二个画面有问题、又跳回封面」）。错位这种事不该静默发生。
+    if diagram_states and len(diagram_rows) != len(scenes):
+        logger.warning(
+            "图解状态行数（%d）与段数（%d）对不上：**不许按段号取**，本集不叠图解状态",
+            len(diagram_rows),
+            len(scenes),
+        )
+        diagram_rows = [[] for _ in scenes]
     beat_focus_rows = beat_focus_overlays or [[] for _ in scenes]
     plan = transitions or [Transition() for _ in scenes]
 

@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -643,3 +645,179 @@ class TestRejectedDraftsAreRepairedWithTheRealReason:
         assert 1 in shots
         assert report["partial"], report
         assert "编造的第三块" in str(report["partial"]), report["partial"]
+
+
+
+def _round(index: int, start: float, end: float) -> Any:
+    from app.services.podcast_tts import RoundTiming
+
+    return RoundTiming(index=index, speaker="A", start=start, end=end)
+
+
+def _plain_png(path: Path, w: int = 400, h: int = 300) -> Path:
+    """一张纯色 PNG（要真文件：图片卡那一层会读它算落点）。"""
+    import pymupdf
+
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, w, h), False)
+    pix.set_rect(pix.irect, (30, 60, 100))
+    pix.save(str(path))
+    return path
+
+
+class TestDiagramRowsStayAlignedWithScenes:
+    """图解状态是**按段号**取的，所以「一段一行」必须永远成立。
+
+    实测踩过的那个 bug（用户报的是「第二个画面有问题，而且又会跳回到封面」）：
+    `_render_scene_layers` 只在**有图解**和**片尾**的段上 `append`，
+    普通段不 append —— 于是 `diagram_states` 比段数短，编码侧按段号取就**整体错位**：
+    这一集本来是第 11 段的图解，被叠到了**第 1 段**上。观众看到的是
+    「封面被一张图解盖住，下一段又回到封面」。
+    """
+
+    @staticmethod
+    def _shot(title: str) -> DiagramShot:
+        return DiagramShot(
+            kind="metric", title=title,
+            title_source="脚本原句：6 比特下状态内存压缩了 5 倍多",
+            metrics=(DiagramMetric("状态内存压缩", 5.0, " 倍",
+                                   source="脚本原句：6 比特下状态内存压缩了 5 倍多"),),
+        )
+
+    def _render(self, tmp_path, scenes):
+        from app.services.video import _render_scene_layers
+
+        work = tmp_path / "layers"
+        work.mkdir()
+        return _render_scene_layers(scenes, PORTRAIT, work, assets={}, pauses=None)
+
+    def test_a_scene_without_a_diagram_still_occupies_a_row(self, tmp_path):
+        base = tmp_path / "base.png"
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 90), False)
+        pix.set_rect(pix.irect, (250, 250, 250))
+        pix.save(str(base))
+        shot = self._shot("状态内存压了多少")
+        scenes = [
+            Scene(start=0.0, end=4.0, image=base, kind="illustration", text="一句话。"),
+            Scene(start=4.0, end=8.0, image=base, kind="illustration", text="两句话。", diagram=shot),
+            Scene(start=8.0, end=12.0, image=base, kind="illustration", text="三句话。"),
+            Scene(start=12.0, end=14.0, image=base, kind="illustration", text="收尾。", brand="outro"),
+        ]
+        layers = self._render(tmp_path, scenes)
+        assert len(layers.diagram_states) == len(scenes), (
+            f"图解状态行数（{len(layers.diagram_states)}）必须等于段数（{len(scenes)}）——"
+            "少一行就会整体错位（实测把第 11 段的图解叠到了第 1 段）"
+        )
+        assert layers.diagram_states[1], "第 2 段自己有图解，那一行不能是空的"
+        assert layers.diagram_states[0] == [] and layers.diagram_states[2] == []
+        assert layers.diagram_states[3] == [], "片尾品牌卡不叠图解，但也得占一行"
+
+    def test_the_encoder_refuses_to_guess_when_the_rows_do_not_match(self, caplog, tmp_path):
+        """对不上时必须**不叠**并报警，而不是照样按段号取（那正是错位的成因）。"""
+        import logging
+
+        from app.services.video_encode import encode_video
+
+        frame = tmp_path / "f.png"
+        import pymupdf
+
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 80, 60), False)
+        pix.set_rect(pix.irect, (250, 250, 250))
+        pix.save(str(frame))
+        audio = tmp_path / "a.wav"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+             "anullsrc=r=24000:cl=mono", "-t", "2", str(audio)],
+            check=True,
+        )
+        scenes = [
+            Scene(start=0.0, end=1.0, image=frame, kind="figure", text="一。"),
+            Scene(start=1.0, end=2.0, image=frame, kind="figure", text="二。"),
+        ]
+        diagram = tmp_path / "d.png"
+        pix2 = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 80, 60), False)
+        pix2.set_rect(pix2.irect, (255, 255, 255))
+        pix2.save(str(diagram))
+        with caplog.at_level(logging.WARNING):
+            encode_video(
+                scenes, [frame, frame], audio, tmp_path / "out.mp4",
+                diagram_states=[[(diagram, 0.2)]],   # 只有一行，段数却是 2
+            )
+        assert any("对不上" in record.getMessage() for record in caplog.records), caplog.text
+
+
+class _RouteLLM:
+    """按 prompt 内容分派的假模型：图解那条返回一份能过核验的草案，其余一律空。"""
+
+    mock = False
+
+    def __init__(self):
+        self.calls: list[list[dict]] = []
+
+    def _chat_json(self, messages, *, max_tokens: int, temperature: float = 0.6):
+        self.calls.append(messages)
+        blob = " ".join(str(m.get("content") or "") for m in messages)
+        if "动态图解镜头" not in blob:
+            return {}
+        return {
+            "shots": [
+                {
+                    "segment": 0, "kind": "metric", "title": "状态内存压缩",
+                    "title_source": "脚本原句：状态内存压缩了 5 倍多",
+                    "metrics": [
+                        {"label": "状态内存压缩", "value": 5, "unit": " 倍",
+                         "source": "脚本原句：状态内存压缩了 5 倍多"}
+                    ],
+                }
+            ]
+        }
+
+
+class TestTheShotSurvivesARebuild:
+    """图解镜头要**存进 `video.scenes[i].diagram`**，重新合成时读回来复用。
+
+    原来这里漏了：`build_scenes` 会读 `preset_scenes[i]["diagram"]`，
+    但写 `result.scenes` 的那段**没有把图解写进去** —— 于是每次「重新合成」都**静默丢掉图解**。
+    少的不是几张图，而是「重新合成不该换画面」这条保证（用户会觉得画面自己变了）。
+    """
+
+    def test_a_composed_video_writes_the_shot_into_its_scene_presets(self, tmp_path):
+        import subprocess
+        import wave
+
+        from app.services.video import compose_video
+
+        pool_dir = tmp_path / "assets"
+        pool_dir.mkdir(exist_ok=True)
+        cover = _plain_png(pool_dir / "cover.png")
+        illu = _plain_png(pool_dir / "illu.png")
+        audio = tmp_path / "a.wav"
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(b"\x00\x00" * 8000 * 4)
+
+        result = compose_video(
+            segments=[{"speaker": "A", "text": "状态内存压缩了 5 倍多。"}],
+            timings=[_round(0, 0.0, 4.0)],
+            audio_path=audio,
+            audio_duration=4.0,
+            cover_path=str(cover),
+            figures=[],
+            illustration_png=str(illu),
+            work_dir=tmp_path / "work",
+            output_path=tmp_path / "out.mp4",
+            title="t",
+            llm=_RouteLLM(),
+            allow_point_llm=True,
+        )
+        entry = result.scenes[0]
+        assert entry.get("diagram"), (
+            "图解镜头没有被写进 `video.scenes[i].diagram` —— 重新合成会静默丢掉它"
+        )
+        # 读回来必须是同一个镜头（`build_scenes` 走的就是这条读回来的路）
+        from app.services.video_core import diagram_shot_from_dict
+
+        assert diagram_shot_from_dict(entry["diagram"]).kind == "metric"

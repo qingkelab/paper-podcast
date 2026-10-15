@@ -527,7 +527,8 @@ class TestMockScriptLanguage:
         # 语言纯度用比例判（钉一句具体文案太脆），再确认它已经是作者视角的新版
         cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
         assert cjk / len(text) > 0.7, text[:80]
-        assert "这篇是我们做的" in text
+        # 第三人称讲解那一版的开场（用户要求：不要「我们」「你们」）
+        assert "这篇论文做的事" in text
 
 
 class TestSplitLongSegments:
@@ -868,9 +869,11 @@ class TestScriptSpeaksAsTheAuthorAndTeaches:
         这个坑在这个项目里踩过好几次（配色、白底都是这么发现的）。
         """
         meta, analysis = mock_analysis("Attention Is All You Need", title_hint="Attention")
+        # 声音基准 = **第三人称讲解**（用户明确要求不要「我们」「你们」），
+        # 所以标记词也跟着换成「作者 / 这篇论文」那一套。
         cases = (
-            ("zh", ("我们", "你们", "打个比方")),
-            ("en", ("our paper", " we ", "relay race")),
+            ("zh", ("作者", "打个比方")),
+            ("en", ("The authors", "relay race")),
         )
         for language, markers in cases:
             script = mock_script(
@@ -879,6 +882,11 @@ class TestScriptSpeaksAsTheAuthorAndTeaches:
             text = " " + "".join(item["text"] for item in script["segments"]) + " "
             for marker in markers:
                 assert marker in text, f"{language} 的 Mock 稿子里没有 {marker!r}：{text[:120]}"
+            # 第一/第二人称一个都不许有（品牌话术除外，Mock 里没有品牌段）
+            from app.services.prompts.text import first_person_hits
+
+            hits = first_person_hits(script["segments"], language=language)
+            assert not hits, f"{language} 的 Mock 稿子里还有第一/第二人称：{hits}"
 
     def test_expert_level_still_lands_terms_in_plain_words(self):
         """专家档也别把术语扔下不管 —— 费曼那条对所有难度档都成立。"""
@@ -1134,3 +1142,94 @@ class TestRetryCarriesTheRealFailure:
         assert ledger and ledger["attempts"], ledger
         assert ledger["attempts"][0]["accepted"] is False
         assert ledger["attempts"][-1]["accepted"] is True
+
+
+class TestNoFirstPerson:
+    """用户要求：脚本与解读里不要「我们」「你们」这类第一/第二人称。
+
+    踩过的事：prompt 里**本来就有**「不要用『我们』冒充作者」，但同一段又留了
+    「日常口语里表示『我们一起看』的『我们』可以用」这个口子 —— 模型顺着口子写
+    「我们做了两件事」「我们这篇论文」「你们怎么解决」，实测一集 41 段里 14 处。
+    所以这一轮做两件事：把口子堵上（prompt），并且**能数出来**（确定性检查）。
+    """
+
+    def test_the_zh_script_prompt_bans_both_pronouns_with_rewrites(self):
+        from app.services.prompts.script import SCRIPT_SYSTEM
+
+        assert "不要出现「我们」「咱们」「你们」" in SCRIPT_SYSTEM
+        assert "我们做了两件事" in SCRIPT_SYSTEM, "要给出替换写法，不然模型不知道换成什么"
+        assert "这篇论文做了两件事" in SCRIPT_SYSTEM
+        # 老的那个口子必须堵上（它就是实测违规的来源）
+        assert "「我们」可以用" not in SCRIPT_SYSTEM
+
+    def test_the_en_script_prompt_bans_them_too(self):
+        from app.services.prompts.script import SCRIPT_SYSTEM_EN
+
+        assert 'Never use "we", "our", "us" or "you"' in SCRIPT_SYSTEM_EN
+        # 老设定「B 管 A 叫 your team」就是「你们」，必须连同设定一起去掉
+        assert "addresses A's team as" not in SCRIPT_SYSTEM_EN
+
+    def test_both_analysis_prompts_require_the_third_person(self):
+        from app.services.prompts.analysis import ANALYSIS_SYSTEM, ANALYSIS_SYSTEM_EN
+
+        assert "一律用第三人称讲论文" in ANALYSIS_SYSTEM
+        assert "never use \"we\", \"our\", \"us\" or \"you\"" in ANALYSIS_SYSTEM_EN
+
+    def test_the_checker_counts_the_right_sentences(self):
+        from app.services.prompts.text import first_person_hits
+
+        segments = [
+            # 品牌话术里就有「我们」，那是写死的社区语气，不算违规
+            {"text": "这里是青稞社区。我们只讲自己真正读过的东西。", "brand": "intro"},
+            {"text": "我们做了两件事。"},
+            {"text": "那你们怎么解决？"},
+            {"text": "作者试过另一条路。"},
+        ]
+        hits = first_person_hits(segments)
+        assert [index for index, _ in hits] == [1, 2], hits
+
+    def test_the_checker_handles_english(self):
+        from app.services.prompts.text import first_person_hits
+
+        hits = first_person_hits(
+            [{"text": "We did two things."}, {"text": "The authors tried another route."}],
+            language="en",
+        )
+        assert hits == [(0, "We did two things.")], hits
+
+    def test_the_generator_warns_instead_of_staying_silent(self, caplog):
+        """模型不守规矩时要**留下痕迹**（只报警不改写：改写是模型的事）。"""
+        import logging
+
+        from app.services.llm import LLMClient
+
+        client = LLMClient.__new__(LLMClient)
+        client.settings = None
+        with caplog.at_level(logging.WARNING):
+            client._report_first_person(
+                {"segments": [{"text": "我们做了两件事。"}]}, language="zh"
+            )
+        assert any("第一/第二人称" in record.getMessage() for record in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            client._report_first_person(
+                {"segments": [{"text": "这篇论文做了两件事。"}]}, language="zh"
+            )
+        assert not caplog.records, "守规矩时不该报警"
+
+    def test_quoted_titles_are_not_counted(self):
+        """论文原题里就带 You（「Attention Is All You Need」）—— 引号内不算。
+
+        不跳过的话每集都会误报一次，报警很快就没人看了。
+        """
+        from app.services.prompts.text import first_person_hits
+
+        hits = first_person_hits(
+            [{"text": "《Attention Is All You Need》这篇论文做了一件事。"}], language="zh"
+        )
+        assert hits == []
+        hits = first_person_hits(
+            [{"text": "“Attention Is All You Need” does one thing."}], language="en"
+        )
+        assert hits == []

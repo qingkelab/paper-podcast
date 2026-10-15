@@ -182,7 +182,7 @@ class LLMClient:
         script = build_script_payload(
             segments, speech_rate=speech_rate, padding_sec=padding_sec, language=language
         )
-        return self._repair_length_if_needed(
+        result = self._repair_length_if_needed(
             script,
             analysis=analysis,
             duration_min=duration_min,
@@ -190,6 +190,29 @@ class LLMClient:
             speech_rate=speech_rate,
             padding_sec=padding_sec,
             language=language,
+        )
+        self._report_first_person(result, language=language)
+        return result
+
+    @staticmethod
+    def _report_first_person(script: dict[str, Any], *, language: str) -> None:
+        """数一遍「我们/你们」这类第一/第二人称，**只报警不改写**。
+
+        为什么要数：prompt 里早就写着「不要用『我们』冒充作者」，但同一段 prompt 又留了
+        「日常口语里的『我们』可以用」这个口子 —— 实测一集 41 段里出现 14 处
+        （「我们做了两件事」「我们这篇论文」「你们怎么解决」）。规矩写进 prompt
+        不等于模型会守，所以至少要让**不遵守这件事可见**（口径见
+        `prompts.text.first_person_hits`）。
+        """
+        from .prompts.text import first_person_hits
+
+        hits = first_person_hits(script.get("segments") or [], language=language)
+        if not hits:
+            return
+        logger.warning(
+            "脚本里有 %d 处第一/第二人称（要求是第三人称讲解）：%s",
+            len(hits),
+            "；".join(f"第 {index} 段「{text[:18]}…」" for index, text in hits[:5]),
         )
 
     def _repair_length_if_needed(

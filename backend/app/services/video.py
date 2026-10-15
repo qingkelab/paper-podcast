@@ -1574,6 +1574,11 @@ def _render_scene_layers(
                     result.diagram_states.append(states)
                 else:
                     _render_card_layer(scene, card_path, layout=lay, session=session)
+                    # ⚠️ **没有图解也要占一行**：编码侧是按**段号**取 `diagram_states[index]` 的，
+                    # 少一行就整体错位 —— 实测踩过：这一集第 11 段的图解被叠到了**第 1 段**上
+                    # （用户看到的是「第二个画面有问题，而且又跳回封面」：第一个图解把封面盖住，
+                    # 下一段又是封面）。行数和段数必须永远 1:1。
+                    result.diagram_states.append([])
                 result.card_paths.append(card_path)
                 if len(beats) > 1:
                     # 小句时间表和编码侧用的是**同一个** `beat_windows_aligned`
@@ -2268,6 +2273,14 @@ def compose_video(
             # 「为什么配这张图」（模型写的）。**只存不渲染**：它是复查图文相符的依据，
             # 也让「同一张图连讲多段」这种判断有迹可循，不必再重读全稿。
             "why": assignment_whys[index] if index < len(assignment_whys) else "",
+            # **动态图解镜头也要存**：`build_scenes` 会从 `preset_scenes[i]["diagram"]` 读回来
+            # 复用（和 `point` / `hook` 同一条规矩）。漏了它，重新合成就会**静默丢掉图解** ——
+            # 少的不只是几张图，还有「重新合成不该换画面」这条保证。
+            "diagram": (
+                diagram_shot_to_dict(body_scenes[index].diagram)
+                if index < len(body_scenes) and body_scenes[index].diagram is not None
+                else None
+            ),
             # **逐句画面**一起存：它和 image 一样是「选图」那一步的产物，
             # 重新合成时复用（规矩 3：重新合成不许调模型），画面才不会因为重做而全变。
             # 存的是 build_scene_beats 施加过守卫之后的结果（真正的画面安排）。

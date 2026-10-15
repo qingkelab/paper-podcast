@@ -33,20 +33,21 @@ def _mock_script_en(
 ) -> dict[str, Any]:
     """英文版 Mock 脚本（真正的英文对谈，不是中文的翻译副本）。"""
     first = innovations[0] if innovations else "it swapped out the whole approach"
-    # 同中文 Mock：作者视角 + 费曼技巧，离线演示的文案要和线上一个风格
+    # 同中文 Mock：**第三人称讲解** + 费曼技巧，离线演示的文案要和线上一个风格。
+    # 同样不许 "we/our/you"（用户明确要求）。
     lines: list[tuple[str, str]] = [
-        ("A", f"\u201c{title}\u201d is our paper. The one-line version: we turned something that had to be computed step by step into something computed all at once."),
-        ("B", "Wait, you're one of the authors? Good — then start with the naive question. Is this an engineering win, or does it actually work better?"),
-        ("A", "Both, but not in the order you'd expect. We started out just wanting training to be faster; somewhere along the way we noticed it also did better at equal compute."),
+        ("A", f"\u201c{title}\u201d does one thing in one line: it turned something that had to be computed step by step into something computed all at once."),
+        ("B", "Start with the naive question then. Is this an engineering win, or does it actually work better?"),
+        ("A", "Both, but not in the expected order. The authors started out just wanting training to be faster; somewhere along the way they noticed it also did better at equal compute."),
         ("B", "So what's the actual change? I don't want to hear \u201ca novel architecture\u201d."),
-        ("A", f"{first} That's still jargon. Think of it this way: the old model is a relay race where every runner waits for the baton. We let everyone watch the whole field at once and give more weight to whoever matters."),
+        ("A", f"{first} That's still jargon. Think of it this way: the old model is a relay race where every runner waits for the baton. This paper lets everyone watch the whole field at once and gives more weight to whoever matters."),
         ("B", "Okay — so the point isn't that it does less work, it's that the steps that used to wait on each other can now happen in parallel."),
-        ("A", "Right, and not only parallel. Because any two positions can connect directly, information travels a shorter path, so long-range dependencies are easier to learn. We didn't expect that — the ablations are what convinced us."),
-        ("B", "Here's my problem with it: once the sequence gets long, you're comparing everything to everything. Didn't you worry the cost would explode?"),
-        ("A", f"We worried about it constantly, and it's the weakness we're most clear-eyed about. {(limitations[0] if limitations else 'Cost grows quadratically with length')} A whole line of later work is about that one cut."),
-        ("B", "So it's a clear win on short sequences and a real cost on long ones — not something you use blindly."),
-        ("A", "That's fair. We traded long-sequence compute for generality and scalability. Whether that trade is worth it depends on what you're building — we wouldn't decide that for you."),
-        ("B", "If you were starting again today, where would you put the effort?"),
+        ("A", "Right, and not only parallel. Because any two positions can connect directly, information travels a shorter path, so long-range dependencies are easier to learn. The authors didn't expect that — the ablations are what convinced them."),
+        ("B", "Here's my problem with it: once the sequence gets long, everything is compared with everything. Did the authors worry the cost would explode?"),
+        ("A", f"The paper worries about it constantly, and it is the weakness the authors are most clear-eyed about. {(limitations[0] if limitations else 'Cost grows quadratically with length')} A whole line of later work is about that one cut."),
+        ("B", "So it's a clear win on short sequences and a real cost on long ones — not something to use blindly."),
+        ("A", "That's fair. It trades long-sequence compute for generality and scalability. Whether that trade is worth it depends on what is being built — the paper doesn't decide that for anyone."),
+        ("B", "If the authors started again today, where would the effort go?"),
         ("A", "Two places: bringing that quadratic cost down, and making positional representations hold up over much longer context. Both are still active."),
         ("B", "Got it. So it isn't the finish line — it moved the track, and everyone kept running on the new one."),
         ("A", "That's a good way to end it. Thanks for listening."),
@@ -295,21 +296,23 @@ def mock_script(
             language=language,
         )
 
-    # Mock 也按「作者视角 + 费曼技巧」写：离线演示里看到的文案要和线上同一个风格，
+    # Mock 按「第三人称讲解 + 费曼技巧」写：离线演示里看到的文案要和线上同一个风格，
     # 否则改完 prompt 打开演示页还以为是没生效（这个坑在本项目里踩过好几次）。
+    # **不许出现「我们」「你们」** —— 和线上 prompt 同一条规矩（见 `prompts.script`）：
+    # 主播是讲解者、不是作者，也没有一个坐在对面的「你们」。
     lines: list[tuple[str, str]] = [
-        ("A", f"《{title}》这篇是我们做的。先说最要紧的一句：我们把过去必须一步一步算的东西，变成了一次算完。"),
-        ("B", "等一下，你们是作者？那正好。我想先问最朴素的：这是纯工程优化，还是效果真的变好了？"),
-        ("A", "两个都有，但顺序不是你想的那样。我们一开始只是想让训练跑得快一点，做着做着发现：同等计算量下效果反而更好了。"),
+        ("A", f"《{title}》这篇论文做的事，一句话说：把过去必须一步一步算的东西，变成了一次算完。"),
+        ("B", "那先问最朴素的：这是纯工程优化，还是效果真的变好了？"),
+        ("A", "两个都有，但顺序不是想的那样。作者一开始只是想让训练跑得快一点，做着做着发现：同等计算量下效果反而更好了。"),
         ("B", "那核心改动到底是什么？我不想听「提出了一个新架构」这种话。"),
-        ("A", f"{first_innovation}这句还是术语。打个比方，以前的模型像接力赛，一棒传一棒，必须等前一棒跑完；我们把它改成所有人同时看全场，谁重要谁就多分点注意力。"),
+        ("A", f"{first_innovation}这句还是术语。打个比方，以前的模型像接力赛，一棒传一棒，必须等前一棒跑完；这篇的做法是让所有人同时看全场，谁重要谁就多分点注意力。"),
         ("B", "哦——所以关键不是算得更少，而是本来要排队等的那些步骤，现在能一起做了。"),
-        ("A", "对，但还不止。因为任意两个位置可以直接建立联系，信息不用绕路，长距离的依赖也更好学。这一点我们当时没预料到，是消融实验做出来才确认的。"),
-        ("B", "那问题来了：序列一长，两两之间都要算一遍，开销不是要爆炸吗？你们想过这个吗？"),
-        ("A", f"当然想过，这也是我们最清楚的一个短板。{(limitations[0] if limitations else '复杂度随长度平方增长')}后来一大堆工作都在补这一刀。"),
-        ("B", "也就是说，短序列上你们占优，长序列上要付代价，不能无脑用。"),
-        ("A", "可以这么理解。通用性和可扩展性是用长序列上的计算代价换来的。这笔账划不划算，取决于你的场景，我们不敢替你下结论。"),
-        ("B", "那如果现在让你们继续做，会往哪儿使劲？"),
+        ("A", "对，但还不止。因为任意两个位置可以直接建立联系，信息不用绕路，长距离的依赖也更好学。这一点作者当时也没预料到，是消融实验做出来才确认的。"),
+        ("B", "那问题来了：序列一长，两两之间都要算一遍，开销不是要爆炸吗？作者想过这个吗？"),
+        ("A", f"当然想过，这也是整篇最清楚的一个短板。{(limitations[0] if limitations else '复杂度随长度平方增长')}后来一大堆工作都在补这一刀。"),
+        ("B", "也就是说，短序列上这种方法占优，长序列上要付代价，不能无脑用。"),
+        ("A", "可以这么理解。通用性和可扩展性是用长序列上的计算代价换来的。这笔账划不划算，取决于具体场景，论文没替谁下结论。"),
+        ("B", "那接下来这条路会往哪儿走？"),
         ("A", "主要是两件事：一是把那个平方复杂度压下来，二是让位置表示撑得住更长的上下文。这两个方向到现在都还是活跃的。"),
         ("B", "明白了。所以它不是终点，是把赛道换了一条，然后大家都在新赛道上继续跑。"),
         ("A", "这个说法挺准。今天就聊到这儿。"),
