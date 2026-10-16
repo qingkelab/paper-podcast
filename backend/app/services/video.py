@@ -2382,6 +2382,12 @@ def compose_video(
             seam_report = audit_seams(output_path, cuts)
             result.qa["seams"] = seam_report.to_dict()
             logger.info("%s", seam_report.summary())
+            # 最差的几处点名（只提示，不拦）：整套 13 集实测下来 398/398 处切点
+            # **两侧都没在动**，所以这里现在几乎每集都会点满 3 条 —— 它不是判决，
+            # 是「画面语法有没有变」的基线（运动幅度中位数 0.09，判「没在动」的阈值 1.0）。
+            for seam in [item for item in seam_report.seams if item.issues()][:3]:
+                logger.info("接缝审计 · 待改：%.1fs %s（%s）", seam.at, seam.kind,
+                            "；".join(seam.issues()[:2]))
     except Exception:  # pragma: no cover - 审计本身不该影响出片
         logger.warning("接缝审计失败（不影响出片）", exc_info=True)
 
