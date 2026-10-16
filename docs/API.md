@@ -122,6 +122,10 @@
       "audio_url": "/api/episodes/xxx/audio?v=1712345678-2304806",
       "audio_duration_sec": 191.69,
       "audio_bytes": 2304806,
+      // video.qa.seams：接缝审计（每个切点两侧在不在动、方向对不对、是硬切还是叠化）。
+      // 只读量测，见 docs/VIDEO_QA.md。video.qa.visual_plan：画面计划概览。
+      // ⚠️ 这两个键原来都写在 `result.qa = report.to_dict()`（整份替换）**之前**，
+      // 于是算出来了、日志也打了，却从来没进过库 —— 顺序有测试钉着。
       // video.diagram_report：图解镜头的台账（提了几条、核验删了什么、带原因再问一次
       // 救回几条）。没有图解镜头时是 null。
       "video": { "url": "/api/episodes/xxx/video?v=...", "duration_sec": 191.69,

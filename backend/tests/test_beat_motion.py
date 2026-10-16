@@ -343,25 +343,41 @@ class TestBeatCardsAreEncoded:
 class TestOldPathDoesNotChange:
     """`beats=[]` 必须走和改动前**完全一样**的路径：同输入 → 同一份字节。"""
 
-    def _encode(self, tmp_path: Path, out_name: str, **kwargs) -> Path:
+    def _inputs(self, tmp_path: Path):
+        """把三层 PNG 渲染**一次**、两次编码共用。
+
+        ⚠️ 原来两次编码各自渲染一遍输入。那样比的是「渲染 + 编码」两件事 ——
+        渲染只要有一次不一样（哪怕只是字体就绪时机差了一点），这条就会红，
+        而它想钉的只是**编码路径**。实测在整套跑里偶发红过一次、单独跑 5 次全绿：
+        不可复现的那种红灯最费时间，所以把输入固定下来，让这条测试只回答一个问题。
+        """
         image = make_png(tmp_path / "img.png", color=(200, 90, 40))
         scene = Scene(start=0, end=4.0, image=image, kind="figure", text="整整一段就是一句话。")
-        chrome = render_chrome(scene, tmp_path / "chrome.png")
-        band = render_caption_band("整整一段就是一句话。", tmp_path / "band.png")
-        audio = make_audio(tmp_path / "audio.wav", 4.0)
+        return (
+            scene,
+            render_chrome(scene, tmp_path / "chrome.png"),
+            render_caption_band("整整一段就是一句话。", tmp_path / "band.png"),
+            render_image_card(scene, tmp_path / "card.png"),
+            make_audio(tmp_path / "audio.wav", 4.0),
+        )
+
+    @staticmethod
+    def _encode(tmp_path: Path, out_name: str, inputs, **kwargs) -> Path:
+        scene, chrome, band, card, audio = inputs
         out = tmp_path / out_name
         encode_video(
             [scene], [chrome], audio, out,
             caption_bands=[[CaptionBand("整整一段就是一句话。", band)]],
-            image_cards=[render_image_card(scene, tmp_path / "card.png")],
+            image_cards=[card],
             waveform=False,
             **kwargs,
         )
         return out
 
     def test_empty_beat_lists_are_byte_identical_to_the_old_call(self, tmp_path):
-        old = self._encode(tmp_path, "old.mp4")
-        new = self._encode(tmp_path, "new.mp4", beat_cards=[[]], beat_chips=[[]])
+        inputs = self._inputs(tmp_path)
+        old = self._encode(tmp_path, "old.mp4", inputs)
+        new = self._encode(tmp_path, "new.mp4", inputs, beat_cards=[[]], beat_chips=[[]])
 
         assert sha256(old) == sha256(new)
         assert count_frames(new) == int(4.0 * 30)

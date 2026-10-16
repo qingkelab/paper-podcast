@@ -242,3 +242,101 @@ ffmpeg 表达式里没有「相对某时刻」的概念，把时间变量整体�
 `tests/test_render_discipline.py::TestNoInlineEasing` 三条扫源码盯住：
 渲染模块里不许出现 `cubic-bezier(...)` 字面量、不许手写 `exp(-k*t)` 弹簧表达式
 （它**看起来**像弹簧，但过冲与峰值时刻和别处对不上）、具名预设必须齐全且拼错名字当场报错。
+
+## 影片语法：从 HyperFrames 学到的（`seam-craft` / `motion-doctrine`）
+
+下面这份是**推导与出处**，结论要落到我们的代码里时，看 `services/seam_audit.py` 与
+`docs/VIDEO_QA.md`「接缝审计」一节。
+
+[HyperFrames](https://github.com/heygen-com/hyperframes)（Apache-2.0，6.5 万星）
+和我们**是同一条技术路线**：HTML + 无头 Chrome 逐帧 seek + ffmpeg，同样把「确定性」
+当产品承诺（same input → same frames → same output）。差别在取舍：
+他们**一帧截一次图**（浏览器自己合成全部图层，没有滤镜图要维护），
+我们只截「图层变化的那一刻」再交给 ffmpeg overlay —— 我们单机快 ~20 倍，
+代价是**图层坐标类**的 bug 得靠我们自己兜（图注压图、图解叠错段都是这一类）。
+
+### 1. Seam Law：切点两侧的动必须对上（我们最缺的一条）
+
+> **How Scene A exits determines how Scene B enters.**
+> ① **轴**：x 还是 x、y 还是 y、Z 还是 Z，跨切不许换轴；
+> ② **方向**：不许镜像（Z 上方向 = 缩放的**符号**）；
+> ③ **速度**：进入初速 ≈ 退出末速（退出 `power4.in` + 进入 `power4.out`，同距离同时长）；
+> ④ **相位**：切点必须落在**两边都还在动**的时候 —— 停下来再切、或从静止开始，都是死拍子。
+
+还有三条配套的：
+
+- **The Current（水流）**：整片只选一个主方向，其他方向是**储备**（向上=升华、Z 推近=深入、
+  Z 拉远=落地、爆开=离开一个世界）。**不许连续两个接缝反向**，变向必须有可见的因。
+- **Carriers（载体）**：眼睛跟物体不跟抽象。最强的接缝是把同一个具体物件交过切点
+  （位置 + 速度都接上）。**「Never a crossfade — it has no carrier at all.」**
+- **Causal Motion**：因果链上的动效要**同帧点火**（效果从触发它的那一帧开始，
+  不许「稍后一点」）；反应幅度跟着质量走（大元素回弹慢）。
+
+**对照我们**：全片默认 `TRANSITION_STYLE = "dissolve"`，而叠化在他们的 anti-pattern
+表里排第一。我们当时的判断是「稳」，方向没错（少即是多），但**「稳」的下一步不是更少，
+而是一致**：真要做，是给切点选一个主方向和一种过渡并重复使用，而不是继续用叠化。
+
+### 2. Performance：场景要一直在演（判据比我们的严）
+
+- **No idle wobble**：呼吸/漂浮/脉冲这类循环一律禁（读起来像视频在等）。
+  进入之后还有好几秒空着 = **编排 bug，该加故事，不是加抖动**。
+  —— 这和我们「Ken Burns 被否掉」是同一个结论，但他们把它写成了法律。
+- **五种持续动线**（都要在计划里具名）：staged reveals（内容留到解说节拍上兑现）/
+  camera with intent（建立→行进→落到主体）/ sequenced UI life（进度、计数、高亮按时间走）/
+  animated sequences（卡片归位、元素被拖）/ cursor-led action。
+- **判据**：任意一秒暂停，必须有东西正在**有意义地**飞。
+  —— 我们只有 `video_qa` 的「4 秒无变化」（下限），没有这一条（质量）。
+- **Stillness before climax**：大动作与结果之间留 **0.3~0.75 秒**。
+- 时长意图：单元素入场 ≤800ms；退场 ≈ 入场 75%；总错峰 ≤500ms；
+  禁 `bounce/elastic` out（准入 `back.out(1.4~1.7)`）；同类元素**共用一个缓动意图**。
+
+### 3. Captions：字幕不是「保留带」（直接打在我们的版式上）
+
+> Center the composition on the **true vertical center (y = H/2)**. Do not shift content up
+> to "make room" for captions; a composition centered at 0.42 × H with a **dead lower band**
+> is the bug, not the fix. Captions are an **overlay**, not a reserved zone.
+> 唯一软规矩：别把关键小字停在底部那 80px 中线带里。
+
+我们的竖版恰恰是那条死带：底部 968→1210（242px ≈ 画布 20%）保留给字幕带的浅底区。
+这解释了上一轮量「宽图留白 40~56%」的另一半 —— 我当时只归因于画幅比例，
+其实还压着一条 20% 的保留带。
+
+他们的字幕模型分三档，值得记：**drop**（口水词不显示，我们是生成稿，不适用）/
+**rail**（默认的干净下三分一字幕 + **行内强调**——我们的数字胶囊就是这个 ✓ 做对了）/
+**embed**（**被提升的峰值**：一个大词合成在主体后面，**每个节拍最多一个、不许相邻同现、
+间隔至少一个节拍**；「把整段都 embed 掉是常见的错」）。
+我们的「本段要点」是每段固定一行（配额式），他们是稀缺且挣来的峰值（稀缺式）。
+
+### 4. 工程纪律（他们的闸门清单）
+
+- **接缝闸门**（`seam-gate.mjs`）逐条数值强制：ledger 一致性、退出时还在动、进入不是从静止、
+  实测方向=计划方向、速度匹配（WARN）、**零重叠**（每帧只有一侧可见 = 这不是叠化）、
+  Z 符号一致、carrier 矩形连续；还诚实列出**脚本查不了的三条**：改头尾 1 秒就作废那次审计、
+  **音频是时钟**（按 VO 的真实词时间轴重排，绝不为了塞进槽位赶读稿）、clip-gating 的坑。
+  —— 第 2 条正是我们花一整轮才得出的「字幕要吸到真实停顿」（96%），外部验证。
+- **舞台必须不透明**：叠化窗口里两侧不透明度之和 < 1，**底下的东西会透出来**；
+  `#root` 没刷底时渲染器把这个凹陷合到默认**白色**页面上 → **每个接缝闪一下白**
+  （他们在两条片子上观察到才修）。做法一句话：装配器负责 `#root { background: … }`。
+- **覆盖率闸门**（`videoFrameCoverage.ts`）：逐 clip 算 `capturedFrames / expectedFrames`，
+  默认阈值 **0.95**，不达标**在编码之前**抛类型化错误中止 —— 宁可不出片，
+  也不给一个「看着正常、像素掉了」的 MP4。文件头写着两次线上事故的现场
+  （时间戳、平台、CLI 版本、渲染时长、注入 clip 数）。
+- **产物事务**（`artifactTransaction.ts`）：产物要么整套落地，要么不落地。
+- **PSNR 回归**（`regression-harness-psnr`）：在检查点用 ffmpeg `psnr` 跟参考渲染比，
+  阈值判定；**旧实现留着当 oracle** 单测新实现。
+- **capturePlan 是一个不可变值**，`replanAfterFailure` 是唯一的回退转移点
+  （原来几个可变布尔会在回退期间组合出非法状态）；**captureCost** 先量这台机器的截图成本，
+  再定 worker 数和路线。
+- **确定性是可测的**：`vfxDeterminism.test.ts`、`runtime-conformance`、
+  `htmlCompiler.parity.test.ts`（**编译路径之间的 parity** —— 我们恰好也有 HTML/SVG 两条路，
+  而它们行为并不一致）、`freezePlan` + `planHash`。
+
+### 5. 组织方式：把「手艺」写成 agent 能读的技能
+
+他们不做一本大文档，而是**一个 gateway + 若干技术技能**：`motion-doctrine`（法则，先读）
+→ 路由到 `cut-the-curve`（过渡全目录）、`seam-craft`（接缝的渲染前提）、
+`captions-overlay`、`oversized-cursor`……每条 skill 的 frontmatter 写清
+**什么时候加载**和**不覆盖什么**（「Does NOT contain the per-transition catalog」）。
+
+我们相反：知识全压在**一个 AGENTS.md** 里（现在已超出工作区预算、加载时被截断），
+而且**没有路由** —— 改字幕的人要读完整个文件才知道哪一节跟他有关。

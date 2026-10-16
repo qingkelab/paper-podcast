@@ -2326,7 +2326,6 @@ def compose_video(
         assets=pool,
         fallback_id=default_id,
     )
-    result.qa["visual_plan"] = visual_summary
     # 「图解镜头这一集的台账」：提了几条、哪几条被核验删了些什么、修复救回几条。
     # 只打日志的话，「这一集为什么一个图解都没有」事后查不到（`diagram_report` 进 video_json）。
     if diagram_report:
@@ -2358,6 +2357,34 @@ def compose_video(
             logger.info("成片自查 · 待改：%s", issue)
     except Exception:  # pragma: no cover - 自查本身不该影响出片
         logger.warning("成片自查失败（不影响出片）", exc_info=True)
+
+    # ⚠️ **顺序有讲究**：上面那一步是 `result.qa = report.to_dict()`（**整份替换**），
+    # 所以「画面计划概览」和「接缝审计」都必须写在它**之后**。
+    # 原来 `visual_plan` 写在它之前 —— 算出来了、日志也打了，但**从来没进过库**
+    # （同一类：算过、打过日志、没存下来，和 `video.scenes[i].diagram` 那个 bug 一个模子）。
+    result.qa["visual_plan"] = visual_summary
+
+    # **接缝审计**（只读）：逐切点量「切点两侧的动对不对得上」。
+    # `video_qa` 只能回答「画面有没有卡住」（≥4 秒无变化），回答不了「切得顺不顺」——
+    # 而用户报过的「一直在反复切换、和语音对不上、有抖动」全在后者。
+    # 判据来自 HyperFrames 的影片法则（见 `docs/VIDEO_MOTION.md`），**先只量不拦**：
+    # 我们目前是「静态卡 + 叠化」的讲解风格，它会在多数切点命中，得先在更多成片上标定。
+    # 成本实测：304 秒的片子整趟解码 + 量 39 处切点 ≈ 2.0 秒。
+    try:
+        from .seam_audit import audit_seams
+
+        cuts = [
+            scene.start
+            for scene in scenes[1:]
+            if scene.start > 0.7 and scene.start < (audio_duration - 0.7)
+        ]
+        if cuts:
+            seam_report = audit_seams(output_path, cuts)
+            result.qa["seams"] = seam_report.to_dict()
+            logger.info("%s", seam_report.summary())
+    except Exception:  # pragma: no cover - 审计本身不该影响出片
+        logger.warning("接缝审计失败（不影响出片）", exc_info=True)
+
     result.poster_path = str(
         capture_poster(
             output_path,
