@@ -230,6 +230,22 @@ with render_session(work_dir) as session:      # HTML 可用 → ChromeSession�
 ③才是真正能把 35.6% 降下去的那条路，而它们都要**重新问一次模型**（存量集的
 `preset` 里没有这些字段，「重新合成」按规矩不调模型，所以怎么重合成都不会出现）。
 
+## 强调行固定在底部（它**不**跟着图走）
+
+「文字层跟着图走」那一节只适用于**图注**。第一版把**强调行**（浅蓝底「本段要点」那一行）
+也一起上移了，结果它在不同段里**上下跳**：宽图时跑到图下面（实测 y≈740），
+窄图时仍留在 878 —— 同一个元素全片换位置，看起来就是忽上忽下。
+
+用户的要求很直接：「高亮的文字位置不要靠上，放在底部，字幕上边就行」。
+现在 `design.content_layout` **只改 `caption_top`**，`point_top` 一个字都不动
+（`PANEL` 常量 `FIGURE_POINT_GAP` / `FIGURE_POINT_MIN_TOP` 一并删掉，免得后来的人以为它还在用）。
+
+**实测（e3083750 重合成后，抽样 7 帧）**：强调行全都落在 **y 880–951**，
+紧贴字幕带上沿（968）—— 改动前同一批帧里它是 740 / 832 / 878 三种位置。
+
+不变量有测试盯着：`test_the_highlight_row_stays_at_the_bottom`（图高从 300 到 742，
+`point_top` 必须始终等于基准值）与 `test_caption_never_moves_down`。
+
 ## 三条「约束静默失效」的教训（同一类 bug，三个实例）
 
 字号自适应那套判据（`scrollWidth <= clientWidth` / `scrollHeight <= clientHeight` / 行数 ≤ N）

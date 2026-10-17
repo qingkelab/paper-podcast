@@ -88,10 +88,17 @@ class TestCaptionFollowsTheFigure:
         assert new.caption_top == ink_bottom + design.FIGURE_CAPTION_GAP
         assert new.caption_top < LAY.caption_top - 100, "宽图的图注必须明显上移"
 
-    def test_point_row_follows_the_caption(self):
-        new = content_layout(LAY, 400, has_caption=True, has_point=True)
-        assert new.point_top > new.caption_top
-        assert new.point_top + LAY.point_height <= LAY.subtitle_top - 8, "强调行不许压到字幕带"
+    def test_the_highlight_row_stays_at_the_bottom(self):
+        """**强调行不跟着图走**（用户要求：「高亮的文字位置不要靠上，放在底部，字幕上边就行」）。
+
+        原来它跟着图上移，于是同一个元素在不同段里上下跳（实测宽图时 y≈740、窄图时 878）。
+        现在它固定在 `point_top`，只要求它**永远贴在字幕带上面**。
+        """
+        for figure_h in (300, 400, 599, 742):
+            new = content_layout(LAY, figure_h, has_caption=True, has_point=True)
+            assert new.point_top == LAY.point_top, f"图高 {figure_h} 时强调行动了：{new.point_top}"
+        assert LAY.point_top + LAY.point_height <= LAY.subtitle_top, "强调行本来就在字幕带上面"
+        assert LAY.subtitle_top - (LAY.point_top + LAY.point_height) <= 24, "而且紧贴字幕带"
 
     def test_caption_font_grows_one_step_when_there_is_room(self):
         new = content_layout(LAY, 400, has_caption=True, has_point=True)
@@ -108,7 +115,7 @@ class TestCaptionFollowsTheFigure:
         for figure_h in range(100, LAY.image_box_h + 1, 50):
             new = content_layout(LAY, figure_h, has_caption=True, has_point=True)
             assert new.caption_top <= LAY.caption_top
-            assert new.point_top <= LAY.point_top
+            assert new.point_top == LAY.point_top, "强调行的位置一个字都不该动"
             assert new.subtitle_top == LAY.subtitle_top
             assert new.image_top == LAY.image_top
             assert new.waveform_top == LAY.waveform_top

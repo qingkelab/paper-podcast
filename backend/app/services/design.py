@@ -136,8 +136,6 @@ LANDSCAPE = Layout(
 # `FIGURE_CAPTION_GAP`。文字紧贴图片之后，卡片里让出来的那块空间变成
 # 一整块干净的留白（在文字下方），而不是「图与说明之间」的一道缝。
 FIGURE_CAPTION_GAP = 26      # 图片下沿 → 图注顶部的间距
-FIGURE_POINT_GAP = 22        # 图注底部 → 强调行顶部的间距
-FIGURE_POINT_MIN_TOP = 0     # 强调行不允许被顶到画布外面
 CAPTION_LINE_RATIO = 1.28    # 图注行高 = 字号 × 这个（18px 档就是 23px，和老的硬编码一致）
 
 
@@ -191,15 +189,13 @@ def content_layout(
         caption_font = layout.caption_max_font + CAPTION_FONT_STEP
     caption_h = CAPTION_LINE_H if not has_caption else caption_line_height(caption_font)
 
-    point_top = caption_top + caption_h + FIGURE_POINT_GAP
-    if not has_point:
-        point_top = layout.point_top
-    elif point_top + layout.point_height > layout.subtitle_top - 8:
-        # 放不下就退回原位（宁可留在老位置，也不要压到字幕带上）
-        point_top = layout.point_top
-        caption_top = min(caption_top, point_top - FIGURE_POINT_GAP - caption_h)
-    point_top = max(FIGURE_POINT_MIN_TOP, point_top)
-
+    # ⚠️ **强调行不跟着图走**（用户要求：「高亮的文字位置不要靠上，放在底部，字幕上边就行」）。
+    #
+    # 原来这里连强调行一起上移，结果它在不同段里**上下跳**：宽图时跑到图下面（实测 y≈740），
+    # 窄图时还留在 878 —— 同一个元素在整片里换位置，看起来就是「忽上忽下」。
+    # 现在只让**图注**跟着图的下沿走（那是修「图注离图 348px」那个缺陷用的），
+    # 强调行固定在 `layout.point_top`（= 字幕带上沿之上那一行），全片一致。
+    point_top = layout.point_top
     from dataclasses import replace
 
     return replace(
