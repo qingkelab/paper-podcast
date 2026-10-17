@@ -65,8 +65,7 @@ from .design import (
     FONT_STACK,
     NUMBER_BG,
     FRAME_STROKE,
-    POINT_BAR,
-    POINT_BAR_W,
+    POINT_TEXT_INSET,
     POINT_BG,
     POINT_TEXT,
     PORTRAIT,
@@ -739,15 +738,15 @@ def _render_slide_layers(
     )
 
     if include_point and scene.point:
-        # 强调行：浅蓝底 + 左侧色条 + 大字。它是画面上最抢眼的一行，
+        # 强调行：浅蓝底 + 大字。它是画面上最抢眼的一行，
         # 也是「突出解读内容」的落点（不是装饰，是每一段的核心结论）。
+        #
+        # **左边那根竖色条已删**（用户：「字幕不要竖着显示，删除即可」）——
+        # 一根 6×74px 的深蓝竖条紧挨着正文，在缩小的播放器里最像「竖着的字」。
+        # 强调靠浅蓝底 + 加粗大字就够了。
         parts.append(
             f'<rect x="{layout.point_left}" y="{layout.point_top}" width="{layout.point_width}" '
             f'height="{layout.point_height}" rx="10" fill="{POINT_BG}"/>'
-        )
-        parts.append(
-            f'<rect x="{layout.point_left}" y="{layout.point_top}" width="{POINT_BAR_W}" '
-            f'height="{layout.point_height}" rx="3" fill="{POINT_BAR}"/>'
         )
         point_size, point_lines = _fit_subtitle(
             scene.point, max_lines=1, max_size=layout.point_max_font
@@ -755,7 +754,7 @@ def _render_slide_layers(
         if point_lines:
             baseline = layout.point_top + layout.point_height / 2 + point_size * 0.36
             parts.append(
-                f'<text x="{layout.point_left + POINT_BAR_W + 18}" y="{baseline:.0f}" '
+                f'<text x="{layout.point_left + POINT_TEXT_INSET}" y="{baseline:.0f}" '
                 f'font-family="{FONT_STACK}" font-size="{point_size:.0f}" '
                 f'font-weight="600" fill="{POINT_TEXT}">{html.escape(point_lines[0])}</text>'
             )
@@ -859,14 +858,12 @@ def render_point_row(
         f'viewBox="0 0 {layout.width} {layout.point_height}">',
         f'<rect x="{layout.point_left}" y="0" width="{layout.point_width}" height="{layout.point_height}" '
         f'rx="10" fill="{POINT_BG}"/>',
-        f'<rect x="{layout.point_left}" y="0" width="{POINT_BAR_W}" height="{layout.point_height}" '
-        f'rx="3" fill="{POINT_BAR}"/>',
     ]
     size, lines = _fit_subtitle(point, max_lines=1, max_size=layout.point_max_font)
     if lines:
         baseline = layout.point_height / 2 + size * 0.36
         parts.append(
-            f'<text x="{layout.point_left + POINT_BAR_W + 18}" y="{baseline:.0f}" '
+            f'<text x="{layout.point_left + POINT_TEXT_INSET}" y="{baseline:.0f}" '
             f'font-family="{FONT_STACK}" font-size="{size:.0f}" '
             f'font-weight="600" fill="{POINT_TEXT}">{html.escape(lines[0])}</text>'
         )

@@ -212,9 +212,11 @@ class TestRenderedPageFacts:
     def test_point_row_layer_matches_the_svg_layer(self, session, tmp_path):
         """强调行这一层两条路径**必须像素级对齐**：ffmpeg 叠它用的是固定坐标。
 
-        画幅、区域位置、左侧蓝条的位置只要差一点，整条片子上的强调行就整体错位。
+        画幅、区域位置、文字起点只要差一点，整条片子上的强调行就整体错位。
+        （原来这条比的是「左侧那条 6px 蓝竖条」，它已按用户要求删掉 —— 现在比**文字墨迹的
+        左右边界**，仍然覆盖「起点有没有对齐」这件事。）
         """
-        from app.services.design import PORTRAIT, POINT_BAR
+        from app.services.design import PORTRAIT, POINT_TEXT
         from app.services.video import render_point_row
         from app.services.htmlpage import point_row_page
 
@@ -224,13 +226,16 @@ class TestRenderedPageFacts:
             point_row_page(text, PORTRAIT), tmp_path / "point-html.png", work_dir=tmp_path
         )
 
-        def bar_x(path):
+        def text_span(path):
             at, width, height = _pixels(path)
-            want = _hex(POINT_BAR)
+            want = _hex(POINT_TEXT)
             xs = [x for x in range(width) if at(x, height // 2) == want]
-            return xs[0], xs[-1]
+            return (xs[0], xs[-1]) if xs else None
 
-        assert bar_x(svg_path) == bar_x(html_path), "强调行的蓝条位置两条路径不一致"
+        svg_span, html_span = text_span(svg_path), text_span(html_path)
+        assert svg_span and html_span, "强调行的字没渲染出来"
+        assert abs(svg_span[0] - html_span[0]) <= 2, f"文字起点没对齐：{svg_span} vs {html_span}"
+        assert abs(svg_span[1] - html_span[1]) <= 3, f"文字右边没对齐：{svg_span} vs {html_span}"
 
 
 # ---------------------------------------------------------------------------

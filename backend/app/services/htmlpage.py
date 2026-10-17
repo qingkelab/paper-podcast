@@ -74,10 +74,9 @@ from .design import (
     FONT_STACK,
     FRAME_STROKE,
     NUMBER_BG,
-    POINT_BAR,
-    POINT_BAR_W,
     POINT_BG,
     POINT_TEXT,
+    POINT_TEXT_INSET,
     SPRING_POP_OVERSHOOT,
     CHIP_POP_BUMP_DELAY,
     CHIP_POP_DELAY,
@@ -333,21 +332,21 @@ html, body {
   font-size: %(subtitle_font).0fpx; line-height: 1.36; color: %(subtitle_text)s;
 }
 
-/* 「本段要点」强调行：浅蓝底 + 左侧色条 + 大字。画面上最抢眼的一行，
-   也是「突出解读内容」的落点（不是装饰，是这一段的核心结论）。 */
+/* 「本段要点」强调行：浅蓝底 + 大字。画面上最抢眼的一行，
+   也是「突出解读内容」的落点（不是装饰，是这一段的核心结论）。
+   **左边的竖色条已删**（用户：「字幕不要竖着显示，删除即可」）。 */
 .point-row {
   position: absolute; top: var(--point-top); left: var(--point-left);
   width: var(--point-w); height: var(--point-h);
   background: %(point_bg)s; border-radius: 10px;
   display: flex; align-items: center;
 }
-.point-bar {
-  width: %(point_bar_w)dpx; height: var(--point-h);
-  border-radius: 3px; background: %(point_bar)s; flex: none;
-}
 .point-text {
   font-size: var(--point-font); font-weight: 600; color: %(point_text)s;
-  margin: 0 18px; white-space: nowrap;
+  /* ⚠️ 这个内缩量必须等于 `design.POINT_TEXT_INSET`（SVG 那条路用的是它）：
+     两条路径的强调行要**像素级对齐**（ffmpeg 叠它用的是固定坐标），
+     差 6px 就是整条片子上强调行整体错位。测试钉着这一条。 */
+  margin: 0 %(point_inset)dpx; white-space: nowrap;
   /* ⚠️ 必须给一个**有限宽度**：`flex: 1 1 auto` + `min-width: 0` 之后
      这个元素的 clientWidth 才是「可用宽度」，而不是「内容宽度」。
      否则 `scrollWidth <= clientWidth` 恒为真（两者一起长），
@@ -390,9 +389,8 @@ html, body {
     "subtitle_text": SUBTITLE_TEXT,
     "subtitle_font": SUBTITLE_MAX_FONT,
     "point_bg": POINT_BG,
-    "point_bar": POINT_BAR,
-    "point_bar_w": POINT_BAR_W,
     "point_text": POINT_TEXT,
+    "point_inset": POINT_TEXT_INSET,
     "number_bg": NUMBER_BG,
     "number_text": NUMBER_TEXT,
 }
@@ -595,7 +593,7 @@ def scene_page(
 def _point_row_markup(point: str, layout: Layout) -> str:
     """强调行：浅蓝底 + 左侧色条 + 大字，一行放下（放不下就缩字号）。"""
     return (
-        '<div class="point-row"><div class="point-bar"></div>'
+        '<div class="point-row">'
         f'<div class="point-text" '
         f'{_fit_attrs(max_font=layout.point_max_font, min_font=22, lines=1, mode="nowrap")}>'
         f"{html_lib.escape(' '.join(point.split()))}</div></div>"

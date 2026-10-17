@@ -226,7 +226,6 @@ POINT_TOP = PORTRAIT.point_top
 POINT_LEFT = PORTRAIT.point_left
 POINT_WIDTH = PORTRAIT.point_width
 POINT_HEIGHT = PORTRAIT.point_height
-POINT_BAR_W = 6
 POINT_BG = "#eef4fb"
 # 字幕带里**数字胶囊**的底色。**故意和强调行不同**：强调行是一整条 856px 的宽底，
 # 浅一点才对；胶囊只有 30×24px，用同一个色等于没画。
@@ -263,7 +262,10 @@ DIAGRAM_FALLBACK_HOLD = 1.6
 ENTRANCE_RISE_PX = 12          # 上升距离：一行字的高度量级，再大就成了「飞进来」
 ENTRANCE_SEC = 0.34            # 与字幕带淡入 0.35 同量级（它是「续上」不是「开始」）
 ENTRANCE_OVERSHOOT = 0.05      # 到位时轻微回弹，和其余弹簧同一套手感  # 短于这个时长的段落不提镜头（一闪而过比不画更糟）
-POINT_BAR = "#2f6fb5"
+# 强调行左边原来有一根 6×74px 的**竖色条**（`POINT_BAR`）—— 用户要求删掉：
+# 「字幕不要竖着显示，删除即可」。在缩小的播放器里，紧挨正文的那根竖条最像竖着的字。
+# 文字现在直接从内缩量开始排（原来要跳过那 6px 条 + 18px 间距）。
+POINT_TEXT_INSET = 24
 POINT_TEXT = "#17416f"
 POINT_MAX_FONT = 40.0
 POINT_SLIDE_SEC = 0.4     # 强调行滑入的时长：它标记「新的一段开始了」

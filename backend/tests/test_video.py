@@ -1417,7 +1417,12 @@ class TestPointEmphasis:
         points = _normalize_points([{"segment": 0, "point": ""}, "闲聊", None], count=2)
         assert points == ["", ""]
 
-    def test_point_row_is_rendered_with_accent_bar(self, tmp_path):
+    def test_point_row_has_no_vertical_bar(self, tmp_path):
+        """强调行**没有左边那根竖色条**（用户：「字幕不要竖着显示，删除即可」）。
+
+        以前这里断言「左侧是强调蓝」，现在反过来钉住它**不在**：在缩小的播放器里，
+        紧挨正文的那根 6×74px 竖条最像「竖着的字」。强调靠浅蓝底 + 加粗大字就够了。
+        """
         row = render_point_row("成功率 67%", tmp_path / "point.png")
         import pymupdf
 
@@ -1430,12 +1435,15 @@ class TestPointEmphasis:
             index = (y * W + x) * n
             return (samples[index], samples[index + 1], samples[index + 2])
 
-        # 左侧色条是强调蓝，整行的底色是浅蓝
-        # 强调行的色条从 POINT_LEFT 开始，左边那 40px 是透明的（图层叠在画面上）
-        bar_r, bar_g, bar_b = at(POINT_LEFT + 2, POINT_HEIGHT // 2)
-        assert bar_b > 150 and bar_b > bar_r + 40, f"左侧色条不是强调蓝：{(bar_r, bar_g, bar_b)}"
+        # 左边那 40px 是透明的（图层叠在画面上），紧邻它的位置以前是深蓝竖条 —— 现在应该是浅蓝底
+        edge = at(POINT_LEFT + 2, POINT_HEIGHT // 2)
+        assert edge[2] >= edge[0] and edge[0] > 200, f"竖色条没删干净：{edge}"
         bg_r, bg_g, bg_b = at(VIDEO_W // 2, 6)
         assert bg_b >= bg_r and bg_r > 200, f"强调行底色不对：{(bg_r, bg_g, bg_b)}"
+        # 字还在（中间那条上要有深色墨迹）
+        dark = sum(1 for x in range(POINT_LEFT, VIDEO_W)
+                   if min(at(x, POINT_HEIGHT // 2)) < 120)
+        assert dark > 20, "强调行的字没渲染出来"
 
     def test_slide_without_point_leaves_the_row_empty(self, tmp_path):
         """没有要点时不画强调行 —— 不能留一个空色块让人以为坏了。"""
