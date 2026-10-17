@@ -1946,6 +1946,15 @@ def compose_video(
         except Exception as exc:  # noqa: BLE001
             logger.warning("模型逐句配图失败，退回均匀分布：%s", exc)
 
+    # ---- 同一张论文原图不许连续覆盖太久（确定性兜底） ----
+    #
+    # 用户报「文本和图像还是无法对应」，量出来的根因是 f2 一张图盖了 14 段 / 101 秒，
+    # 而这 101 秒里解说走过了 8 个话题。模型每段的 why 都具体且不同（它认真判了），
+    # 但 6 张原图对 41 段，它只能反复挑最像的那张。prompt 那边收紧判据，
+    # 这里保证**上限**：超出的段落改判 `generate`，交给现场生成那条线去画。
+    if image_for_segment is not None:
+        image_for_segment, beat_picks = _apply_figure_run_cap(image_for_segment, beat_picks)
+
     if image_for_segment is None:
         image_for_segment = heuristic_per_segment(
             len(segments), figure_ids, default_id
@@ -1988,6 +1997,7 @@ def compose_video(
     runs = group_generate_runs(image_for_segment)
     generated = 0
     if runs:
+        runs = split_long_runs(runs)
         capped = merge_runs_to_cap(runs, max_topic_images)
         if len(capped) < len(runs):
             logger.info(
@@ -2455,6 +2465,64 @@ def collapse_generate_within_segments(
     return collapsed
 
 
+def _apply_figure_run_cap(
+    picks: list[str], beat_picks: list[list[str]] | None
+) -> tuple[list[str], list[list[str]] | None]:
+    """把「一张原图连续盖太久」兜住：超出的段落改判 `generate`，并让逐句那层跟着段走。
+
+    抽成函数是为了能直接测（`TestOneFigureCannotCoverAHundredSeconds`）——
+    内联在 `compose_video` 里就只能靠跑一整条出片去验证，那太慢也太脆。
+    """
+    capped = cap_figure_runs(picks)
+    if capped == picks:
+        return picks, beat_picks
+    changed = [i for i, (before, after) in enumerate(zip(picks, capped)) if before != after]
+    logger.info(
+        "同一张原图连续覆盖超过 %d 段，%d 段改判现场生成配图：%s",
+        FIGURE_RUN_MAX_SEGMENTS,
+        len(changed),
+        "、".join(f"第 {i} 段" for i in changed[:6]) + ("…" if len(changed) > 6 else ""),
+    )
+    # 逐句那层跟着段走（否则 `scene.image` 会和 `beats` 打架：段级说生成、
+    # 逐句还指着原图，画面就按原图走，等于没改）
+    if beat_picks is not None:
+        for index in changed:
+            if index < len(beat_picks):
+                beat_picks[index] = [GENERATE_ID] * len(beat_picks[index])
+    return capped, beat_picks
+
+
+def cap_figure_runs(picks: list[str], *, max_run: int = FIGURE_RUN_MAX_SEGMENTS) -> list[str]:
+    """同一张**论文原图**连续覆盖超过 `max_run` 段时，多出来的段落改判 `generate`。
+
+    这是**确定性兜底**，和 prompt 里那条「同一张图最多连续三段」是同一件事的两道保险：
+    模型层负责判「这段话说的东西这张图有没有」，这里负责保证「一张图不会讲一百秒」——
+    后者是能算的，前者不能。
+
+    三条豁免（都是有意的，不是漏掉）：
+    - `cover`：片头那几帧顶着封面标题，本来就该停在同一张首页上；
+    - `illustration`：概括全文的信息图，只做中性过渡画面；
+    - `generate`：已经是现场生成，它自己按「连续几段合并成一张」处理。
+    另外片头 / 片尾那些段（`brand` 非空）不参与 —— 那是品牌话术，画面本来就不切。
+    """
+    out = list(picks)
+    index = 0
+    while index < len(out):
+        pick = out[index]
+        end = index
+        while end + 1 < len(out) and out[end + 1] == pick:
+            end += 1
+        run = end - index + 1
+        if (
+            run > max_run
+            and pick not in ("cover", "illustration", GENERATE_ID)
+        ):
+            for position in range(index + max_run, end + 1):
+                out[position] = GENERATE_ID
+        index = end + 1
+    return out
+
+
 def group_generate_runs(picks: list[str]) -> list[tuple[int, int]]:
     """把连续的 generate **段落**合并成 [起, 止) 区间。
 
@@ -2478,6 +2546,31 @@ def group_generate_runs(picks: list[str]) -> list[tuple[int, int]]:
     if start is not None:
         runs.append((start, len(picks)))
     return runs
+
+
+def split_long_runs(
+    runs: list[tuple[int, int]], *, max_len: int = FIGURE_RUN_MAX_SEGMENTS
+) -> list[tuple[int, int]]:
+    """把过长的生成区间**切开**，让每张现场生成的图最多覆盖 `max_len` 段。
+
+    为什么必须切：`group_generate_runs` 会把**连续**几段的 `generate` 合并成一组、
+    生成一张图 —— 那是对的（连续几段通常在讲同一件事）。但如果那一段连续很长
+    （实测把「一张原图盖 14 段」兜住之后，剩下的 11 段会连成一组），
+    生成出来的就又是**一张图讲 80 秒**，只不过从「原图对不上」变成「生成的图对不上」。
+
+    `merge_runs_to_cap` 只合并不拆分（它管的是「组数超过上限」），所以这里补上拆分那半边。
+    实测单张生成图约 10 秒 / 3000+ token，所以段均 7.3 秒下 3 段 ≈ 22 秒一张，
+    成本与「每段一张」不是一个量级。
+    """
+    if max_len <= 0:
+        return runs
+    out: list[tuple[int, int]] = []
+    for start, end in runs:
+        position = start
+        while position < end:
+            out.append((position, min(position + max_len, end)))
+            position += max_len
+    return out
 
 
 def merge_runs_to_cap(

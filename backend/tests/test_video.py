@@ -4090,3 +4090,88 @@ class TestPerBeatFreshGeneration:
         # 理由按「这一段第一句」收
         assert result.scenes[0]["why"] == "开场点题"
         assert result.scenes[1]["why"] == "讲机制"
+
+
+class TestOneFigureCannotCoverAHundredSeconds:
+    """同一张论文原图不许连续覆盖太久 —— 用户报的「文本和图像还是无法对应」。
+
+    实测根因（e3083750）：f2 一张图**连续盖了 14 段 / 101 秒**，而解说在这 101 秒里走过
+    「σ-Reveal 怎么挑文件 → 节点打分 → 为什么带父目录 → 相关性分数怎么算 → 数据/代码两类权重
+    → A3 用语法结构 → 编辑距离 → 三通道优势」至少 8 个话题。模型每一段的 `why` 都具体且
+    不同（它认真判了），但它的判据是「话题属于这篇论文」而不是「这句话讲的东西图上看得见」——
+    6 张原图对 41 段，它只能反复挑最像的那张。prompt 那边收紧判据，这里保证**上限**。
+    """
+
+    def test_a_long_run_gets_capped(self):
+        from app.services.design import FIGURE_RUN_MAX_SEGMENTS, GENERATE_ID
+        from app.services.video import cap_figure_runs
+
+        picks = ["f2"] * 14
+        capped = cap_figure_runs(picks)
+        assert capped[:FIGURE_RUN_MAX_SEGMENTS] == ["f2"] * FIGURE_RUN_MAX_SEGMENTS
+        assert all(pick == GENERATE_ID for pick in capped[FIGURE_RUN_MAX_SEGMENTS:])
+
+    def test_short_runs_are_untouched(self):
+        from app.services.video import cap_figure_runs
+
+        picks = ["f1", "f1", "f2", "f2", "f2", "f3"]
+        assert cap_figure_runs(picks) == picks
+
+    def test_cover_and_illustration_are_exempt(self):
+        """片头那几帧顶着封面标题、信息图只做中性过渡 —— 都是有意停在一张图上的。"""
+        from app.services.video import cap_figure_runs
+
+        assert cap_figure_runs(["cover"] * 5) == ["cover"] * 5
+        assert cap_figure_runs(["illustration"] * 8) == ["illustration"] * 8
+        assert cap_figure_runs(["generate"] * 8) == ["generate"] * 8
+
+    def test_several_runs_are_each_capped(self):
+        from app.services.design import GENERATE_ID
+        from app.services.video import cap_figure_runs
+
+        capped = cap_figure_runs(["f1"] * 5 + ["f2"] * 4)
+        assert capped.count(GENERATE_ID) == 2 + 1, capped
+
+    def test_it_actually_runs_inside_compose(self, tmp_path, monkeypatch):
+        """兜底要真的接在出片那条线上（不是只有一个没人调的函数）。"""
+        from app.services import video as video_module
+        from app.services.design import GENERATE_ID
+
+        picks = ["f1"] * 6
+        image_for_segment, beat_picks = video_module._apply_figure_run_cap(
+            picks, beat_picks=[["f1"] * 2] * 6
+        )
+        assert image_for_segment[3:] == [GENERATE_ID] * 3
+        assert beat_picks[3:] == [[GENERATE_ID] * 2] * 3, "逐句那层要跟着段走，否则画面不会变"
+        _ = monkeypatch
+
+
+class TestAGeneratedImageAlsoCoversAtMostAFewSegments:
+    """把「一张原图盖 14 段」兜住之后，剩下的段落会连成一条很长的 `generate` 区间 ——
+    而 `group_generate_runs` 会把连续区间合并成**一张**图，于是又变成「一张图讲 80 秒」
+    （只是从「原图对不上」变成「生成的图对不上」）。所以合并之外还要会**拆**。
+    """
+
+    def test_a_long_generate_run_is_split(self):
+        from app.services.design import FIGURE_RUN_MAX_SEGMENTS
+        from app.services.video import split_long_runs
+
+        splits = split_long_runs([(11, 22)])
+        assert len(splits) == (11 + FIGURE_RUN_MAX_SEGMENTS - 1) // FIGURE_RUN_MAX_SEGMENTS
+        assert all(end - start <= FIGURE_RUN_MAX_SEGMENTS for start, end in splits)
+        assert splits[0][0] == 11 and splits[-1][1] == 22, "覆盖范围不能变"
+
+    def test_short_runs_are_untouched(self):
+        from app.services.video import split_long_runs
+
+        assert split_long_runs([(3, 6), (9, 10)]) == [(3, 6), (9, 10)]
+
+    def test_it_still_respects_the_topic_image_cap(self):
+        """拆完之后还要过「组数上限」那一关（拆出的组太多就再合并回去）。"""
+        from app.services.video import merge_runs_to_cap, split_long_runs
+
+        runs = split_long_runs([(0, 40)], max_len=3)     # 14 组
+        assert len(runs) == 14
+        capped = merge_runs_to_cap(runs, 12)
+        assert len(capped) == 12
+        assert capped[0][0] == 0 and capped[-1][1] == 40
