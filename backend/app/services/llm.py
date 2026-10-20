@@ -83,6 +83,12 @@ class LLMClient:
         self.mode = settings.llm_mode
         self.mock = self.mode == "mock"
         self.base_url, self.api_key, self.model, self.timeout = settings.llm_credentials
+        # **用量台账**：这一集一共调了几次模型、进出多少 token。
+        # 以前完全没记 —— 所以「生成一集花多少钱」只能靠猜。`usage` 是提供方在响应里
+        # 直接给的（DeepSeek / Ark 都按 OpenAI 兼容返回），不额外花任何调用。
+        self.usage: dict[str, int] = {
+            "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        }
         self.provider_label = {"deepseek": "DeepSeek", "doubao": "豆包方舟"}.get(
             self.mode, "Mock"
         )
@@ -556,6 +562,18 @@ class LLMClient:
 
     # ---------- 内部 ----------
 
+    def _record_usage(self, usage: dict[str, Any]) -> None:
+        """把这一次调用的 token 用量记进台账（拿不到就只记次数）。"""
+        self.usage["calls"] += 1
+        for key, field in (
+            ("prompt_tokens", "prompt_tokens"),
+            ("completion_tokens", "completion_tokens"),
+            ("total_tokens", "total_tokens"),
+        ):
+            value = usage.get(key)
+            if isinstance(value, int):
+                self.usage[field] += value
+
     def _chat_json(
         self,
         messages: list[dict[str, str]],
@@ -637,6 +655,7 @@ class LLMClient:
         choices = body.get("choices") or []
         if not choices:
             raise LLMError(f"{self.provider_label} 返回中没有 choices：{str(body)[:200]}")
+        self._record_usage(body.get("usage") or {})
         content = (choices[0].get("message") or {}).get("content") or ""
         if not isinstance(content, str) or not content.strip():
             raise LLMError(f"{self.provider_label} 返回了空 message")

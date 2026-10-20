@@ -1419,6 +1419,9 @@ class RenderedLayers:
     # 与逐句卡分开：状态数由内容决定（几个节点就几步），与字幕句数无关。
     diagram_states: list[list[tuple[Path, float]]] = field(default_factory=list)
     beat_focuses: list[list[Path | None]] = field(default_factory=list)
+    # 「本段要点」滑入的时刻（相对本段的秒数，0 = 段首）。见 `point_moment`：
+    # 让它晚一句进来，一段里就多一个「有意义的变化事件」——静止空档就是这么压下去的。
+    point_moments: list[float] = field(default_factory=list)
     # 每一段的**版式**：图注/强调行跟着图的下沿走（`design.content_layout`）。
     # 渲染各层用它、编码叠层也用它 —— 「跟着图走」只有一个来源。
     # 空列表 = 全部用传入的基准版式（老调用点不受影响）。
@@ -1717,8 +1720,15 @@ def _render_scene_layers(
                 _render_point_layer(scene.point, point_path, layout=lay, session=session)
                 result.point_rows.append(point_path)
                 result.point_paths.append(point_path)
+                # 要点行**晚一句**滑进来（见 `point_moment`）：一段里多一个变化事件
+                windows = (
+                    beat_windows_aligned(beats, scene.duration, start=scene.start, pauses=pauses)
+                    if len(beats) > 1 else None
+                )
+                result.point_moments.append(point_moment(scene, windows=windows))
             else:
                 result.point_rows.append(None)
+                result.point_moments.append(0.0)
 
     return result
 
@@ -2272,6 +2282,7 @@ def compose_video(
         target_duration=audio_duration,
         caption_bands=layers.caption_bands,
         point_rows=layers.point_rows,
+        point_moments=layers.point_moments,
         pauses=pauses,
         image_cards=layers.cards,
         transitions=transitions,
@@ -2373,6 +2384,22 @@ def compose_video(
     # 原来 `visual_plan` 写在它之前 —— 算出来了、日志也打了，但**从来没进过库**
     # （同一类：算过、打过日志、没存下来，和 `video.scenes[i].diagram` 那个 bug 一个模子）。
     result.qa["visual_plan"] = visual_summary
+
+    # **成本台账**：这一步（视频合成）一共调了几次模型、进出多少 token。
+    # 现场生成配图 / 图解草案 / 要点 都在这条链上，是**唯一**可能花钱的地方；
+    # 以前只打日志，事后没有任何地方能回答「这一集花了多少」。
+    try:
+        usage = getattr(llm, "usage", None)
+        if isinstance(usage, dict) and usage.get("calls"):
+            result.qa["cost"] = dict(usage)
+            logger.info(
+                "本集视频阶段的模型花费：%d 次调用 / 输入 %d / 输出 %d tokens",
+                usage.get("calls", 0),
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+            )
+    except Exception:  # pragma: no cover - 台账不该影响出片
+        logger.warning("记录模型用量失败（不影响出片）", exc_info=True)
 
     # **接缝审计**（只读）：逐切点量「切点两侧的动对不对得上」。
     # `video_qa` 只能回答「画面有没有卡住」（≥4 秒无变化），回答不了「切得顺不顺」——
@@ -2490,6 +2517,19 @@ def _apply_figure_run_cap(
             if index < len(beat_picks):
                 beat_picks[index] = [GENERATE_ID] * len(beat_picks[index])
     return capped, beat_picks
+
+
+def point_moment(scene: "Scene", *, windows: list[tuple[float, float]] | None = None) -> float:
+    """「本段要点」在**这一段里的第几秒**滑进来（默认第二句开始时，0 表示第 0 秒）。"""
+    if len(split_caption_beats(scene.text)) <= POINT_REVEAL_AT_BEAT:
+        return 0.0
+    if not windows or len(windows) <= POINT_REVEAL_AT_BEAT:
+        return 0.0
+    # ⚠️ `beat_windows_aligned` 返回的是**段内相对**窗口（`start=` 只用于把边界映射到
+    # 绝对时间去吸停顿，返回前又还原了）。第一版按绝对时间算了，减掉 scene.start 之后
+    # 变成负数 → 全被 `max(0, ...)` 吃成 0，改动「看起来生效、实际没生效」。
+    start = float(windows[POINT_REVEAL_AT_BEAT][0])
+    return max(0.0, min(start, scene.duration * POINT_REVEAL_RATIO_MAX))
 
 
 def cap_figure_runs(picks: list[str], *, max_run: int = FIGURE_RUN_MAX_SEGMENTS) -> list[str]:

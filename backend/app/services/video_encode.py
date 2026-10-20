@@ -140,6 +140,8 @@ def encode_video(
     target_duration: float | None = None,
     caption_bands: list[list[CaptionBand]] | None = None,
     point_rows: list[Path | None] | None = None,
+    # 「本段要点」滑入的时刻（相对本段秒数，0 = 段首）。见 `video.point_moment`。
+    point_moments: list[float] | None = None,
     pauses: list[Pause] | None = None,
     image_cards: list[Path | None] | None = None,
     transitions: list[Transition] | None = None,
@@ -507,19 +509,24 @@ def encode_video(
                 graph.append(f"[{last}][po{node}]overlay=0:0[v{node}]")
                 last = f"v{node}"
 
-            # ---- 本段要点：从左侧滑入（标记这一段的开始） ----
+            # ---- 本段要点：从左侧滑入（**默认晚一句**，见 `video.point_moment`） ----
             row = rows[index] if index < len(rows) else None
             if row is not None:
                 row_in = add_image(row)
                 node += 1
                 graph.append(f"[{row_in}:v]format=rgba[pt{node}]")
+                at = float(point_moments[index]) if point_moments and index < len(point_moments) else 0.0
                 # 具名预设：滑入的过冲与峰值位置在 `motion.SPRING_PRESETS["slide"]` 里
-                ease = spring_ease(POINT_SLIDE_SEC, **spring_kwargs("slide"))
+                ease = spring_ease(POINT_SLIDE_SEC, variable=f"(t-{at:.3f})", **spring_kwargs("slide"))
                 # 滑入用**弹簧**而不是 `min(1, t/T)`：后者是匀速（实测就是「机器在滑」），
                 # 而 936px 的匀速位移最能看出「没有缓动」。过冲 2%（≈19px）后就地落定。
+                # `at > 0` 时这一行**在第 at 秒才进场**：一段里因此多一个「有意义的变化事件」，
+                # 静止空档占比靠它往下压（实测 51%~62% → 见 docs/VIDEO_QA.md）。
                 graph.append(
                     f"[{last}][pt{node}]overlay="
-                    f"x='-(W)+W*{ease}':y={scene_layout.point_top}[v{node}]"
+                    f"x='-(W)+W*{ease}':y={scene_layout.point_top}"
+                    + (f":enable='gte(t,{at:.3f})'" if at > 0 else "")
+                    + f"[v{node}]"
                 )
                 last = f"v{node}"
 

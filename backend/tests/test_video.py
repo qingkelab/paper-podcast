@@ -4183,3 +4183,84 @@ class TestAGeneratedImageAlsoCoversAtMostAFewSegments:
         capped = merge_runs_to_cap(runs, 12)
         assert len(capped) == 12
         assert capped[0][0] == 0 and capped[-1][1] == 40
+
+
+class TestThePointRowLandsOnTheSecondSentence:
+    """「本段要点」不再在第 0 秒滑进来，而是**晚一句**（staged reveal）。
+
+    为什么：一句 30 字要念 10 秒，要点第 0 秒就进场的话，剩下那 10 秒画面**什么都不变**。
+    实测整片静止空档 51%~62%、接缝审计 398 处切点两侧全都没在动 —— 这一条是往反方向拉的
+    最小改动（不动字幕、不换图）。
+    """
+
+    @staticmethod
+    def _scene(text: str, start: float = 0.0, end: float = 12.0):
+        from app.services.video_core import Scene
+
+        return Scene(start=start, end=end, image=Path("x.png"), kind="figure", text=text)
+
+    def test_a_single_sentence_scene_keeps_zero(self):
+        from app.services.video import point_moment
+
+        scene = self._scene("整整一段就是一句话。", 0.0, 8.0)
+        assert point_moment(scene) == 0.0
+
+    def test_two_sentences_move_it_to_the_second_sentence(self):
+        from app.services.video import point_moment
+
+        # ⚠️ 切句有下限（`CAPTION_BEAT_MIN_CHARS=28`）：太短的句子不拆。
+        # 第一版用了 20 个字的两句，`split_caption_beats` 根本不切 → 断言失败。
+        scene = self._scene(
+            "这一段我们先把背景交代清楚，免得后面听不懂。接下来才是这一节真正要说的结论。",
+            10.0, 30.0,
+        )
+        # 窗口是**段内相对**时间（`beat_windows_aligned` 的返回值），见 `point_moment`
+        windows = [(0.0, 6.0), (6.0, 20.0)]
+        moment = point_moment(scene, windows=windows)
+        assert moment == pytest.approx(6.0), "应当落在第二句开始时（段内第 6 秒）"
+
+    def test_it_never_waits_past_forty_percent_of_the_scene(self):
+        from app.services.design import POINT_REVEAL_RATIO_MAX
+        from app.services.video import point_moment
+
+        scene = self._scene(
+            "第一句写得非常非常长，长到把大半段时间都用掉，听众也会跟着走神。第二句才收尾。",
+            0.0, 30.0,
+        )
+        windows = [(0.0, 27.0), (27.0, 30.0)]   # 段内相对
+        assert point_moment(scene, windows=windows) <= 30.0 * POINT_REVEAL_RATIO_MAX + 1e-6
+
+    def test_the_encoder_gates_the_row_on_that_moment(self):
+        """编码侧要**真的**把 `enable='gte(t,at)'` 写进滤镜链，而不只是算了个数。"""
+        import inspect
+
+        from app.services import video_encode
+
+        source = inspect.getsource(video_encode.encode_video)
+        assert "point_moments" in source
+        assert "enable='gte(t,{at:.3f})'" in source
+
+
+class TestTheCostLedger:
+    """「这一集的模型花了多少」必须能查到 —— 以前只有日志，事后无处可查。"""
+
+    def test_usage_is_accumulated_on_the_client(self):
+        from app.services.llm import LLMClient
+
+        client = LLMClient.__new__(LLMClient)
+        client.usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        client._record_usage({"prompt_tokens": 1200, "completion_tokens": 300, "total_tokens": 1500})
+        client._record_usage({"prompt_tokens": 800, "completion_tokens": 200, "total_tokens": 1000})
+        assert client.usage == {
+            "calls": 2, "prompt_tokens": 2000,
+            "completion_tokens": 500, "total_tokens": 2500,
+        }
+
+    def test_a_missing_usage_field_still_counts_the_call(self):
+        from app.services.llm import LLMClient
+
+        client = LLMClient.__new__(LLMClient)
+        client.usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        client._record_usage({})
+        assert client.usage["calls"] == 1
+        assert client.usage["prompt_tokens"] == 0
