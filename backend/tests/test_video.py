@@ -4125,12 +4125,19 @@ class TestOneFigureCannotCoverAHundredSeconds:
         picks = ["f1", "f1", "f2", "f2", "f2", "f3"]
         assert cap_figure_runs(picks) == picks
 
-    def test_cover_and_illustration_are_exempt(self):
-        """片头那几帧顶着封面标题、信息图只做中性过渡 —— 都是有意停在一张图上的。"""
+    def test_cover_is_exempt_but_the_illustration_is_capped(self):
+        """片头那几帧顶着封面标题（有意停在一张图上）；**信息图不许连着盖太久**。
+
+        实测 15 集 469 段里信息图覆盖 38%（最差一集 21/31 段）—— 一张概括图对二三十段
+        不同的解说，是「图文对不上」的最大来源（比现场生成图 7% 大得多）。
+        """
+        from app.services.design import GENERATE_ID, ILLUSTRATION_RUN_MAX_SEGMENTS
         from app.services.video import cap_figure_runs
 
         assert cap_figure_runs(["cover"] * 5) == ["cover"] * 5
-        assert cap_figure_runs(["illustration"] * 8) == ["illustration"] * 8
+        capped = cap_figure_runs(["illustration"] * 8)
+        assert capped[:ILLUSTRATION_RUN_MAX_SEGMENTS] == ["illustration"] * ILLUSTRATION_RUN_MAX_SEGMENTS
+        assert capped[ILLUSTRATION_RUN_MAX_SEGMENTS:] == [GENERATE_ID] * (8 - ILLUSTRATION_RUN_MAX_SEGMENTS)
         assert cap_figure_runs(["generate"] * 8) == ["generate"] * 8
 
     def test_several_runs_are_each_capped(self):

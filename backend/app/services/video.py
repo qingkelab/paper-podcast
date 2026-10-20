@@ -2553,11 +2553,11 @@ def cap_figure_runs(picks: list[str], *, max_run: int = FIGURE_RUN_MAX_SEGMENTS)
         while end + 1 < len(out) and out[end + 1] == pick:
             end += 1
         run = end - index + 1
-        if (
-            run > max_run
-            and pick not in ("cover", "illustration", GENERATE_ID)
-        ):
-            for position in range(index + max_run, end + 1):
+        # 每张图自己的上限：论文原图 3 段、信息图 3 段（它只能当中性过渡）、
+        # 封面不设限（片头那几帧本来就停在同一张首页上）。
+        limit = ILLUSTRATION_RUN_MAX_SEGMENTS if pick == "illustration" else max_run
+        if run > limit and pick not in ("cover", GENERATE_ID):
+            for position in range(index + limit, end + 1):
                 out[position] = GENERATE_ID
         index = end + 1
     return out
