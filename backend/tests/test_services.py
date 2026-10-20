@@ -1117,11 +1117,13 @@ class TestRetryCarriesTheRealFailure:
         from app.services import prompts
         from app.services.llm import LLMClient
 
-        target = prompts.target_chars(3, 350)      # 和被测代码同一个口径
+        # ⚠️ `speech_rate` 是**百分比档位**（0 = 正常），不是「字/分钟」——
+        # 这两个测试原来传 350，被 `effective_rate` 的新校验当场抓住（正是它该抓的）。
+        target = prompts.target_chars(3)            # 和被测代码同一个口径（默认档位 0）
         original = int(target * 1.5)
         client, _ = self._client([int(target * 1.32), int(target * 1.18)])
         result = client._repair_length_if_needed(
-            self._script(original), analysis={}, duration_min=3, level="intro", speech_rate=350,
+            self._script(original), analysis={}, duration_min=3, level="intro", speech_rate=0,
         )
         assert result["word_count"] < original, result["word_count"]
         assert result.get("length_repair", {}).get("still_over_budget") is True
@@ -1132,11 +1134,11 @@ class TestRetryCarriesTheRealFailure:
         from app.services import prompts
         from app.services.llm import LLMClient
 
-        target = prompts.target_chars(3, 350)
+        target = prompts.target_chars(3)
         client, _ = self._client([int(target * 1.32), int(target * 0.95)])
         result = client._repair_length_if_needed(
             self._script(int(target * 1.5)), analysis={}, duration_min=3,
-            level="intro", speech_rate=350,
+            level="intro", speech_rate=0,
         )
         ledger = result.get("length_repair")
         assert ledger and ledger["attempts"], ledger
@@ -1233,3 +1235,34 @@ class TestNoFirstPerson:
             [{"text": "“Attention Is All You Need” does one thing."}], language="en"
         )
         assert hits == []
+
+
+class TestSpeedPercentIsNotACharRate:
+    """`effective_rate(speech_rate)` 的 `speech_rate` 是**百分比偏移**，不是「字/分钟」。
+
+    踩过的坑（我自己踩的）：给它传 350（以为是「350 字/分钟」），
+    它会静默算成 `base × 4.5` —— 3 分钟档的目标字数从 1050 变成 4725，
+    而且**不报错**，只是时长模型整个偏掉。所以现在越界直接 raise。
+    """
+
+    def test_zero_means_the_base_rate(self):
+        from app.services.prompts.units import CHARS_PER_MINUTE, effective_rate
+
+        assert effective_rate(0) == CHARS_PER_MINUTE
+        assert effective_rate(10) > CHARS_PER_MINUTE
+        assert effective_rate(-20) < CHARS_PER_MINUTE
+
+    def test_passing_a_char_rate_explodes_loudly(self):
+        import pytest as _pytest
+
+        from app.services.prompts.units import effective_rate
+
+        with _pytest.raises(ValueError, match="百分比偏移"):
+            effective_rate(350)
+
+    def test_target_chars_still_works_with_the_default_rate(self):
+        """默认档位（0）下，3 分钟档的目标字数仍然按 350 字/分钟算（≈1050）。"""
+        from app.services import prompts
+
+        assert 1000 < prompts.target_chars(3) < 1100
+

@@ -14,6 +14,8 @@ __all__ = [
     "WORDS_PER_MINUTE_EN",
     "MAX_ROUND_CHARS",
     "AI_CLICHES",
+    "SPEED_PERCENT_MAX",
+    "SPEED_PERCENT_MIN",
     "effective_rate",
     "output_language_rule",
     "brand_padding_sec",
@@ -74,11 +76,26 @@ AI_CLICHES = {
 }
 
 
-def effective_rate(speech_rate: int = 0, language: str = "zh") -> float:
-    """把语速档位换算成实际语速。
+# 「语速档位」的合法范围（百分比偏移）。0 = 正常；+10 = 快 10%；-20 = 慢 20%。
+# 超出这个范围的一定是**把「字/分钟」当成了档位**（我本人就传过一次 350，
+# 于是 `effective_rate` 静默算成 base×4.5，目标字数凭空涨了 4.5 倍）。
+SPEED_PERCENT_MIN = -50
+SPEED_PERCENT_MAX = 100
 
-    中文是字/分钟，英文是词/分钟 —— 两者量纲不同，不能用同一个常量。
+
+def effective_rate(speech_rate: int = 0, language: str = "zh") -> float:
+    """把**语速档位**换算成实际语速（字/分钟 或 词/分钟）。
+
+    ⚠️ `speech_rate` 是**百分比偏移**，不是「字/分钟」：0 = 正常，10 = 快 10%。
+    名字有歧义（历史上就这么叫的），所以这里加了硬校验 —— 越界直接报错，
+    **不许静默算出 4.5 倍**。中文是字/分钟，英文是词/分钟，两者量纲不同，不能共用一个常量。
     """
+    if not SPEED_PERCENT_MIN <= speech_rate <= SPEED_PERCENT_MAX:
+        raise ValueError(
+            f"语速档位 {speech_rate} 越界（合法范围 {SPEED_PERCENT_MIN}~{SPEED_PERCENT_MAX}）。"
+            "这是**百分比偏移**（0 = 正常语速），不是「字/分钟」——"
+            "想改基础语速请改 `CHARS_PER_MINUTE` / `WORDS_PER_MINUTE_EN`。"
+        )
     base = WORDS_PER_MINUTE_EN if language == "en" else CHARS_PER_MINUTE
     return base * (1.0 + speech_rate / 100.0)
 
