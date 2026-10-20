@@ -138,7 +138,7 @@ AGENTS.md 只留**结论与入口**；推导、实测数据、踩坑的来龙去
 | 封面爆款标题（写法 + 清洗 `normalize_hook`） | `services/prompts/cover.py` |
 | 画面强调行 + 子图聚光灯的挑法 | `services/prompts/points.py` |
 | 逐段选图 + 配图理由 | `services/prompts/assign.py` |
-| 脚本写短了 / 写长了怎么补 | `services/prompts/repair.py` |
+| 脚本写短了 / 写长了怎么补（含压不下来时的确定性删段） | `services/prompts/repair.py` |
 | 折行、去尾虚词这类文字小工具 | `services/prompts/text.py` |
 | 弹簧缓动（过冲多少、公式、ffmpeg/JS 两种形态） | `services/motion.py` |
 | 成片自查（静止空档 / 音画长度差）与响度目标 | `services/video_qa.py` / `services/loudness.py` |

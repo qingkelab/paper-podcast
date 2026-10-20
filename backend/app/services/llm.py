@@ -282,6 +282,19 @@ class LLMClient:
                         "base_segments": current.get("segments", []),
                     }
                 if attempt == 2:
+                    # **模型压不下来就整段删**（确定性兜底）。实测两次精简只减 8%，
+                    # 而目标时长要的是 −25%~−30% —— 只靠「让模型再删几句」做不到。
+                    pruned = self._prune_overflow(
+                        current if detail.get("candidate") is None else detail["candidate"],
+                        target=target,
+                        language=language,
+                        attempts=attempts,
+                        actual=actual,
+                        speech_rate=speech_rate,
+                        padding_sec=padding_sec,
+                    )
+                    if pruned is not None:
+                        return pruned
                     best = detail.get("after")
                     if candidate is not None and best is not None and best < actual:
                         logger.warning(
@@ -359,6 +372,63 @@ class LLMClient:
             "扩写完成：%d → %d 字（目标 %d 字）", actual, repaired["word_count"], target
         )
         return repaired
+
+    def _prune_overflow(
+        self,
+        script: dict[str, Any],
+        *,
+        target: int,
+        language: str,
+        attempts: list[dict[str, Any]],
+        actual: int,
+        speech_rate: int = 0,
+        padding_sec: float = 0.0,
+    ) -> dict[str, Any] | None:
+        """最后的确定性兜底：还超预算就**整段删**到预算内（规则见 `prompts.repair.prune_to_budget`）。
+
+        只在「两次精简之后仍然超预算 10% 以上」时才动手 —— 差一点点就接受，
+        不要为了几十个字去动结构。返回 `None` 表示「不用删 / 删了也救不回来」。
+        """
+        from .prompts.repair import prune_to_budget
+
+        budget = target * LENGTH_TRIM_THRESHOLD
+        # **超过硬预算就删**（不给自己留 10% 余量）：预算本身已经是「目标 ×1.15」，
+        # 再容 10% 就是 +26% —— 实测那样落不回设定时长（3 分钟档会播到 3.9 分钟）。
+        if script.get("word_count", actual) <= budget:
+            return None
+        kept, deleted = prune_to_budget(
+            script.get("segments") or [],
+            target_chars=target,
+            budget_chars=int(budget),
+            language=language,
+        )
+        if not deleted:
+            return None
+        pruned = build_script_payload(
+            kept, speech_rate=speech_rate, padding_sec=padding_sec, language=language
+        )
+        pruned["segments"] = [
+            {**segment, "round": index} for index, segment in enumerate(kept)
+        ]
+        pruned["length_repair"] = {
+            "attempts": attempts,
+            "pruned": True,
+            "deleted": deleted,
+            "before_prune": script.get("word_count", actual),
+            "after_prune": pruned["word_count"],
+            "target": target,
+            "budget": int(budget),
+        }
+        logger.warning(
+            "两次精简都没进预算（%d 字），按规则整段删了 %d 段：%d → %d 字（目标 %d，上限 %d）",
+            script.get("word_count", actual),
+            len(deleted),
+            script.get("word_count", actual),
+            pruned["word_count"],
+            target,
+            int(budget),
+        )
+        return pruned
 
     def _trim_script(
         self,

@@ -1109,10 +1109,10 @@ class TestRetryCarriesTheRealFailure:
         assert "【上一版的结果】" not in first
 
     def test_the_trim_loop_keeps_the_shorter_version_when_both_attempts_miss(self):
-        """两次都没压进预算，但第二版明显更短 → **留更短的那一版**，不是退回原稿。
+        """两次都没压进预算 → 先留更短的那一版，再交给**确定性删段**落进预算。
 
-        原来两条出口都返回原稿：「压不到 1050」就把 1572 → 1250 的成果一起丢掉，
-        只因为 1250 > 预算 1207。可它已经比原稿短 322 字、离目标 19%。
+        原来两条出口都返回原稿：「压不到 1050」就把 1572 → 1250 的成果一起丢掉。
+        现在更近一步：没进预算就按规则整段删（记录在台账里），保证**时长兑现**。
         """
         from app.services import prompts
         from app.services.llm import LLMClient
@@ -1126,8 +1126,10 @@ class TestRetryCarriesTheRealFailure:
             self._script(original), analysis={}, duration_min=3, level="intro", speech_rate=0,
         )
         assert result["word_count"] < original, result["word_count"]
-        assert result.get("length_repair", {}).get("still_over_budget") is True
-        assert len(result["length_repair"]["attempts"]) == 2
+        assert result["word_count"] <= target * 1.15 + 1, "没落进预算（时长就兑现不了）"
+        ledger = result.get("length_repair") or {}
+        assert len(ledger.get("attempts") or []) == 2
+        assert ledger.get("pruned") is True and ledger["deleted"], ledger
 
     def test_the_ledger_is_recorded_even_when_it_succeeds(self):
         """成功也要留下台账（几次、每版多少字）—— 只写日志等于没人看得见。"""
@@ -1266,3 +1268,101 @@ class TestSpeedPercentIsNotACharRate:
 
         assert 1000 < prompts.target_chars(3) < 1100
 
+
+
+class TestPruneToBudget:
+    """模型压不下来就**整段删**（确定的规则，可复算）。
+
+    实测：目标 936 字，模型写 1303（+39%），两次精简只减 8%（→1194，仍在预算 1076 之上），
+    成片于是比设定时长长 24%~69%。「让模型再删几句」这条路已经试到 #2 了，所以补一条
+    不依赖模型的闸。
+    """
+
+    SEGS = [
+        {"speaker": "A", "brand": "intro", "text": "这里是青稞社区。我们只讲自己读过的东西。"},
+        {"speaker": "A", "text": "这是一段很长的解释，" * 20},
+        {"speaker": "B", "text": "那基线公平吗？"},
+        {"speaker": "A", "text": "在 16 个任务上提升 67%，基线是 ResNet-50。"},
+        {"speaker": "A", "text": "所以它的意义在这里。"},
+        {"speaker": "B", "text": "今天就聊到这儿。"},
+    ]
+
+    def test_within_budget_is_a_noop(self):
+        from app.services.prompts.repair import prune_to_budget
+
+        kept, deleted = prune_to_budget(self.SEGS, target_chars=10000, budget_chars=11500)
+        assert kept == self.SEGS and deleted == []
+
+    def test_it_deletes_the_longest_digit_free_segment_first(self):
+        from app.services.prompts.repair import prune_to_budget
+
+        kept, deleted = prune_to_budget(self.SEGS, target_chars=100, budget_chars=147)
+        assert [item["segment"] for item in deleted] == [1], deleted
+        assert all("青稞社区" in seg["text"] for seg in kept if seg.get("brand"))
+
+    def test_digits_and_the_ends_are_protected_as_long_as_possible(self):
+        """含数字的段（证据）、品牌段、第一段、最后两段 —— **优先不删**。
+
+        注意这里的规矩是「优先级」而不是「绝对不删」：预算极端紧时（比如只剩 11 个字），
+        为了把稿子压进时长只能把能删的都删掉。所以断言分两半：
+        品牌段与最后一段**永远**在（它们不在候选里），含数字的段**排在最后**才被删。
+        """
+        from app.services.prompts.repair import prune_to_budget
+
+        # ① 只需要删一两段时，先删不含数字的那段
+        _kept, deleted = prune_to_budget(self.SEGS, target_chars=100, budget_chars=147)
+        assert all("67%" not in item["head"] for item in deleted), "含数字的段被优先删了"
+
+        # ② 预算极端紧时，能删的都删；但品牌段/第一段/最后两段仍然留着
+        kept, deleted = prune_to_budget(self.SEGS, target_chars=10, budget_chars=11, max_delete=8)
+        survivors = {seg["text"] for seg in kept}
+        assert any("青稞社区" in text for text in survivors), "品牌段被删了"
+        assert "今天就聊到这儿。" in survivors, "最后一段被删了"
+        assert deleted
+
+    def test_it_stops_at_the_delete_cap(self):
+        from app.services.prompts.repair import prune_to_budget
+
+        kept, deleted = prune_to_budget(self.SEGS, target_chars=1, budget_chars=1, max_delete=1)
+        assert len(deleted) == 1, "删段数量必须有上限，不能把稿子删空"
+
+    def test_the_ledger_says_what_was_deleted(self):
+        from app.services.prompts.repair import prune_to_budget
+
+        _kept, deleted = prune_to_budget(self.SEGS, target_chars=100, budget_chars=147)
+        assert set(deleted[0]) == {"segment", "chars", "head", "unit"}
+
+
+class TestTheTrimLoopFallsBackToDeletion:
+    def test_a_stubborn_script_is_pruned_into_budget(self):
+        """两次精简都压不下来 → 整段删，并且台账里记着删了哪些段。"""
+        from app.services import prompts
+        from app.services.llm import LLMClient
+
+        class _Stubborn:
+            calls = 0
+
+            def _chat_json(self, messages, *, max_tokens, temperature=0.6):
+                _Stubborn.calls += 1
+                # 每次交回一版**更短但仍然超预算**的稿子：两次精简都「压不动」
+                text = "这一段的解释很长" * 20
+                return {"segments": [{"speaker": "A", "text": text} for _ in range(9)]}
+
+        client = LLMClient.__new__(LLMClient)
+        client.settings = None
+        client._chat_json = _Stubborn()._chat_json  # type: ignore[method-assign]
+        target = prompts.target_chars(3)
+        body = "这一段的解释很长" * 25          # 每段 200 字
+        segments = [
+            {"speaker": "A" if i % 2 == 0 else "B", "text": body,
+             **({"brand": "intro"} if i == 0 else {})}
+            for i in range(10)
+        ]
+        script = {"segments": segments, "word_count": sum(len(s["text"]) for s in segments)}
+        result = client._repair_length_if_needed(
+            script, analysis={}, duration_min=3, level="intro", speech_rate=0,
+        )
+        ledger = result.get("length_repair") or {}
+        assert ledger.get("pruned") is True, ledger
+        assert ledger["deleted"], "删段台账是空的"
+        assert result["word_count"] <= target * 1.15 + 1
