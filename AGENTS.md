@@ -104,9 +104,9 @@ AGENTS.md 只留**结论与入口**；推导、实测数据、踩坑的来龙去
 | 想深入看什么 | 打开 |
 |---|---|
 | 踩坑档案（按主题：数据与 PDF / 配图 / 渲染 / 编码 / TTS / 品牌 / 存储…） | `docs/PITFALLS.md` |
-| 画面渲染两条路径、Tier B、配图装填、宽图文字跟图、横版竖版 | `docs/RENDERING.md` |
+| 画面渲染两条路径、Tier B、配图装填与居中（`figure_fit`）、宽图文字跟图、横版竖版 | `docs/RENDERING.md` |
 | 动效（弹簧/缓动、转场、字幕换句、声波条、进度条）与影片语法 | `docs/VIDEO_MOTION.md` |
-| 逐句动效、图内聚光灯、配图理由（why） | `docs/BEAT_MOTION.md` |
+| 逐句动效、图内聚光灯、配图理由（why）、字幕字号（整集一个号） | `docs/BEAT_MOTION.md` |
 | 成片自查（静止空档 / 响度 / 音画差）与接缝审计 | `docs/VIDEO_QA.md` |
 | 动态图解镜头（证据核验 → 模型草案 → 着色渲染） | `docs/DIAGRAM_SHOTS.md` |
 | 标题与封面（爆款标题、毛玻璃封面、poster 静帧） | `docs/TITLE_COVER.md` |
@@ -154,6 +154,7 @@ AGENTS.md 只留**结论与入口**；推导、实测数据、踩坑的来龙去
 | ffmpeg 编码与静帧 | `services/video_encode.py` |
 | HTML 画面 / Chrome 截图 | `services/htmlpage.py` / `htmlframe.py` |
 | 流水线各阶段（解析→解读→脚本→TTS→视频） | `services/pipeline.py` |
+| **配图装填几何**（两条渲染路径共用一份） | `services/figure_fit.py` |
 | 单集接口（建 / 列表 / 详情 / 删除 / 重试） | `api/routes/episodes.py` |
 | 账号接口 | `api/routes/auth.py` |
 | 专辑接口 | `api/routes/albums.py` |

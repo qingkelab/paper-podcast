@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ..branding import BRAND_CTA_SUBTITLE, BRAND_CTA_TITLE, logo_path
+from . import figure_fit
 from .audio_track import Pause, align_boundaries
 from .design import (
     BEAT_IMAGE_MIN_SEC,
@@ -168,55 +169,14 @@ def _logo_data_uri(width: int) -> tuple[str, int, int] | None:
 CARD_OVERHANG_RATIO = 0.25
 
 
-@lru_cache(maxsize=64)
 def _ink_bbox_cached(path: str, threshold: int = 242) -> tuple[int, int, int, int] | None:
-    """按**文件**缓存的墨迹包围盒：同一张图在一次出片里要量两次（渲染 + 排文字），
-    而逐像素扫一遍 962×440 要 0.4 秒、1600×1200 要 1.5 秒（纯 Python 循环）。"""
-    try:
-        import pymupdf
-
-        return _ink_bbox(pymupdf.Pixmap(path), threshold=threshold)
-    except Exception:  # noqa: BLE001
-        logger.warning("量墨迹包围盒失败（%s），按整张图装填", path, exc_info=True)
-        return None
+    """按文件缓存的墨迹包围盒（实现在 `figure_fit`，HTML 那条路也用它）。"""
+    return figure_fit.ink_bbox_of_file(path, threshold)
 
 
 def _ink_bbox(pix: Any, *, threshold: int = 242) -> tuple[int, int, int, int] | None:
-    """图里**真正有内容**的矩形（x0, y0, x1, y1），整张全白时返回 None。
-
-    为什么需要它：论文原图大多是又宽又扁的，四周还带一大圈白（页边距、图表自身留白）。
-    原来的做法是「按整张图等比缩放到装进 896×742 的卡」——实测内容只占卡片中间一条，
-    **整帧 52% 的行是空白**，画面看着像"这一段没有配图"。
-
-    注意这里**只量、不裁**：量出包围盒之后按它来缩放和定位（见 `image_card_markup`），
-    内容一个字都不会丢，图外的白边会溢出到卡片之外 —— 而页面本来就是白底，
-    那点白边看不出来。比裁像素安全（也避开了 PyMuPDF 没有 Pixmap 裁剪构造这件事）。
-    """
-    try:
-        import pymupdf
-
-        gray = pymupdf.Pixmap(pymupdf.csGRAY, pix)
-        width, height = gray.width, gray.height
-        data = gray.samples
-        left, right, top, bottom = width, -1, height, -1
-        for y in range(height):
-            row = y * width
-            for x in range(width):
-                if data[row + x] < threshold:
-                    if x < left:
-                        left = x
-                    if x > right:
-                        right = x
-                    if y < top:
-                        top = y
-                    if y > bottom:
-                        bottom = y
-        if right < 0 or bottom < 0:
-            return None
-        return left, top, right + 1, bottom + 1
-    except Exception:  # noqa: BLE001  量不出来就用整张图，不影响出片
-        logger.warning("量墨迹包围盒失败，按整张图装填", exc_info=True)
-        return None
+    """图里真正有内容的矩形（见 `figure_fit.ink_bbox`）。"""
+    return figure_fit.ink_bbox(pix, threshold=threshold)
 
 
 def _pixmap_to_uri_at_scale(pix: Any, target_w: int, target_h: int) -> tuple[str, int, int]:
@@ -253,6 +213,260 @@ def _pixmap_to_uri(pix: Any, max_w: int, max_h: int) -> tuple[str, int, int]:
         "data:image/png;base64," + base64.b64encode(data).decode("ascii"),
         pix.width,
         pix.height,
+    )
+
+
+def _prepare_image(path: Path, max_w: int, max_h: int) -> tuple[str, int, int]:
+    """把图缩放到展示尺寸并转成 data URI。
+
+    先缩放再内嵌是有必要的：原始配图可能接近 1000x1200，直接 base64 内嵌会让
+    每张幻灯片的 SVG 膨胀到几百 KB，resvg 每次都要重新解码整张大图。
+    缩放后单帧渲染从 ~200ms 降到 ~40ms，30 帧就是好几秒的差别。
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover
+        raise VideoError("缺少 pymupdf，无法处理配图") from exc
+
+    try:
+        pix = pymupdf.Pixmap(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise VideoError(f"配图无法读取：{path.name}（{exc}）") from exc
+
+    scale = min(max_w / pix.width, max_h / pix.height, 1.0)
+    if scale < 1.0:
+        try:
+            target_w = max(int(pix.width * scale), 1)
+            target_h = max(int(pix.height * scale), 1)
+            pix = pymupdf.Pixmap(pix, target_w, target_h)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("配图缩放失败，使用原尺寸（会慢一些）：%s", exc)
+
+    data = pix.tobytes("png")
+    return (
+        "data:image/png;base64," + base64.b64encode(data).decode("ascii"),
+        pix.width,
+        pix.height,
+    )
+
+
+def _image_data_uri(path: Path, *, max_side: int = 1400) -> tuple[str, int, int]:
+    """把图缩到 `max_side` 以内再 base64 内嵌，返回 data URI。
+
+    封面要用 `preserveAspectRatio="slice"` 裁满整张卡（比例不受控），
+    所以不能走 `_prepare_image`（那个按 contain 算尺寸）。模糊之后细节本来就没了，
+    缩到 1400 以内既够用又不让 SVG 膨胀。
+
+    返回 `(data URI, 原始宽, 原始高)` —— 宽高要给调用方算**它在卡片里被放大/缩小了多少**，
+    模糊半径得按那个倍率走（见 `image_card_markup`）。
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover
+        raise VideoError("缺少 pymupdf，无法处理配图") from exc
+    try:
+        pix = pymupdf.Pixmap(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise VideoError(f"配图无法读取：{path.name}（{exc}）") from exc
+    scale = min(max_side / max(pix.width, pix.height), 1.0)
+    if scale < 1.0:
+        try:
+            pix = pymupdf.Pixmap(pix, max(int(pix.width * scale), 1), max(int(pix.height * scale), 1))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("封面底图缩放失败，使用原尺寸：%s", exc)
+    return (
+        "data:image/png;base64," + base64.b64encode(pix.tobytes("png")).decode("ascii"),
+        pix.width,
+        pix.height,
+    )
+
+
+def _wrap(text: str, max_units: float) -> list[str]:
+    """按全角单位宽度折行（西文按 0.55 计）。
+
+    实现在 `design.wrap_units`：折行规则 HTML 与 SVG 两条渲染路径必须共用，
+    所以它跟封面标题的断行规则（`design.hook_lines`）放在一起。这里只留旧名字。
+    """
+    return wrap_units(text, max_units)
+
+
+def _fit_subtitle(
+    text: str,
+    *,
+    max_lines: int = 6,
+    max_size: float = 30.0,
+    layout: Layout = PORTRAIT,
+) -> tuple[float, list[str]]:
+    """选一个既能放下、又不至于太小的字号。
+
+    竖版画幅只有 896px 宽，比横版窄很多，所以必须**同时**检查行数和总高度：
+    光看行数会在字号偏大时让文字溢出到画面外。
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return 24.0, []
+
+    def wrap_at(size: float) -> list[str]:
+        units = layout.subtitle_width / size
+        lines: list[str] = []
+        current = ""
+        width = 0.0
+        for token in _tokenize(text):
+            token_width = sum(_char_width(c) for c in token)
+            if current and width + token_width > units:
+                lines.append(current.strip())
+                current = ""
+                width = 0.0
+            if not current and token == " ":
+                continue
+            current += token
+            width += token_width
+        if current.strip():
+            lines.append(current.strip())
+        return lines
+
+    for size in (max_size - 2 * step for step in range(6)):
+        lines = wrap_at(size)
+        if len(lines) <= max_lines and len(lines) * size * 1.36 <= layout.subtitle_max_height:
+            return size, lines
+
+    # 还是放不下：用最小字号，超出部分截断加省略号
+    size = min(20.0, max_size)
+    lines = wrap_at(size)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:-1] + "…"
+    return size, lines
+
+
+def render_slide(
+    scene: Scene,
+    output_path: Path,
+    *,
+    include_subtitle: bool = True,
+    include_point: bool = True,
+    layout: Layout = PORTRAIT,
+) -> Path:
+    """渲染一帧画面：配图 + 图注 + 字幕（白底竖版，与论文首页同尺寸）。
+
+    `include_subtitle=False` 时只画字幕区的底色和分隔线，不画文字 ——
+    这一段的字幕会拆成几句、由 `render_caption_band` 单独渲染、再按时间叠上去
+    （见 `CaptionBand`）。底图里若还留着一整段文字，第一句出现之前就会露馅。
+
+    这个函数现在等于「骨架 + 图片卡」两层叠在一起（见下面的
+    `render_chrome` / `render_image_card`）。保留它是为了两件事：
+    现有的测试与「一页到底」的简单用法，以及需要单张整页图时不必自己拼。
+    """
+    return _render_slide_layers(
+        scene,
+        output_path,
+        include_subtitle=include_subtitle,
+        include_point=include_point,
+        include_image=True,
+        layout=layout,
+    )
+
+
+def render_chrome(
+    scene: Scene,
+    output_path: Path,
+    *,
+    include_subtitle: bool = True,
+    include_point: bool = True,
+    layout: Layout = PORTRAIT,
+) -> Path:
+    """只渲染**骨架**：白底 + logo + 图注 + 强调行 + 字幕带（图片区留白）。
+
+    为什么要拆出骨架：转场要的是「图片在变、版面不动」。实测那条 40 秒的论文宣传片
+    就是这种观感 —— 白底、每 9~10 秒换一次画面、换的时候整页快速淡过去。
+    只有把图片单独成层，才能做到「图片溶解、标题/图注/字幕/进度条一动不动」。
+    """
+    return _render_slide_layers(
+        scene,
+        output_path,
+        include_subtitle=include_subtitle,
+        include_point=include_point,
+        include_image=False,
+        layout=layout,
+    )
+
+
+@dataclass(frozen=True)
+class FittedFigure:
+    """一张配图在卡片里**装填之后**的结果（渲染与排版共用同一份，不各算一遍）。"""
+
+    data_uri: str
+    img_w: int
+    img_h: int
+    x: float
+    y: float
+    frame: tuple[float, float, float, float] | None  # 内容包围盒在卡内的位置（无则 None）
+    ink_h: int      # **内容**在卡内的高度：排图注时要的「图片下沿」就按它算
+    ink_w: int
+
+
+def fitted_figure_height(scene: Scene, layout: Any = None) -> int | None:
+    """这一段的图在卡片里实际能占多高；算不出来（封面/图解/读图失败）返回 None。
+
+    「文字层跟着图走」（`design.content_layout`）要的就是这个数 ——
+    它必须是**真正画出来的那一张卡**用的数，所以两边都走 `_fit_figure`。
+    """
+    if scene.diagram is not None or scene.brand == "outro" or (scene.headline or "").strip():
+        return None
+    try:
+        return _fit_figure(scene, layout or PORTRAIT).ink_h
+    except Exception:  # noqa: BLE001
+        logger.warning("量图片装填高度失败（%s），文字层按老位置摆", scene.image, exc_info=True)
+        return None
+
+
+def _fit_figure(scene: Scene, layout: Any) -> FittedFigure:
+    """把配图按**内容包围盒**装进卡片，返回 data URI 与落点。
+
+    两种模式：
+    - **普通配图**（论文原图/表格/概念示意）：量出「有墨」的矩形，按它算缩放与落点，
+      图外的白边溢出到卡片之外（页面本来就是白底，看不见）。不裁像素：裁错会丢内容，
+      溢出最多是不好看。溢出上限 `CARD_OVERHANG_RATIO`，防某张图底色不是纯白时露出方块。
+    - **图解/封面**（`scene.diagram` / `scene.headline`）：走原来的等比装填，一个字都不改。
+
+    `ink_w/ink_h` 是**内容**在卡内占的尺寸 —— 图注就是贴着它的下沿摆的。
+    """
+    card_w, card_h = layout.image_box_w, layout.image_box_h
+    data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
+    # 图解/封面走原来的等比装填，一个字都不改；普通配图按**内容包围盒**装填，
+    # 几何来自 `figure_fit`（HTML 那条路调的是同一段代码，见该模块的注释）。
+    if scene.diagram is None and not (scene.headline or "").strip():
+        try:
+            import pymupdf
+
+            source = pymupdf.Pixmap(str(scene.image))
+            fit = figure_fit.fit_figure(
+                card_w, card_h, source.width, source.height,
+                figure_fit.ink_bbox_of_file(str(scene.image)),
+            )
+            data_uri, img_w, img_h = _pixmap_to_uri_at_scale(source, fit.img_w, fit.img_h)
+            return FittedFigure(
+                data_uri=data_uri,
+                img_w=img_w,
+                img_h=img_h,
+                x=fit.img_x,
+                y=fit.img_y,
+                frame=fit.frame,
+                ink_h=max(1, int(round(fit.ink_h))),
+                ink_w=max(1, int(round(fit.ink_w))),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("按内容装填失败（%s），退回等比装填", scene.image, exc_info=True)
+            data_uri, img_w, img_h = _prepare_image(scene.image, card_w, card_h)
+    return FittedFigure(
+        data_uri=data_uri,
+        img_w=img_w,
+        img_h=img_h,
+        x=(card_w - img_w) / 2,
+        y=(card_h - img_h) / 2,
+        frame=None,
+        ink_h=img_h,
+        ink_w=img_w,
     )
 
 
@@ -673,7 +887,11 @@ def _render_slide_layers(
     layout: Layout = PORTRAIT,
 ) -> Path:
     """骨架与整页共用的渲染实现（`include_image` 决定图片层要不要画进来）。"""
-    font_size, lines = _fit_subtitle(scene.text)
+    if layout.subtitle_font > 0:
+        font_size = layout.subtitle_font
+        lines = _wrap(" ".join((scene.text or "").split()), layout.subtitle_width / font_size)
+    else:
+        font_size, lines = _fit_subtitle(scene.text)
 
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{layout.width}" height="{layout.height}" '
@@ -1051,7 +1269,13 @@ def _band_layout(
     **两层必须共用这一份**：胶囊的位置是从基线推出来的，各算一遍就会歪。
     """
     band_h = layout.height - layout.subtitle_top
-    font_size, lines = _fit_subtitle(text, max_lines=3, max_size=CAPTION_BAND_MAX_FONT)
+    if layout.subtitle_font > 0:
+        # 整集一个字号（`design.caption_font_size` 定的）：不再逐句自适应。
+        # 逐句自适应会让短句 38px、长句 26px —— 用户反馈「文字大小要统一」。
+        font_size = layout.subtitle_font
+        lines = _wrap(" ".join((text or "").split()), layout.subtitle_width / font_size)
+    else:
+        font_size, lines = _fit_subtitle(text, max_lines=3, max_size=CAPTION_BAND_MAX_FONT)
     line_height = font_size * 1.36
     block_h = line_height * len(lines)
     # 竖直居中：整页字幕是从固定基线往下排的，这里只有一两行，

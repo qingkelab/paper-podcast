@@ -71,6 +71,10 @@ class Layout:
     landscape: bool = False
     # 图注最多多大（跟着图走的时候，宽图让出来的竖空间可以给它一点，见 `content_layout`）
     caption_max_font: int = 18
+    # **整集共用的字幕字号**（0 = 不锁定，各句各算 —— 老行为）。
+    # 逐句自适应会让「短句 38px、长句 26px」这样跳字号，用户反馈「文字大小要统一」；
+    # 现在由 `caption_font_size()` 一次算好，挂在 layout 上，所有渲染路径都读它。
+    subtitle_font: float = 0.0
 PORTRAIT = Layout(
     width=936,
     height=1210,
@@ -137,6 +141,53 @@ LANDSCAPE = Layout(
 # 一整块干净的留白（在文字下方），而不是「图与说明之间」的一道缝。
 FIGURE_CAPTION_GAP = 26      # 图片下沿 → 图注顶部的间距
 CAPTION_LINE_RATIO = 1.28    # 图注行高 = 字号 × 这个（18px 档就是 23px，和老的硬编码一致）
+
+
+# 字幕字号区间：整集只定一次（见 `caption_font_size`）。
+# 上限沿用逐句那条路的老上限 38 —— 再大的话一句 20 字就要占三行。
+CAPTION_FONT_MIN = 26.0
+CAPTION_FONT_MAX = 38.0
+# 一句字幕最多几行：**两句封顶**（用户早先定的「字幕整句 1~2 行」，这一次又强调
+# 「不用这样分段」—— 三行读起来像被切成三块）。超过两行的句子在这个字号下放不下，
+# 就整集一起降一档，而不是让某一句自己变小。
+CAPTION_MAX_LINES = 2
+
+
+def caption_font_size(
+    texts: "list[str] | tuple[str, ...]",
+    layout: Layout,
+    *,
+    min_size: float = CAPTION_FONT_MIN,
+    max_size: float = CAPTION_FONT_MAX,
+    max_lines: int = CAPTION_MAX_LINES,
+) -> float:
+    """**整集一个**字幕字号：所有句子共用，取「最长的那句也放得下」的最大值。
+
+    为什么不再逐句自适应：每条字幕带由浏览器自己 `fitText()` 量 —— 短句取 38px、
+    长句退到 26px，于是相邻两句的字号就差了一档（用户反馈「文字大小要统一」）。
+    这里先用同一张近似宽度表（`wrap_units`）把所有句子都算一遍，定一个号，
+    之后每条带子都用它，**句子之间不再跳字号**。
+
+    放不下就整集一起降一档，而不是让某一句单独变小 —— 「统一」优先于「这句想大点」。
+    （极长的句子在同一个字号下会多占一行，最多 `max_lines` 行；行数差异不影响观感，
+    字号差异才影响。）
+    """
+    items = [" ".join(str(text or "").split()) for text in texts]
+    items = [text for text in items if text]
+    if not items:
+        return max_size
+    size = max_size
+    while size > min_size:
+        fits = all(
+            len(wrap_units(text, layout.subtitle_width / size)) <= max_lines
+            and len(wrap_units(text, layout.subtitle_width / size)) * size * 1.36
+            <= layout.subtitle_max_height
+            for text in items
+        )
+        if fits:
+            break
+        size -= 1.0
+    return float(size)
 
 
 def caption_line_height(size: int) -> int:

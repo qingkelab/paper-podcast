@@ -325,6 +325,19 @@ def diagram_shot_to_dict(shot: "DiagramShot") -> dict:
     }
 
 
+def diagram_shot_is_drawable(shot: "DiagramShot | None") -> bool:
+    """这个图解镜头有没有**能画的东西**（节点、指标，或至少一个标题）。
+
+    什么都没有的镜头渲染出来就是一张纯白卡。生成时 `diagram.verify_shot` 不会
+    产出这种镜头，但**重建时复用的是库里存的旧数据** —— 同一条判据要在那条路上
+    再拦一次，否则那张白卡会一直跟着老片子。定义放这里是因为「什么算可画」是
+    数据层的事，渲染几何不参与判断。
+    """
+    if shot is None:
+        return False
+    return bool(shot.nodes) or bool(shot.metrics) or bool((shot.title or "").strip())
+
+
 def diagram_shot_from_dict(raw: Any) -> "DiagramShot | None":
     """从库里存的那份读回来。形状对不上就返回 None（老数据没有这一列，天然走这条）。"""
     if not isinstance(raw, dict) or not str(raw.get("kind") or "").strip():

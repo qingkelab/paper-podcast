@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .design import (
+    wrap_units,
     DIAGRAM_ACCENT,
     DIAGRAM_CARD_FILL,
     DIAGRAM_CARD_STROKE,
@@ -48,7 +49,13 @@ from .design import (
     FONT_STACK,
     Layout,
 )
-from .video_core import DiagramItem, DiagramMetric, DiagramNode, DiagramShot
+from .video_core import (
+    DiagramItem,
+    DiagramMetric,
+    DiagramNode,
+    DiagramShot,
+    diagram_shot_is_drawable,
+)
 
 __all__ = [
     "DiagramError",
@@ -58,12 +65,25 @@ __all__ = [
     "render_diagram_state",
     "render_diagram_state_html",
     "verify_shot",
+    "shot_is_drawable",
     "VerificationResult",
 ]
 
 
 class DiagramError(Exception):
     """图解镜头渲染失败（调用方据此退回原来的画面流程）。"""
+
+
+# 节点卡片的高度规则：卡长到内容需要的高度，夹在最小/最大之间。
+# 最小 132 是「两行字 + 上下留白」看上去还像一张卡的下限；最大 360 是因为再高
+# 就成一块大白板了（早先固定摊满 + 封顶 240，两头都不对）。
+NODE_MIN_H = 132.0
+NODE_MAX_H = 360.0
+NODE_PAD_Y = 18.0
+
+# 大字卡（hook / summary）那块至少占卡片高度的这个比例：一行标题 + 一行要点本身
+# 撑不满一张卡，靠把富余空间摊进间距来做到「占住中间一块」。
+HERO_MIN_SPAN = 0.5
 
 
 # --------------------------------------------------------------------------
@@ -215,14 +235,19 @@ def verify_shot(
         dropped.append("标题无依据 → 整条镜头放弃")
         return VerificationResult(None, dropped)
 
-    # 「要有节点」这条只对流程/对比镜头成立：hook 与 summary 本来就是纯标题镜头
-    # （实测第一版把它们也要求 2 个节点，结果开场钩子整条被丢掉）。
+    # 「要有节点」这条只对流程/对比镜头成立：hook 与 summary 只保证「讲得清」，
+    # 节点数交给模型自己定（实测第一版把它们也要求 2 个节点，结果开场钩子整条被丢掉）。
     if shot.kind in ("flow", "compare") and len(nodes) < min_nodes and not metrics:
         dropped.append(f"有效节点不足 {min_nodes} 个且没有可用指标 → 整条镜头放弃")
         return VerificationResult(None, dropped)
-    if shot.kind not in ("flow", "compare") and not (nodes or metrics or bullets or shot.subtitle):
-        dropped.append("标题之外的每一部分都没通过核验 → 整条镜头放弃")
+    # 指标镜头：数字被核验掉之后就什么也没剩了（它本来就是为了那个数字），
+    # 不能靠标题凑数 —— 那等于把编造的数字换成一句空话，还占掉一个画面。
+    if shot.kind == "metric" and not metrics:
+        dropped.append("指标全部没通过核验 → 整条镜头放弃")
         return VerificationResult(None, dropped)
+    # hook / summary 允许只有一句话 —— 它们走 `_hero_title` 的大字版式（整幅居中），
+    # 不是「只有标题的空画面」。（这条曾经是「必须有点节点或指标」，因为那时它们
+    # 确实只画顶部一行标题、八成是白的；改了版式之后就没有这个坑了。）
 
     # 统一成元组：`DiagramShot` 的字段是 frozen tuple，返回 list 会让
     # 「同一个镜头渲染两次」的比较结果不一致（测试里逮到的）
@@ -241,6 +266,10 @@ def verify_shot(
 # --------------------------------------------------------------------------
 
 
+# 判据只有一份（数据层 `video_core.diagram_shot_is_drawable`），这里再导出一次方便同层调用。
+shot_is_drawable = diagram_shot_is_drawable
+
+
 def shot_state_count(shot: DiagramShot) -> int:
     """这个镜头一共几个状态（= 需要渲染几张卡）。
 
@@ -249,7 +278,10 @@ def shot_state_count(shot: DiagramShot) -> int:
     观众的眼睛才跟得上。
     """
     if shot.kind == "metric":
-        return max(1, min(len(shot.metrics) + 1, 3))
+        # **数字递增必须给满三个状态**（0 → 一半 → 目标值）。原来算的是「指标数 + 1」，
+        # 只有一个指标时只有 2 个状态 —— 末状态停在「一半」：66% 的指标画面上永远是 33%，
+        # 目标值一次都没出现过（实测 `最高5.3倍，吞吐高66%` 那个镜头就是这样）。
+        return 3 if shot.metrics else 1
     if shot.kind == "flow":
         return max(1, min(len(shot.nodes), 4))
     if shot.kind == "compare":
@@ -354,13 +386,20 @@ def diagram_svg(shot: DiagramShot, layout: Layout, *, state: int = 0) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">',
         f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>',
-        _header(shot, box),
+        # 没有节点也没有指标（hook / summary 常见）→ 整幅当大字卡排，
+        # 否则照旧在顶部放小标题（节点/指标自己有版式，不需要它抢地方）
+        _hero_block(shot, box) if _is_hero(shot) else _header(shot, box),
     ]
     if shot.kind == "metric" or shot.metrics:
         parts.append(_metrics(shot, box, metric_state))
-    if shot.kind in ("flow", "compare") and shot.nodes:
+    if shot.nodes:
+        # **别按 kind 挑着画**：模型给的 kind 是 `flow/compare/metric/hook/summary` 里挑一个，
+        # 但 `hook`/`summary` 也常带节点 —— 早先这里只画 `flow`/`compare` 的节点，
+        # 于是那两个镜头**只剩一个标题**，画面九成是白的（实测 93% 空白行）。
+        # 有节点就画，kind 只决定它想强调什么。
         parts.append(_nodes(shot, box, nodes, links))
-    if shot.bullets:
+    if shot.bullets and not _is_hero(shot):
+        # hero 版式把要点并进居中那块了，这里不再钉到画面底部
         parts.append(_bullets(shot, box, nodes))
     parts.append("</svg>")
     return "\n".join(part for part in parts if part)
@@ -419,6 +458,97 @@ def _header(shot: DiagramShot, box: dict[str, float]) -> str:
     return "\n".join(out)
 
 
+def _is_hero(shot: DiagramShot) -> bool:
+    """这个镜头走「大字卡」版式吗：既没有节点也没有指标（hook / summary 常见）。"""
+    return not (shot.nodes or shot.metrics)
+
+
+def _hero_block(shot: DiagramShot, box: dict[str, float]) -> str:
+    """没有节点也没有指标时的版式：**整块居中的大字卡**（标题 + 副标题 + 要点）。
+
+    hook / summary 这两种镜头本来就只是一句钩子或一句结论。早先它们照 `_header` 只画
+    顶部一行 52px 标题，要点再钉在画面最底部 —— 中间一大片白的（实测空白行 87%），
+    用户截图里那张「只有一个标题 + 一整个白画面」就是这个。现在这三样合成**一块**
+    居中排：标题按可用宽度折行、字号按字数定档，副标题与要点跟着走，不再各贴一头。
+    """
+    title = (shot.title or "").strip()
+    if not title:
+        return ""
+    accent_w = 8.0
+    text_left = box["left"] + accent_w + 16
+    max_w = box["right"] - text_left
+    # 字号按字数定档，再看折出来的行数够不够「一块」；行数超了就降一档重排
+    size = 92.0 if len(title) <= 10 else 76.0 if len(title) <= 14 else 62.0 if len(title) <= 22 else 50.0
+    lines = wrap_units(title, max_w / size)
+    while len(lines) > 3 and size > 34:
+        size -= 6.0
+        lines = wrap_units(title, max_w / size)
+    line_h = size * 1.34
+    subtitle = (shot.subtitle or "").strip()
+    sub_size = 30.0 if subtitle else 0.0
+
+    bullet_size = 26.0
+    bullet_lines: list[str] = []
+    for text in shot.bullets:
+        bullet_lines.extend(wrap_units(text, (max_w - 24) / bullet_size) or [text])
+
+    # 一行标题 + 一行要点，撑起来的其实只有卡片的一小条 —— 字号再大也一样。
+    # 所以把富余的纵向空间**摊进这一块的间距**里（标题与要点之间多留一些、
+    # 要点之间也多留一些），让它占住卡片中间一半：既是一整块，又不贴边。
+    #
+    # ⚠️ `span_h` 必须和下面真画出来的位置**同一套算法**：第一版用「行数 × 行距」
+    # 算跨度（多算了一道行距），结果整块偏上、下面多出一截（实测上 22% / 下 38%）。
+    area_h = box["bottom"] - box["top"]
+    base_gap = 30.0
+    base_lead = bullet_size * 1.6
+
+    def span(gap: float, lead: float) -> float:
+        height = len(lines) * line_h
+        if subtitle:
+            height += 20 + sub_size * 1.3
+        if bullet_lines:
+            height += gap + bullet_size + max(0, len(bullet_lines) - 1) * lead
+        return height
+
+    slack = max(0.0, HERO_MIN_SPAN * area_h - span(base_gap, base_lead))
+    # slack 摊在「标题与要点之间」和「要点之间」这几道缝上（只有一行要点时全给第一道）
+    gaps = (1 + max(0, len(bullet_lines) - 1)) if bullet_lines else 0
+    per_gap = (slack / gaps) if gaps else 0.0
+    gap_to_bullets = base_gap + per_gap
+    bullet_lead = base_lead + per_gap
+    span_h = span(gap_to_bullets, bullet_lead)
+
+    top = box["top"] + max(0.0, (area_h - span_h) / 2)
+    out = [
+        f'<rect x="{box["left"]:.1f}" y="{top + size * 0.08:.1f}" width="{accent_w:.1f}" '
+        f'height="{len(lines) * line_h:.1f}" rx="4" fill="{DIAGRAM_ACCENT}"/>'
+    ]
+    for index, line in enumerate(lines):
+        out.append(
+            f'<text x="{text_left:.1f}" y="{top + size * 0.94 + index * line_h:.1f}" '
+            f'font-family="{FONT_STACK}" font-size="{size:.0f}" font-weight="600" '
+            f'fill="{DIAGRAM_TEXT}">{_escape(line)}</text>'
+        )
+    cursor = top + len(lines) * line_h
+    if subtitle:
+        cursor += 20
+        out.append(
+            f'<text x="{text_left:.1f}" y="{cursor + sub_size:.1f}" '
+            f'font-family="{FONT_STACK}" font-size="{sub_size:.0f}" '
+            f'fill="{DIAGRAM_MUTED}">{_escape(subtitle)}</text>'
+        )
+        cursor += sub_size * 1.3
+    if bullet_lines:
+        cursor += gap_to_bullets
+        for index, line in enumerate(bullet_lines):
+            baseline = cursor + bullet_size + index * bullet_lead
+            out.append(
+                f'<text x="{text_left:.1f}" y="{baseline:.1f}" font-family="{FONT_STACK}" '
+                f'font-size="{bullet_size:.0f}" fill="{DIAGRAM_MUTED}">· {_escape(line)}</text>'
+            )
+    return "\n".join(out)
+
+
 def _content_top(shot: DiagramShot, box: dict[str, float]) -> float:
     top = box["top"] + 60
     if shot.subtitle:
@@ -454,8 +584,34 @@ def _nodes(shot: DiagramShot, box: dict[str, float], visible: int, links: int) -
     rows = max(1, (len(nodes) + columns - 1) // columns)
     gap = 18.0
     cell_w = (box["right"] - box["left"] - gap * (columns - 1)) / columns
-    # 卡片高度按行数摊满可用区域（封顶 240：再高就成一块大白板了）
-    cell_h = min(240.0, (area_h - gap * (rows - 1)) / rows)
+    # 卡高先按**内容量**算，再夹在 [NODE_MIN_H, NODE_MAX_H] 之间，且不超过摊满所需。
+    #
+    # 原来是「按行数摊满可用区域、封顶 240」，两行长字的卡片被拉到顶格高，
+    # 字全贴着卡上沿、下半截是空的 —— 用户截图里那张「一个框 + 一整片白」就是这么来的。
+    # 现在卡只长到内容需要的高度（同网格取最大值，保证各卡一致），
+    # 剩下空间交给整块竖向居中。
+    label_sizes: list[float] = []
+    detail_sizes: list[float] = []
+    needed: list[float] = []
+    for node in nodes:
+        label_size = _fit_font(node.label, want=30, minimum=20, max_chars=12)
+        detail_size = _fit_font(node.detail, want=20, minimum=15, max_chars=30) if node.detail else 0.0
+        label_sizes.append(label_size)
+        detail_sizes.append(detail_size)
+        needed.append(2 * NODE_PAD_Y + label_size + (detail_size * 1.6 + 8 if detail_size else 0.0))
+    # 卡高 = max(内容需要的高度, 摊满可用区域的高度)，封顶 NODE_MAX_H。
+    #
+    # 两头都试过了：**固定摊满 + 封顶 240** 会把两行长字的卡拉成一块高白板（用户截图里那张
+    # 「一个框 + 一整片白」）；**只按内容长** 又变成画面中间一条窄带（空白行 74%）。
+    # 所以：内容多就按内容长，内容少就长到摊满为止 —— 但字在卡内**竖向居中**，
+    # 卡片高一点也不会显得空。
+    cell_h = min(
+        max(NODE_MAX_H, max(needed)),
+        max(NODE_MIN_H, max(needed), (area_h - gap * (rows - 1)) / rows),
+    )
+    # **竖向居中**：整块节点区落在可用区域中间，上下留白对称。
+    block_h = rows * cell_h + gap * (rows - 1)
+    top += max(0.0, (area_h - block_h) / 2)
 
     positions: dict[str, tuple[float, float, float, float]] = {}
     out: list[str] = []
@@ -465,23 +621,35 @@ def _nodes(shot: DiagramShot, box: dict[str, float], visible: int, links: int) -
         y = top + row * (cell_h + gap)
         positions[node.id] = (x, y, cell_w, cell_h)
         if index >= visible:
-            # 还没轮到的节点：**保留占位**（不画）—— 位置固定，后面的节点一动就到位
+            # 还没轮到的节点：画一个**占位框**（浅底 + 虚线，不带字）。
+            #
+            # 原来是「保留位置但不画」—— 于是第一个状态只有一个框，其余三分之二全是白，
+            # 用户的反馈是「避免出现这样的画面」。占位框让构图从第 0 帧就是完整的：
+            # 观众看到的是「一张正在长出来的图」，而不是「一个孤零零的方框」。
+            out.append(
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_w:.1f}" height="{cell_h:.1f}" rx="14" '
+                f'fill="{DIAGRAM_CARD_FILL}" fill-opacity="0.45" stroke="{DIAGRAM_CARD_STROKE}" '
+                f'stroke-width="1.5" stroke-dasharray="7 7"/>'
+            )
             continue
         is_current = index == visible - 1
-        label_size = _fit_font(node.label, want=30, minimum=20, max_chars=12)
+        label_size = label_sizes[index]
+        detail_size = detail_sizes[index]
+        # 文字在卡内**竖向居中**（卡比内容高时上下留白对称，不再顶着卡上沿）
+        text_h = label_size + (detail_size * 1.6 + 8 if detail_size else 0.0)
+        text_top = y + max(NODE_PAD_Y, (cell_h - text_h) / 2)
         out.append(
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_w:.1f}" height="{cell_h:.1f}" rx="14" '
             f'fill="{DIAGRAM_CARD_FILL}" stroke="{DIAGRAM_ACCENT if is_current else DIAGRAM_CARD_STROKE}" '
             f'stroke-width="{3 if is_current else 1.5}"/>'
         )
         out.append(
-            f'<text x="{x + 20:.1f}" y="{y + label_size + 18:.1f}" font-family="{FONT_STACK}" '
+            f'<text x="{x + 20:.1f}" y="{text_top + label_size:.1f}" font-family="{FONT_STACK}" '
             f'font-size="{label_size:.0f}" font-weight="600" fill="{DIAGRAM_TEXT}">{_escape(node.label)}</text>'
         )
         if node.detail:
-            detail_size = _fit_font(node.detail, want=20, minimum=15, max_chars=30)
             out.append(
-                f'<text x="{x + 20:.1f}" y="{y + label_size + 18 + detail_size * 1.6:.1f}" '
+                f'<text x="{x + 20:.1f}" y="{text_top + label_size + detail_size * 1.6 + 8:.1f}" '
                 f'font-family="{FONT_STACK}" font-size="{detail_size:.0f}" '
                 f'fill="{DIAGRAM_MUTED}">{_escape(node.detail)}</text>'
             )
@@ -531,9 +699,45 @@ def _metrics(shot: DiagramShot, box: dict[str, float], state: int) -> str:
     if not metrics:
         return ""
     top = _content_top(shot, box)
-    row_h = 120.0
+    area_h = box["bottom"] - top - (60 if shot.bullets else 10)
     bar_max = box["right"] - box["left"] - 20
-    out: list[str] = []
+    # 只有一个指标时走「主角数字」版式：标签在上、数字占中部、条形在下，整块竖向居中。
+    # 原来一律每行 120 高从顶部往下排 —— 一个数字写完，画面剩下八成全白（实测 81%）。
+    if len(metrics) == 1:
+        metric = metrics[0]
+        shown = _metric_shown(metric, state)
+        text = _format_value(shown, metric)
+        label_size = 30.0
+        value_size = min(132.0, 860.0 / max(3.0, len(text) * 0.62))
+        bar_h = 24.0
+        block_h = label_size + 12 + value_size + 22 + bar_h
+        block_top = top + max(0.0, (area_h - block_h) / 2)
+        ratio = max(0.0, min(1.0, shown / (metric.value or 1.0)))
+        out = [
+            f'<text x="{box["left"]:.1f}" y="{block_top + label_size:.1f}" '
+            f'font-family="{FONT_STACK}" font-size="{label_size:.0f}" '
+            f'fill="{DIAGRAM_MUTED}">{_escape(metric.label)}</text>',
+            f'<text x="{box["left"]:.1f}" y="{block_top + label_size + 12 + value_size:.1f}" '
+            f'font-family="{FONT_STACK}" font-size="{value_size:.0f}" font-weight="700" '
+            f'fill="{DIAGRAM_ACCENT}">{_escape(text)}</text>',
+        ]
+        bar_y = block_top + label_size + 12 + value_size + 22
+        out.append(
+            f'<rect x="{box["left"]:.1f}" y="{bar_y:.1f}" width="{bar_max:.1f}" '
+            f'height="{bar_h:.0f}" rx="{bar_h / 2:.0f}" fill="{DIAGRAM_GRID}"/>'
+        )
+        if ratio > 0:
+            out.append(
+                f'<rect x="{box["left"]:.1f}" y="{bar_y:.1f}" width="{bar_max * ratio:.1f}" '
+                f'height="{bar_h:.0f}" rx="{bar_h / 2:.0f}" fill="{DIAGRAM_ACCENT}"/>'
+            )
+        return "\n".join(out)
+
+    # 多指标：行高按个数摊开（封顶 220），整块竖向居中 —— 数字跟着行长。
+    row_h = min(220.0, max(120.0, area_h / len(metrics)))
+    value_size = min(96.0, max(56.0, row_h * 0.42))
+    top += max(0.0, (area_h - len(metrics) * row_h) / 2)
+    out = []
     for index, metric in enumerate(metrics):
         y = top + index * row_h
         shown = _metric_shown(metric, state)
@@ -541,7 +745,6 @@ def _metrics(shot: DiagramShot, box: dict[str, float], state: int) -> str:
         # （「5 倍」和「28 MB」谁长谁短说明不了任何事），观众读到的是「填满」和那个数字
         ratio = max(0.0, min(1.0, shown / (metric.value or 1.0)))
         label_size = _fit_font(metric.label, want=26, minimum=19, max_chars=18)
-        value_size = 56.0
         text = _format_value(shown, metric)
         out.append(
             f'<text x="{box["left"]:.1f}" y="{y + label_size:.1f}" font-family="{FONT_STACK}" '

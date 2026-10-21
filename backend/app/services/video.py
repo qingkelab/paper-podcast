@@ -67,11 +67,13 @@ from .design import *  # noqa: F401,F403
 # 这些名字同时是**对外门面**：老调用点（含 tests 里那 60 多个 import）继续写
 # `from app.services.video import encode_video` 就行，一个字都不用改。
 # 新代码请直接用上面对应的模块（类型 → video_core，画面 → video_render，ffmpeg → video_encode）。
+from .design import caption_font_size
 from .design import content_layout
 from .design import DIAGRAM_FALLBACK_HOLD
 from .design import ENABLE_CLAUSE_REVEAL
 from .video_core import (
     diagram_shot_from_dict,
+    diagram_shot_is_drawable,
     diagram_shot_to_dict,
     plan_reveals,
     _SENTENCE_END,
@@ -1430,6 +1432,8 @@ class RenderedLayers:
     beat_count: int = 0
     chip_count: int = 0
     backend: str = "svg"
+    # 整集共用的字幕字号（0 = 没锁定）—— 进 `video.qa` 台账，事后可复算
+    caption_font: float = 0.0
 
 
 def _scene_layout(scene: Scene, layout: Layout) -> Layout:
@@ -1473,11 +1477,26 @@ def _render_scene_layers(
     **同一个** `beat_windows_aligned`，不给就会按字数估，两边的「太短不切」判据会错位。
     """
     work_dir.mkdir(parents=True, exist_ok=True)
+    # **整集一个字幕字号**：先按全部句子（与逐句带子同一套 `split_caption_beats`）算一次，
+    # 挂到版式上，之后每条带子、每一层强调都用它 —— 句子之间不再跳字号。
+    # 不这么做的话，浏览器是**逐句** `fitText()` 的：短句 38px、长句 26px，
+    # 用户看到的就是「文字大小不统一」（见 `design.caption_font_size`）。
+    caption_size = caption_font_size(
+        [
+            beat
+            for scene in scenes
+            if (scene.brand or "") != "outro"
+            for beat in split_caption_beats(scene.text)
+        ],
+        layout,
+    )
+    layout = replace(layout, subtitle_font=caption_size)
     result = RenderedLayers(
         slides=[], caption_bands=[], band_paths=[], point_rows=[], point_paths=[],
         cards=[], card_paths=[], focus_rows=[], focus_paths=[], focus_frames=[],
         image_ids=[], beat_focuses=[],
     )
+    result.caption_font = caption_size
 
     with render_session(work_dir) as session:
         if session is not None:
@@ -2098,12 +2117,25 @@ def compose_video(
     # 「这一集为什么有/没有图解」的台账：存进 `video.diagram_report`（只打日志是查不到的）
     diagram_report: dict[str, Any] = {}
     if preset_scenes:
+        skipped: list[str] = []
         for entry in preset_scenes:
             index = entry.get("index")
             shot = diagram_shot_from_dict(entry.get("diagram"))
-            if shot is not None and isinstance(index, int) and 0 <= index < len(segments):
-                diagram_shots[index] = shot
-        if diagram_shots:
+            if not isinstance(index, int) or not (0 <= index < len(segments)):
+                continue
+            if shot is None:
+                continue
+            # 老片子里存过「只有标题、没有节点也没有指标」的镜头 —— 它画出来是一张
+            # 九成空白的卡（实测 87% 空白行）。复用这条路上也要拦，否则重建之后
+            # 那张空卡会一直在（判据与生成时同一份：`shot_is_drawable`）。
+            if not diagram_shot_is_drawable(shot):
+                skipped.append(f"第 {index} 段（{shot.title[:16]}）没有节点/指标")
+                continue
+            diagram_shots[index] = shot
+        if skipped:
+            diagram_report["reuse_skipped"] = skipped
+            logger.info("图解镜头：复用 %d 段，跳过 %d 段空镜头", len(diagram_shots), len(skipped))
+        elif diagram_shots:
             logger.info("图解镜头：复用上次的 %d 段", len(diagram_shots))
     elif allow_point_llm and llm is not None:
         diagram_shots = assign_diagram_shots(
@@ -2384,6 +2416,15 @@ def compose_video(
     # 原来 `visual_plan` 写在它之前 —— 算出来了、日志也打了，但**从来没进过库**
     # （同一类：算过、打过日志、没存下来，和 `video.scenes[i].diagram` 那个 bug 一个模子）。
     result.qa["visual_plan"] = visual_summary
+
+    # **字幕字号台账**：整集一个字（`design.caption_font_size` 算的）。
+    # 存下来是因为「字幕大小看着不统一」这种反馈，事后要能回答「这一集定的是几号、
+    # 有多少句因此占两行」—— 只存在渲染期的局部变量里就查不到了。
+    if layers.caption_font:
+        result.qa["caption"] = {
+            "font": round(float(layers.caption_font), 1),
+            "locked": True,
+        }
 
     # **成本台账**：这一步（视频合成）一共调了几次模型、进出多少 token。
     # 现场生成配图 / 图解草案 / 要点 都在这条链上，是**唯一**可能花钱的地方；

@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 from .design import (
     BG_COLOR,
     CAPTION_FADE_SEC,
+    CAPTION_MAX_LINES,
     BRAND_DARK,
     BRAND_DARK_PANEL,
     BRAND_GOLD,
@@ -465,6 +466,39 @@ def _logo_chip() -> str:
     return f'<div class="logo-chip"><img src="{uri}" alt=""></div>'
 
 
+def _plain_image_block(scene: "Scene", layout: Layout) -> str:
+    """普通配图：按**内容包围盒**装填，内容在卡片里左右居中（与 SVG 那条路同一段几何）。
+
+    ⚠️ 原来这里是 `<img>` + `max-width/max-height: 100%`，缩放交给浏览器 ——
+    浏览器缩的是**整张图**，于是图里烘进去的白边也被算进宽度：实测 a1ed76d0 的 Fig.2
+    源图右边有 154px 白边、左边只有 20px，画面上的图整体**偏左 67px**。
+    用户的原话是「视频中的图片要左右居中」。现在几何由 `figure_fit` 算好，
+    这里只负责把那张图按算好的位置摆进一个「内容大小」的框里。
+    """
+    uri = _data_uri(scene.image, max_side=int(max(layout.image_box_w, layout.image_box_h) * 1.5))
+    if scene.diagram is not None:
+        # 图解镜头：卡片就是整块画布，不按内容裁框
+        return f'<div class="image-box"><div class="image-frame"><img src="{uri}" alt=""></div></div>'
+    try:
+        from .figure_fit import fit_for_file
+
+        fit, _ = fit_for_file(scene.image, layout.image_box_w, layout.image_box_h)
+    except Exception:  # noqa: BLE001 - 读不出尺寸就交给浏览器的老行为
+        return f'<div class="image-box"><div class="image-frame"><img src="{uri}" alt=""></div></div>'
+    ink_w = max(2.0, fit.ink_w)
+    ink_h = max(2.0, fit.ink_h)
+    # 框 = 内容大小；里面那张图按 `img_x/ink_x` 的差平移，于是**内容**正好落满这个框
+    return (
+        '<div class="image-box">'
+        f'<div class="image-frame" style="width:{ink_w:.1f}px;height:{ink_h:.1f}px;'
+        f'position:relative;overflow:hidden;padding:0;max-width:none;max-height:none">'
+        f'<img src="{uri}" alt="" style="position:absolute;max-width:none;'
+        f'left:{-(fit.ink_x - fit.img_x):.1f}px;top:{-(fit.ink_y - fit.img_y):.1f}px;'
+        f'width:{fit.img_w}px;height:{fit.img_h}px">'
+        "</div></div>"
+    )
+
+
 def _image_block(scene: "Scene", layout: Layout) -> str:
     """图片区：普通页是「图 + 贴着它的细边框」，封面页是「毛玻璃 + 玻璃面板」。
 
@@ -477,12 +511,7 @@ def _image_block(scene: "Scene", layout: Layout) -> str:
     if not headline:
         if not scene.image:
             return '<div class="image-box"></div>'
-        uri = _data_uri(scene.image, max_side=int(max(layout.image_box_w, layout.image_box_h) * 1.5))
-        return (
-            '<div class="image-box">'
-            f'<div class="image-frame"><img src="{uri}" alt=""></div>'
-            "</div>"
-        )
+        return _plain_image_block(scene, layout)
 
     # 模糊半径跟着「首页在卡片里被放大了多少」走：竖版把整页缩到约 0.96 倍，
     # 横版卡片又宽又矮、裁满时首页被放大到近 2 倍 —— 同一个半径在横版上明显更清楚。
@@ -651,9 +680,14 @@ def point_row_page(point: str, layout: Layout) -> Page:
     )
 
 
-def _band_css(band_h: int) -> str:
+def _band_css(band_h: int, layout: Layout) -> str:
     """字幕带那一层的排版 CSS。**带子和「只有胶囊」那一层共用这一份** ——
-    两处各写一份的话，胶囊就会歪几个像素，而这种错位在小方块上看得很清楚。"""
+    两处各写一份的话，胶囊就会歪几个像素，而这种错位在小方块上看得很清楚。
+
+    字号取自 `layout.subtitle_font`（整集一个号，见 `design.caption_font_size`）；
+    没锁定时退回逐句自适应的上限，那是老行为。
+    """
+    font = layout.subtitle_font if layout.subtitle_font > 0 else SUBTITLE_BAND_MAX_FONT
     return BASE_CSS + f"""
     html, body {{ height: {band_h}px; }}
     .page {{ height: {band_h}px; }}
@@ -661,7 +695,7 @@ def _band_css(band_h: int) -> str:
       position: absolute; left: var(--subtitle-left); top: 0;
       width: var(--subtitle-w); height: {band_h}px;
       display: flex; align-items: center;
-      font-size: {SUBTITLE_BAND_MAX_FONT:.0f}px; line-height: 1.36; color: {SUBTITLE_TEXT};
+      font-size: {font:.0f}px; line-height: 1.36; color: {SUBTITLE_TEXT};
     }}
     """
 
@@ -671,9 +705,17 @@ def _band_body(text: str, layout: Layout, *, hidden_from: int | None = None) -> 
 
     `hidden_from=N`：第 N 个小句起先不显示（用于「字幕按小句依次出现」，见 `_clause_text`）。
     """
-    attrs = _fit_attrs(
-        max_font=SUBTITLE_BAND_MAX_FONT, min_font=24, lines=3, height=True
-    )
+    if layout.subtitle_font > 0:
+        # 锁定：上下限都给它，`fitText` 只会把这一个字号写上去（它仍会量一次，
+        # 但**不会再把某一句单独缩小** —— 那正是「字号不统一」的来源）。
+        attrs = _fit_attrs(
+            max_font=layout.subtitle_font, min_font=layout.subtitle_font,
+            lines=CAPTION_MAX_LINES, height=True,
+        )
+    else:
+        attrs = _fit_attrs(
+            max_font=SUBTITLE_BAND_MAX_FONT, min_font=24, lines=3, height=True
+        )
     clean = " ".join((text or "").split())
     return (
         f'<div class="page"><div class="band-text" {attrs}>'
@@ -701,7 +743,7 @@ def caption_band_page(
     默认 `True` 保持不变：「一页到底」的 `render_slide` 与老数据都按原样出片。
     """
     band_h = layout.height - layout.subtitle_top
-    css = _band_css(band_h) if chip else _band_css(band_h) + CHIP_OFF_CSS
+    css = _band_css(band_h, layout) if chip else _band_css(band_h, layout) + CHIP_OFF_CSS
     if hidden_from is not None:
         css += CLAUSE_HIDDEN_CSS
     return Page(
@@ -781,7 +823,7 @@ def caption_chip_page(text: str, layout: Layout, *, spring: bool = False) -> Pag
         }
     return Page(
         html=_document(
-            _band_css(band_h) + CHIP_CSS,
+            _band_css(band_h, layout) + CHIP_CSS,
             _layout_vars(layout),
             _band_body(text, layout),
             script=script,

@@ -191,6 +191,88 @@ class TestRendering:
         assert scene.diagram.items(), "每个镜头都要能列出自己需要核验的条目"
 
 
+def _ink_box(svg: str, layout) -> tuple[float, float, float, float, float]:
+    """量一张卡上墨迹的包围盒（相对卡片宽高的比例）+ 空白行占比。
+
+    用真像素量，不看字符串 ——「画面上有没有东西」只有渲出来才知道。
+    """
+    import tempfile
+
+    import pymupdf
+
+    from app.services.video_render import _rasterize_custom
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "card.png"
+        _rasterize_custom(svg, out, width=layout.image_box_w, height=layout.image_box_h)
+        pix = pymupdf.Pixmap(str(out))
+    n, data, w, h = pix.n, pix.samples, pix.width, pix.height
+    ink = lambda x, y: min(data[(y * w + x) * n], data[(y * w + x) * n + 1], data[(y * w + x) * n + 2]) < 246
+    cols = [x for x in range(w) if any(ink(x, y) for y in range(0, h, 3))]
+    rows = [y for y in range(h) if any(ink(x, y) for x in range(0, w, 3))]
+    blank = sum(1 for y in range(h) if not any(ink(x, y) for x in range(0, w, 2)))
+    return cols[0] / w, cols[-1] / w, rows[0] / h, rows[-1] / h, blank / h
+
+
+class TestNoNearlyEmptyFrames:
+    """**「避免出现这样的画面」**：一张只画了一个框（或只有一行标题）、其余大片留白的卡。
+
+    用户截图里那张就是这样：标题 + 一个节点方框，画面 60% 是白的。三条改法各守一条：
+    还没出现的节点画占位框、节点块竖向居中、没有节点时走大字版式。
+    """
+
+    def test_state_zero_draws_every_node_box_even_the_ones_not_yet_revealed(self):
+        """状态 0 只亮第一个节点，但**占位框要先摆好** —— 否则构图从第 0 帧就是残缺的。"""
+        shot = flow_shot()
+        svg = DG.diagram_svg(shot, PORTRAIT, state=0)
+        cards = [line for line in svg.splitlines() if "<rect" in line and 'rx="14"' in line]
+        assert len(cards) == len(shot.nodes), f"状态 0 应该有 {len(shot.nodes)} 个框，实际 {len(cards)}"
+        ghosts = [line for line in cards if 'stroke-dasharray="7 7"' in line]
+        assert len(ghosts) == len(shot.nodes) - 1, "未出现的节点用虚线占位（第一个是实线高亮）"
+
+    def test_the_node_block_sits_in_the_middle_not_against_the_top(self):
+        """节点块竖向居中：上下留白对称，而不是「贴着标题、下面空一大片」。"""
+        _, _, top, bottom, _ = _ink_box(DG.diagram_svg(flow_shot(), PORTRAIT, state=2), PORTRAIT)
+        above, below = top, 1.0 - bottom
+        assert abs(above - below) < 0.12, f"上下留白差太多：上 {above:.0%} / 下 {below:.0%}"
+
+    def test_a_shot_with_only_a_title_becomes_a_big_centred_card(self):
+        """hook / summary 常常只有一句话 —— 那是大字卡，不是「标题 + 一片白」。"""
+        shot = DiagramShot(
+            kind="summary",
+            title="高方差是内在代价",
+            title_source="脚本原句：高方差是内在代价",
+            bullets=("优势要在在线自适应框架下才兑现得出来。",),
+            bullet_sources=("脚本原句：优势要在在线自适应框架下才兑现得出来。",),
+        )
+        svg = DG.diagram_svg(shot, PORTRAIT, state=0)
+        assert 'font-size="92"' in svg, "只有一句话时标题要放到最大一档"
+        assert "· 优势要在在线自适应框架下才兑现得出来。" in svg, "要点并进居中那块"
+        _, _, top, bottom, blank = _ink_box(svg, PORTRAIT)
+        assert abs(top - (1.0 - bottom)) < 0.15, "整块要竖向居中"
+        # 大字卡本来就只有两行字，**空白行占比天然高**（这不是「空画面」的判据）；
+        # 要量的是「这一块有没有占住卡片中间」—— 上下跨度够不够。
+        assert bottom - top > 0.35, f"整块只占了卡片高度的 {bottom - top:.0%}，还是薄薄一条"
+
+    def test_a_single_metric_reaches_its_target_value(self):
+        """只有一个指标时也要给满三个状态 —— 否则末状态停在「一半」，目标值永不出现。"""
+        shot = DiagramShot(
+            kind="metric", title="最高5.3倍，吞吐高66%",
+            metrics=(DiagramMetric("吞吐提升", 66.0, "%"),),
+        )
+        assert DG.shot_state_count(shot) == 3
+        shown = [DG._metric_shown(shot.metrics[0], state) for state in range(3)]
+        assert shown[-1] == 66.0, f"末状态没到目标值：{shown}"
+
+    def test_a_stored_shot_with_nothing_at_all_is_not_reused(self):
+        """重建时复用旧镜头也要拦：什么都没的卡渲染出来就是一张纯白。"""
+        from app.services.video_core import diagram_shot_is_drawable
+
+        assert diagram_shot_is_drawable(flow_shot())
+        assert diagram_shot_is_drawable(DiagramShot(kind="hook", title="一句话"))
+        assert not diagram_shot_is_drawable(DiagramShot(kind="hook", title="   "))
+
+
 # --------------------------------------------------------------------------
 # 接入流水线：候选筛选 → 模型草案 → 核验 → 落到 Scene（见 docs/DIAGRAM_SHOTS.md）
 # --------------------------------------------------------------------------
