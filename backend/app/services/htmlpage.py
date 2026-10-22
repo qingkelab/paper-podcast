@@ -697,6 +697,13 @@ def _band_css(band_h: int, layout: Layout) -> str:
       display: flex; align-items: center;
       font-size: {font:.0f}px; line-height: 1.36; color: {SUBTITLE_TEXT};
     }}
+    /* ⚠️ 字幕正文**必须再包一层块**再放进 flex 容器里。
+       小句是 `<span class="clause">`，如果它们直接是 flex 容器的子元素，每个 span 就成了
+       一个 flex item（被 blockify），于是一句话被摆成**并排的几列**、每列各自折行 ——
+       观众读到的字序就乱了：「这篇论文想解决 | 能不能不重新训练 | 只靠少量物理试验就让机器」
+       然后第二行是「就是了：| 大模型，| 人恢复状态?」。这不是分块动效，是排版坏了。
+       包一层之后 flex 只有一个子元素（负责竖向居中），里面的 span 仍然是**行内**的。 */
+    .band-inner {{ width: 100%; }}
     """
 
 
@@ -719,7 +726,8 @@ def _band_body(text: str, layout: Layout, *, hidden_from: int | None = None) -> 
     clean = " ".join((text or "").split())
     return (
         f'<div class="page"><div class="band-text" {attrs}>'
-        f"{_clause_text(clean, hidden_from=hidden_from)}</div></div>"
+        f'<div class="band-inner">{_clause_text(clean, hidden_from=hidden_from)}</div>'
+        "</div></div>"
     )
 
 

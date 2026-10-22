@@ -19,6 +19,11 @@ from app.services.design import (
     caption_font_size,
     wrap_units,
 )
+from app.services.htmlframe import ChromeSession, chrome_available
+
+requires_chrome = pytest.mark.skipif(
+    not chrome_available(), reason="这台机器上没有 Chrome，跳过需要真渲染的用例"
+)
 
 SHORT = "那这近似会不会让结果不可信？"
 MEDIUM = "6 比特下状态内存压缩了 5 倍多，Qwen 从 144 兆降到 28 兆左右。"
@@ -130,3 +135,66 @@ def _first_line_height(path: Path) -> int:
             break
         height = row - top
     return height + 1
+
+
+class TestTheSentenceReadsInOrder:
+    """用户反馈「字幕不用这样分段」的**真正原因**：一句话被排成了并排的几列。
+
+    小句是 `<span class="clause">`。字幕带是 `display:flex`（为了竖向居中），
+    如果这些 span **直接**是 flex 容器的子元素，每个 span 都会变成一个 flex item ——
+    也就是一句话被摆成几列、每列各自折行，读起来字序全乱：
+
+        这篇论文想解决 | 能不能不重新训练 | 只靠少量物理试验就让机器
+        的就是：       | 大模型，           | 人恢复状态?
+
+    这不是动效，是排版坏了。修法是中间垫一层 `.band-inner`（flex 只负责居中，
+    里面照旧是行内文字）。
+    """
+
+    SENTENCE = "这篇论文想解决的就是：能不能不重新训练大模型，只靠少量物理试验就让机器人恢复状态?"
+
+    def test_the_clauses_are_not_flex_items(self):
+        """结构层就能拦住：小句不能是 flex 容器的直接子元素。"""
+        from dataclasses import replace
+
+        from app.services.htmlpage import caption_band_page
+
+        page = caption_band_page(self.SENTENCE, replace(PORTRAIT, subtitle_font=31.0))
+        assert '<div class="band-inner">' in page.html, "字幕正文要垫一层块，否则小句会各占一列"
+        assert 'class="band-text" data-fit-max' in page.html
+
+    @requires_chrome
+    def test_the_rendered_lines_read_in_order(self, tmp_path):
+        """真渲染之后按行读回来：拼起来必须还是原句（列排版会打乱顺序）。"""
+        import json
+        from dataclasses import replace
+
+        from app.services.htmlpage import caption_band_page
+
+        js = """(() => {
+          const el = document.querySelector('.band-text');
+          const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          const lines = [];
+          let node;
+          while ((node = walker.nextNode())) {
+            const range = document.createRange();
+            for (let i = 0; i < node.data.length; i++) {
+              range.setStart(node, i); range.setEnd(node, i + 1);
+              const r = range.getBoundingClientRect();
+              const top = Math.round(r.top + window.scrollY);
+              let line = lines.find(l => Math.abs(l.top - top) <= 2);
+              if (!line) { line = {top, text: ''}; lines.push(line); }
+              line.text += node.data[i];
+            }
+          }
+          lines.sort((a, b) => a.top - b.top);
+          return JSON.stringify(lines.map(l => l.text));
+        })()"""
+        with ChromeSession.start() as session:
+            session.open_page(
+                caption_band_page(self.SENTENCE, replace(PORTRAIT, subtitle_font=31.0)),
+                work_dir=tmp_path,
+            )
+            lines = json.loads(session._evaluate(js))
+        assert len(lines) == 2, f"这句应当两行：{lines}"
+        assert "".join(lines) == self.SENTENCE, f"按行读回来字序乱了：{lines}"

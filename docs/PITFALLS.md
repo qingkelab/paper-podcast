@@ -10,6 +10,10 @@
 - **`request.form()` 返回的是 Starlette 的 `UploadFile`，而 `fastapi.UploadFile` 是它的子类**。
   用 `fastapi.UploadFile` 做 `isinstance` 判断恒为假——曾经导致所有 PDF 上传被 400 拒绝。
   判据统一用 `starlette.datastructures.UploadFile`。
+- **`display:flex` 会把所有直接子元素 blockify**。字幕带为了竖向居中用了 flex，
+  而正文里的小句是 `<span class="clause">` —— span 直接当子元素就各占一列，一句话被排成
+  并排几列、字序全乱（用户截图：「这篇论文想解决 | 能不能不重新训练 | …」）。
+  凡是「容器要居中、内容里又有语义 span」的地方，都要垫一层包裹块。
 - **闭包内不要用 `out += [...]`**。augmented assignment 会把变量变成闭包局部变量，
   抛 `UnboundLocalError`。用 `extend()` 或改成纯函数返回列表。
 - **「居中」要居中**内容**，不是居中那张图**。论文原图四周烘进来的白边是不对称的
