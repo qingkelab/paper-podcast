@@ -12,6 +12,7 @@ const router = useRouter()
 const links = [
   { to: '/', label: '首页' },
   { to: '/create', label: '开始生成' },
+  { to: '/quick-images', label: '快速图文' },
   { to: '/library', label: '播客库' },
   { to: '/albums', label: '专辑' },
   { to: '/settings', label: '设置' },

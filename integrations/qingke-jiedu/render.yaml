@@ -1,0 +1,28 @@
+# Render Blueprint —— 在 Render 用「Blueprint」部署时读取本文件
+# 也可以不用本文件：直接在 Render 新建 Web Service 选 Docker，效果一致。
+services:
+  - type: web
+    name: qingke-jiedu
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /api/health
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: LLM_PROVIDER
+        value: deepseek
+      - key: DEEPSEEK_API_KEY
+        sync: false          # 部署后在 Render 面板填写（未配置时文案生成会报错）
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: CHROME_PATH
+        value: /usr/bin/google-chrome-stable
+      - key: WECHAT_APP_ID
+        sync: false          # 可选：配置后「同步到公众号」自动存草稿
+      - key: WECHAT_APP_SECRET
+        sync: false
+      - key: MAX_COPY_CHARS
+        value: "1000"
+      - key: MAX_TITLE_CHARS
+        value: "20"

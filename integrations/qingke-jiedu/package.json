@@ -1,0 +1,29 @@
+{
+  "name": "qingke-jiedu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "青稞解读：输入论文/网页链接，一键生成图片、1000字内解读文案、20字内爆款标题，并同步到多个公众号与 X",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "oxlint src web server.js test --max-warnings=0",
+    "check": "npm run lint && npm test",
+    "smoke:web": "node web/smoke.mjs"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "@napi-rs/canvas": "^1.0.7",
+    "adm-zip": "^0.6.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsdom": "^29.1.1",
+    "multer": "^2.2.0",
+    "pdfjs-dist": "^6.2.108",
+    "puppeteer-core": "^25.8.0"
+  },
+  "devDependencies": {
+    "oxlint": "^1.87.0"
+  }
+}

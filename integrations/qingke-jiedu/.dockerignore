@@ -1,0 +1,8 @@
+node_modules
+output
+.npm-cache
+.env
+.git
+.github
+.DS_Store
+*.log

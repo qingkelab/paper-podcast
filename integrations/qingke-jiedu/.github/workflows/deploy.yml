@@ -1,0 +1,47 @@
+# CI：每次 push / PR 都跑 lint + 单测，并构建一次 Docker 镜像。
+# 部署本身推荐用 Render 的「Auto Deploy」：在 Render 连接 GitHub 仓库后，
+# 每次 push 会自动用 Dockerfile 构建并上线（无需本工作流触发）。
+#
+# 可选：若想用 Actions 手动触发 Render 部署，在仓库 Secrets 里添加
+# RENDER_DEPLOY_HOOK（Render 服务 → Settings → Deploy Hook），并取消下面注释。
+name: CI / Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint（oxlint：0 error，告警数不得增长）
+        run: npm run lint
+      - name: Unit tests
+        run: npm test
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t link2post .
+
+  # deploy:
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
+  #   steps:
+  #     - name: Trigger Render deploy hook
+  #       run: curl -sf "${{ secrets.RENDER_DEPLOY_HOOK }}"

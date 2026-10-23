@@ -104,6 +104,25 @@ pnpm dev                                 # http://127.0.0.1:5173
 打开 http://127.0.0.1:5173 ，粘贴一段论文文本就能看到完整流程。
 后端 API 文档在 http://127.0.0.1:8000/docs 。
 
+### 合并开发：播客 + 快速图文
+
+`paper-podcast` 是主应用，导航栏的「快速图文」接入了 `integrations/qingke-jiedu/`。
+这个入口提供快速转图、解读文案和 arXiv 检索；「开始生成」继续负责完整的双人播客、音频与视频。
+
+按上面的方式准备 `.venv` 和 `frontend` 后，在项目根目录运行：
+
+```bash
+./scripts/dev-all.sh
+```
+
+打开 http://127.0.0.1:5173 使用统一界面。脚本会同时启动播客后端、前端和图文服务；
+首次运行会安装图文服务的 Node 依赖，按 Ctrl+C 会一起停止。完整双人播客在未配置模型与语音密钥时会走 Mock；
+快速图文会复用主应用 `.env` 里的模型密钥；也可在 `integrations/qingke-jiedu/.env` 单独配置。
+单纯转图不需要模型密钥。
+
+单独部署时，构建前通过 `VITE_QINGKE_JIEDU_URL` 指向浏览器可访问的图文服务地址；
+GitHub Pages 演示版默认使用青稞解读的静态浏览器版。
+
 ---
 
 ## 接入真实豆包 API
@@ -193,6 +212,7 @@ wss://openspeech.bytedance.com/api/v3/sami/podcasttts    (WebSocket 长连接)
 ```
 paper-podcast/
 ├── docs/API.md                    前后端接口契约（唯一权威）
+├── docs/ARCHITECTURE.md           模块职责、运行资源边界与演进策略
 ├── backend/
 │   ├── app/
 │   │   ├── main.py                FastAPI 入口，托管前端静态文件

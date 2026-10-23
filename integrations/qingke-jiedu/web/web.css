@@ -1,0 +1,149 @@
+/* 青稞解读 · 浏览器版补充样式（基于 ../public/style.css） */
+
+/* ===== 接口设置卡片（侧边，默认折叠） ===== */
+.api-card {
+  padding: 14px 18px;
+}
+.api-card summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  border-radius: 6px;
+}
+.api-card summary::-webkit-details-marker {
+  display: none;
+}
+.api-card summary .api-title {
+  flex: none;
+}
+.api-card details[open] summary {
+  margin-bottom: 10px;
+}
+.api-state {
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #fff4e5;
+  color: #b26a00;
+  border: 1px solid #ffd9a0;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.api-state.ok {
+  background: #e8f9f0;
+  color: #067647;
+  border-color: #a9e6c5;
+}
+.api-note {
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0 0 10px;
+}
+.api-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+.api-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #5b6470;
+}
+.api-grid input,
+.api-grid select {
+  border: 1px solid #e3e6eb;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  background: #fff;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.api-grid input:focus,
+.api-grid select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(7, 193, 96, 0.12);
+}
+.api-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.api-card .model-indicator {
+  margin-top: 10px;
+}
+
+/* ===== 空状态（首次打开 / 内容区没有结果时） ===== */
+#empty-state {
+  border: 1.5px dashed #dfe3e8;
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.6);
+  padding: 56px 32px;
+  text-align: center;
+  color: #5b6470;
+}
+#empty-state .empty-icons {
+  font-size: 34px;
+  letter-spacing: 6px;
+  margin-bottom: 14px;
+}
+#empty-state h2 {
+  font-size: 18px;
+  color: #1f2329;
+  margin: 0 0 10px;
+}
+#empty-state p {
+  font-size: 13.5px;
+  line-height: 1.8;
+  margin: 0;
+}
+
+/* ===== 全局细节 ===== */
+.hero h1 .badge {
+  font-size: 12px;
+  vertical-align: middle;
+  margin-left: 6px;
+}
+.latest-hint {
+  font-size: 12px;
+  margin: 6px 0 0;
+}
+.tile-dl {
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: #07c160;
+  font-size: 12px;
+  padding: 0;
+}
+.tile-dl:hover {
+  text-decoration: underline;
+}
+.foot a {
+  color: #07c160;
+  text-decoration: none;
+}
+.lightbox-dl {
+  cursor: pointer;
+}
+
+/* 键盘可达性：所有可交互元素统一绿色焦点环 */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

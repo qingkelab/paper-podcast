@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>青稞解读 · 论文/网页 → 图片 · 解读 · 播客</title>
+  <meta name="description" content="青稞解读：输入论文/网页链接，一键生成逐页图片、1000 字内解读文案、爆款标题，或 3–5 分钟第一人称科普视频播客。" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%2307c160'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white'>青</text></svg>" />
+  <style>
+    :root {
+      --bg: #f5f6f8; --card: #fff; --ink: #1f2329; --muted: #8a919c; --line: #e8eaee;
+      --accent: #07c160; --accent-dark: #06a552; --accent-soft: #e8f9f0;
+      --radius: 14px; --shadow: 0 1px 2px rgba(16,24,40,.04), 0 8px 24px rgba(16,24,40,.06);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font: 16px/1.7 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", "Microsoft YaHei", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 56px 20px 72px; }
+    header { display: flex; align-items: center; gap: 16px; }
+    .logo {
+      width: 56px; height: 56px; flex: none; display: grid; place-items: center;
+      background: linear-gradient(135deg, #07c160, #04a0c0); color: #fff;
+      font-size: 28px; font-weight: 700; border-radius: 16px;
+      box-shadow: 0 6px 16px rgba(7,193,96,.28);
+    }
+    h1 { margin: 0; font-size: 26px; letter-spacing: .5px; }
+    .tagline { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin: 36px 0; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 20px; }
+    .card h2 { margin: 0 0 8px; font-size: 17px; }
+    .card p { margin: 0; color: var(--muted); font-size: 14px; }
+    .card .emoji { font-size: 24px; display: block; margin-bottom: 8px; }
+    h3 { font-size: 16px; margin: 32px 0 10px; }
+    pre {
+      background: #0f1116; color: #e6e9ef; border-radius: 12px; padding: 16px 18px;
+      overflow-x: auto; font-size: 13.5px; line-height: 1.7;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    code { font-family: inherit; }
+    .inline-code {
+      background: #eef1f4; border-radius: 6px; padding: 1px 6px; font-size: 13.5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    ul { padding-left: 20px; margin: 10px 0; }
+    li { margin: 4px 0; }
+    .muted { color: var(--muted); }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
+    a.btn {
+      display: inline-block; padding: 10px 18px; border-radius: 10px; font-size: 14.5px;
+      font-weight: 600; text-decoration: none; border: 1px solid var(--line);
+      background: #fff; color: var(--ink);
+    }
+    a.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    a.btn:hover { border-color: var(--accent); color: var(--accent-dark); }
+    a.btn.primary:hover { background: var(--accent-dark); color: #fff; }
+    footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <span class="logo">青</span>
+      <div>
+        <h1>青稞解读 · QingKe JieDu</h1>
+        <p class="tagline">输入论文 / 网页链接，一键生成图片、解读文案、爆款标题，或 3–5 分钟科普视频播客</p>
+      </div>
+    </header>
+
+    <div class="cards">
+      <div class="card">
+        <span class="emoji">🖼</span>
+        <h2>图文转图</h2>
+        <p>PDF 逐页转 PNG / 网页整页截图（长页自动分段），配 1000 字内解读文案与 20 字内爆款标题，可一键同步到公众号「贴图」。</p>
+      </div>
+      <div class="card">
+        <span class="emoji">🎙️</span>
+        <h2>论文播客</h2>
+        <p>论文链接 → AI 写稿 → 语音合成（MiniMax / edge-tts）→ ffmpeg 合成 3–5 分钟第一人称科普视频，论文原图与页面作画面。</p>
+      </div>
+      <div class="card">
+        <span class="emoji">🕒</span>
+        <h2>最新论文</h2>
+        <p>按时间、分类、关键词检索 arXiv，列表里直接「转图 / 视频 / 复制」，选题到成片一条链路。</p>
+      </div>
+    </div>
+
+    <h3>快速开始</h3>
+    <pre><code>git clone git@github.com:qingkelab/qingke-jiedu.git
+cd qingke-jiedu
+npm install
+cp .env.example .env      # 填 DEEPSEEK_API_KEY 或 OPENAI_API_KEY（本机 Ollama 亦可）
+npm start                 # 浏览器打开 http://127.0.0.1:4780</code></pre>
+
+    <h3>质量门禁</h3>
+    <pre><code>npm run check   # oxlint（0 error / 0 warning）+ node:test（单元 + 服务端冒烟）</code></pre>
+
+    <h3>环境要求</h3>
+    <ul>
+      <li>Node.js ≥ 20</li>
+      <li>系统 Chrome（网页截图用，<span class="inline-code">CHROME_PATH</span> 可覆盖）</li>
+      <li><span class="inline-code">ffmpeg</span>（论文播客合成视频用）；配音默认 <span class="inline-code">edge-tts</span>，配 <span class="inline-code">MINIMAX_API_KEY</span> 可切高保真</li>
+      <li>生成文案需要真实模型：DeepSeek / OpenAI / 本机 Ollama 任一</li>
+    </ul>
+
+    <div class="actions">
+      <a class="btn primary" href="./web/">🚀 在线使用（浏览器版）</a>
+      <a class="btn" href="https://github.com/qingkelab/qingke-jiedu">GitHub 仓库</a>
+      <a class="btn" href="https://github.com/qingkelab/qingke-jiedu#readme">使用文档</a>
+      <a class="btn" href="https://github.com/qingkelab/qingke-jiedu/blob/main/render.yaml">部署配置（Render）</a>
+    </div>
+
+    <footer>
+      <b>浏览器版</b>（<a href="./web/">/web/</a>）把整个应用搬进了浏览器：PDF 转图、文案与标题、arXiv 最新论文检索都能直接用，
+      API key 只存在内存里；受浏览器能力限制，<b>网页整页截图、论文播客视频、公众号凭证同步</b>需要在本机/服务器跑 Node 服务（<span class="inline-code">npm start</span>）。
+      浏览器版源码在仓库 <span class="inline-code">web/</span> 目录，与 Node 版共用 <span class="inline-code">src/</span> 里的取源、切片与提示词模块。
+    </footer>
+  </div>
+</body>
+</html>

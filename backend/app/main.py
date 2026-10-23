@@ -37,6 +37,10 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     settings.ensure_dirs()
+    # 运行资源只在 ASGI lifespan 中创建：导入 app.main / 调用 create_app
+    # 不应提前打开数据库文件。这样测试、命令行工具和服务启动共享同一资源边界。
+    db = Database(settings.db_path)
+    app.state.db = db
 
     logger.info("=" * 62)
     logger.info("  %s v%s", settings.app_name, settings.version)
@@ -56,12 +60,14 @@ async def lifespan(app: FastAPI):
         max_attempts=settings.login_max_attempts,
         lockout_minutes=settings.login_lockout_minutes,
     )
-    await app.state.queue.start()
     try:
+        await app.state.queue.start()
         yield
     finally:
-        await app.state.queue.stop()
-        app.state.db.close()
+        try:
+            await app.state.queue.stop()
+        finally:
+            db.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -75,7 +81,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.state.settings = settings
-    app.state.db = Database(settings.db_path)
 
     app.add_middleware(
         CORSMiddleware,

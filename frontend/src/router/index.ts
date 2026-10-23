@@ -33,6 +33,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '生成新播客' },
   },
   {
+    path: '/quick-images',
+    name: 'quick-images',
+    component: () => import('../views/QuickImagesView.vue'),
+    meta: { title: '快速图文解读', public: true },
+  },
+  {
     path: '/task/:id',
     name: 'task',
     component: () => import('../views/TaskView.vue'),

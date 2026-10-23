@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%2307c160'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white'>青</text></svg>" />
+  <title>青稞解读 · 论文/网页 → 图片 + 解读 + 爆款标题</title>
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/embed.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <div class="brand">
+        <span class="logo">青</span>
+        <div>
+          <h1>青稞解读</h1>
+          <p class="tagline">粘贴论文 / 网页链接，一键生成图片 · 1000 字内解读 · 20 字内爆款标题，并同步到公众号与 X</p>
+        </div>
+      </div>
+    </header>
+
+    <!-- 顶部功能导航：图文转图 / 论文深度解读 / 论文播客 / 最新论文 -->
+    <nav class="mode-nav" aria-label="功能菜单">
+      <div class="seg">
+        <button id="mode-pic" class="seg-btn active" type="button">🖼 图文转图</button>
+        <button id="mode-podcast" class="seg-btn" type="button">🎙️ 论文播客</button>
+        <button id="mode-latest" class="seg-btn" type="button">🕒 最新论文</button>
+      </div>
+    </nav>
+
+    <div class="layout">
+      <aside class="side">
+    <section class="input-card">
+
+      <!-- 图文转图 / 深度解读：链接输入 -->
+      <form id="form" autocomplete="off">
+        <div class="input-row">
+          <input
+            id="url"
+            type="url"
+            placeholder="https:// 输入论文 PDF 链接或网页链接"
+            required
+          />
+          <button id="submit" type="submit">生成</button>
+        </div>
+      </form>
+      <div class="upload-row" id="upload-row">
+        <label class="upload-label" for="file-upload">📎 上传文章（PDF / Markdown / 文本）</label>
+        <input id="file-upload" type="file" accept=".pdf,.md,.txt,.markdown" hidden />
+      </div>
+      <div class="examples">
+        <span>试试：</span>
+        <button class="chip" data-url="https://arxiv.org/pdf/1706.03762.pdf">论文 PDF（Attention 论文）</button>
+        <button class="chip" data-url="https://arxiv.org/abs/1706.03762">网页（arXiv 摘要页）</button>
+      </div>
+
+      <!-- 最新论文：时间 + 分类 + 关键词搜索 -->
+      <div id="latest-form" hidden>
+        <div class="input-row">
+          <select id="latest-category">
+            <option value="">全部分类</option>
+            <option value="cs.AI">cs.AI 人工智能</option>
+            <option value="cs.CL">cs.CL 计算语言学</option>
+            <option value="cs.CV">cs.CV 计算机视觉</option>
+            <option value="cs.LG">cs.LG 机器学习</option>
+            <option value="cs.RO">cs.RO 机器人</option>
+            <option value="cs.SE">cs.SE 软件工程</option>
+            <option value="cs.CR">cs.CR 密码与安全</option>
+            <option value="stat.ML">stat.ML 统计机器学习</option>
+          </select>
+          <select id="latest-days">
+            <option value="1">最近 1 天</option>
+            <option value="3" selected>最近 3 天</option>
+            <option value="7">最近 7 天</option>
+            <option value="14">最近 14 天</option>
+            <option value="30">最近 30 天</option>
+          </select>
+          <button id="latest-search" type="button">搜索最新论文</button>
+        </div>
+        <div class="keyword-row">
+          <span>关键词：</span>
+          <button class="chip kw" data-kw="RL" type="button">RL</button>
+          <button class="chip kw" data-kw="OPD" type="button">OPD</button>
+          <button class="chip kw" data-kw="RSI" type="button">RSI</button>
+          <button class="chip kw" data-kw="VLA" type="button">VLA</button>
+          <button class="chip kw" data-kw="World Model" type="button">World Model</button>
+          <button class="chip kw" data-kw="World Action Model" type="button">World Action Model</button>
+        </div>
+      </div>
+
+      <!-- 论文播客：时长 + 音色 -->
+      <div id="podcast-options" class="podcast-options" hidden>
+        <div class="podcast-row">
+          <span class="muted">时长</span>
+          <select id="pod-duration">
+            <option value="auto" selected>3–5 分钟（自动）</option>
+            <option value="short">约 3 分钟</option>
+            <option value="long">5 分钟以上</option>
+          </select>
+        </div>
+        <div class="podcast-row">
+          <span class="muted">音色</span>
+          <select id="pod-voice"></select>
+        </div>
+        <div class="model-indicator" id="pod-engine-hint"></div>
+      </div>
+
+      <div class="model-select">
+        <span class="muted">模型</span>
+        <div class="seg">
+          <button id="prov-ollama" class="seg-btn active" type="button">Ollama</button>
+          <button id="prov-api" class="seg-btn" type="button">API</button>
+        </div>
+      </div>
+      <div class="model-select" id="ollama-model-row">
+        <span class="muted">Ollama 模型</span>
+        <select id="ollama-model"></select>
+        <button id="ollama-refresh" class="icon-btn" type="button" title="重新读取 Ollama 模型列表">↻</button>
+      </div>
+      <!-- 转图与文案解耦：勾上就只转图，完全不碰模型（模型没配/挂了也能用） -->
+      <label class="only-images" id="only-images-row">
+        <input type="checkbox" id="only-images" />
+        <span>只转图，不生成文案</span>
+      </label>
+      <div class="model-indicator" id="model-indicator">模型：加载中…</div>
+      <div class="model-indicator" id="ip-indicator">出站 IP：加载中…</div>
+
+      <div class="history" id="history-block">
+        <div class="history-head">
+          <span class="muted">🕘 历史记录</span>
+          <button id="history-clear" class="icon-btn" type="button" title="清空历史">🗑</button>
+        </div>
+        <ul id="history-list" class="history-list"></ul>
+      </div>
+    </section>
+
+      </aside>
+
+      <main class="content">
+    <section id="status" class="status" hidden>
+      <div class="spinner"></div>
+      <div class="status-main">
+        <span id="status-text">正在处理…</span>
+        <div id="status-detail" class="status-detail" hidden></div>
+      </div>
+    </section>
+
+    <section id="error" class="error" hidden></section>
+
+    <main id="arxivlist" hidden>
+      <div class="meta-bar">
+        <span class="badge">🕒 最新论文</span>
+        <span id="arxivlist-count" class="muted"></span>
+      </div>
+      <section class="card">
+        <div class="card-head">
+          <h2>📑 论文列表</h2>
+        </div>
+        <div id="arxivlist-body" class="arxiv-list"></div>
+      </section>
+    </main>
+
+    <main id="result" hidden>
+      <div class="meta-bar">
+        <span id="meta-type" class="badge"></span>
+        <span id="meta-provider" class="badge muted"></span>
+        <div class="meta-title" id="meta-title"></div>
+        <span id="meta-origin" class="muted"></span>
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>🎞️ 内容图片</h2>
+          <div class="head-actions">
+            <span id="img-count" class="muted"></span>
+            <span id="sel-count" class="badge" hidden></span>
+            <button class="btn ghost" id="sel-all" type="button">全选</button>
+            <button class="btn ghost" id="sel-clear" type="button">清空</button>
+            <a id="zip-btn" class="btn ghost" href="#">⬇ 下载全部（ZIP）</a>
+          </div>
+        </div>
+        <div id="gallery" class="gallery"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>📝 解读文案</h2>
+          <div class="head-actions">
+            <span id="copy-count" class="badge" hidden></span>
+            <button class="btn ghost" id="copy-copy" type="button" disabled>复制文案</button>
+            <a id="md-btn" class="btn ghost" href="#" aria-disabled="true">下载 .md</a>
+          </div>
+        </div>
+        <!-- 文案与图片是两段式：图片先出，这里单独显示文案生成状态 / 失败重试 -->
+        <div id="copy-notice" class="copy-notice" hidden>
+          <span id="copy-notice-text"></span>
+          <button class="btn ghost" id="copy-retry" type="button">重新生成文案</button>
+        </div>
+        <div id="copy-pending" class="copy-pending" hidden>
+          <span class="spinner small"></span>
+          <span id="copy-pending-text">正在生成解读文案与标题…</span>
+        </div>
+        <div id="copy-body" hidden>
+          <div class="copy-toolbar">
+            <div class="seg">
+              <button id="view-preview" class="seg-btn active" type="button">预览</button>
+              <button id="view-src" class="seg-btn" type="button">Markdown 源码</button>
+            </div>
+          </div>
+          <div id="copy-style" class="style-check" hidden></div>
+          <div id="copy-render" class="copy-render"></div>
+          <pre id="copy-src" class="copy-text" hidden></pre>
+          <details class="reasoning" id="reasoning" hidden>
+            <summary>🧠 推理过程（模型思考）</summary>
+            <pre id="reasoning-text"></pre>
+          </details>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>🔥 爆款标题</h2>
+          <div class="head-actions">
+            <span id="title-count" class="badge" hidden></span>
+          </div>
+        </div>
+        <div id="titles" class="titles"></div>
+        <div id="titles-empty" class="muted">文案生成后自动给出 3 条候选标题。</div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>📤 同步发布</h2>
+          <span id="sync-hint" class="muted"></span>
+        </div>
+        <div class="account-radios" id="wechat-account"></div>
+        <div class="sync-actions">
+          <button class="btn sync" id="sync-wechat">同步为公众号贴图</button>
+          <button class="btn ghost" id="sync-wechat-browser">浏览器打开后台</button>
+          <button class="btn sync" id="sync-x">同步到 X</button>
+        </div>
+        <p class="sync-note" id="sync-note"></p>
+      </section>
+    </main>
+
+
+    <main id="podcastresult" hidden>
+      <div class="meta-bar">
+        <span class="badge">🎙️ 论文播客</span>
+        <div class="meta-title" id="pod-title"></div>
+        <span id="pod-origin" class="muted"></span>
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>▶️ 播客视频</h2>
+          <div class="head-actions">
+            <span id="pod-meta" class="badge muted"></span>
+            <a id="pod-download" class="btn ghost" href="#">⬇ 下载 mp4</a>
+          </div>
+        </div>
+        <video id="pod-video" class="pod-video" controls preload="metadata"></video>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>🎧 旁白脚本</h2>
+          <div class="head-actions">
+            <button class="btn ghost" id="pod-copy" type="button">复制脚本</button>
+          </div>
+        </div>
+        <div id="pod-style" class="style-check" hidden></div>
+        <div id="pod-script" class="pod-script"></div>
+      </section>
+    </main>
+      </main>
+    </div>
+
+    <footer class="foot">
+      <span id="foot-note"></span>
+    </footer>
+  </div>
+
+  <div id="lightbox" class="lightbox" hidden>
+    <div class="lightbox-inner">
+      <img id="lightbox-img" alt="预览" />
+      <button id="lightbox-close" class="lightbox-close">✕</button>
+      <a id="lightbox-dl" class="lightbox-dl" href="#">下载原图</a>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -79,13 +79,18 @@ async def _create_from_upload(request: Request, settings: Settings) -> dict[str,
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="只支持 PDF 文件，请上传 .pdf")
 
-    data = await upload.read()
+    # UploadFile 是 spooled file，但 read() 不带长度会把整个上传重新载入内存。
+    # 只读到上限 + 1 字节即可判定超限，避免恶意/误操作的大文件造成内存峰值。
+    try:
+        data = await upload.read(MAX_PDF_BYTES + 1)
+    finally:
+        await upload.close()
     if not data:
         raise HTTPException(status_code=400, detail="上传的文件是空的")
     if len(data) > MAX_PDF_BYTES:
         raise HTTPException(
             status_code=400,
-            detail=f"文件过大（{len(data) // 1024 // 1024}MB），上限 {MAX_PDF_BYTES // 1024 // 1024}MB",
+            detail=f"文件超过上限（{MAX_PDF_BYTES // 1024 // 1024}MB），请压缩后重试",
         )
     if data[:5] != b"%PDF-":
         raise HTTPException(status_code=400, detail="这个文件不是有效的 PDF（缺少 PDF 文件头）")
