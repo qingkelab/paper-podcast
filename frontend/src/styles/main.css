@@ -213,6 +213,37 @@ pre {
   margin-left: auto;
 }
 
+@media (max-width: 1080px) {
+  .app-header__inner {
+    height: auto;
+    min-height: var(--header-height);
+    flex-wrap: wrap;
+    column-gap: 16px;
+    row-gap: 0;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .app-nav {
+    order: 3;
+    flex: 1 0 100%;
+    width: 100%;
+    margin-left: 0;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  .app-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .nav-link {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+}
+
 .nav-link {
   position: relative;
   padding: 8px 14px;
